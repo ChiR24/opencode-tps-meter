@@ -151,11 +151,17 @@ export default function TpsMeterPlugin(
   };
 
   // Load configuration from all sources (synchronous)
-  let config: Config;
+  let config: Config | undefined;
   try {
     config = loadConfigSync();
   } catch (error) {
     logger.warn('[TpsMeter] Failed to load config, using defaults:', error instanceof Error ? error.message : String(error));
+    config = defaultConfig;
+  }
+
+  // Ensure config is defined (handle edge case where loadConfigSync returns undefined)
+  if (!config) {
+    logger.warn('[TpsMeter] Config is undefined, using defaults');
     config = defaultConfig;
   }
 

@@ -41,12 +41,42 @@ A live tokens-per-second meter plugin for OpenCode. Track AI token throughput in
 
 ## Installation
 
-This plugin is designed for local installation. Since it's not published to npm, install it from the local directory or git repository:
+### From NPM (Recommended)
 
-### From Local Directory
+The easiest way to install is from the NPM registry:
 
 ```bash
-# Clone or download the repository
+# Using bun
+bun add opencode-tps-meter
+
+# Using npm
+npm install opencode-tps-meter
+
+# Using yarn
+yarn add opencode-tps-meter
+```
+
+Then add to your OpenCode configuration (see [Quick Start](#quick-start) below).
+
+### From Git Repository
+
+If you prefer to install directly from GitHub:
+
+```bash
+# Install directly from git
+bun add github:ChiR24/opencode-tps-meter
+
+# Or with npm
+npm install github:ChiR24/opencode-tps-meter
+```
+
+### From Local Directory (Development)
+
+For local development or testing:
+
+```bash
+# Clone the repository
+git clone https://github.com/ChiR24/opencode-tps-meter.git
 cd opencode-tps-meter
 
 # Install dependencies and build
@@ -63,20 +93,6 @@ Then in your OpenCode project:
 # Link the plugin locally
 bun link opencode-tps-meter
 ```
-
-### From Git Repository
-
-```bash
-# Install directly from git
-bun add github:ChiR24/opencode-tps-meter
-
-# Or with npm
-npm install github:ChiR24/opencode-tps-meter
-```
-
-### Manual Installation
-
-Copy the `dist` folder from this repository into your project's `node_modules/opencode-tps-meter` directory.
 
 ---
 
