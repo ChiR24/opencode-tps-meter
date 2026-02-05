@@ -47,7 +47,7 @@ This plugin is designed for local installation. Since it's not published to npm,
 
 ```bash
 # Clone or download the repository
-cd opencode-tps-plugin
+cd opencode-tps-meter
 
 # Install dependencies and build
 bun install
@@ -68,10 +68,10 @@ bun link opencode-tps-meter
 
 ```bash
 # Install directly from git
-bun add github:ChiR24/opencode-tps-plugin
+bun add github:ChiR24/opencode-tps-meter
 
 # Or with npm
-npm install github:ChiR24/opencode-tps-plugin
+npm install github:ChiR24/opencode-tps-meter
 ```
 
 ### Manual Installation
