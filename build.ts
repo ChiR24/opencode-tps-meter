@@ -48,16 +48,27 @@ async function build(): Promise<void> {
   const cjsPath = path.join(outDir, "index.js");
   let cjsContent = await Bun.file(cjsPath).text();
   
-  // Replace the original module.exports line with our fix
-  // Export the plugin function itself (not the result of calling it)
+  // Remove the original CommonJS export line
   cjsContent = cjsContent.replace(
-    /module\.exports = __toCommonJS\(exports_src\);/,
-    `// OpenCode compatibility: export plugin function\n` +
-    `module.exports = exports_src.default;`
+    /module\.exports = __toCommonJS\(exports_src\);\n?/,
+    ""
   );
+  
+  // Append the export at the end of the file
+  // This ensures TpsMeterPlugin is defined before we export it
+  cjsContent += `\n// OpenCode compatibility: export plugin function\n`;
+  cjsContent += `module.exports = exports_src.default;\n`;
+  cjsContent += `module.exports.default = exports_src.default;\n`;
+  cjsContent += `Object.defineProperty(module.exports, "__esModule", { value: true });\n`;
   
   await Bun.write(cjsPath, cjsContent);
   console.log("✓ Fixed CJS exports for OpenCode compatibility");
+
+  // Create a package.json in dist to force CommonJS mode for .js files
+  // This is needed because the root package.json has "type": "module"
+  const distPkgPath = path.join(outDir, "package.json");
+  await Bun.write(distPkgPath, JSON.stringify({ type: "commonjs" }, null, 2));
+  console.log("✓ Created dist/package.json with type: commonjs");
 
   // Generate type declarations using tsc
   const tscProcess = Bun.spawn(["bunx", "tsc", "--emitDeclarationOnly", "--declaration", "--outDir", "dist"], {
