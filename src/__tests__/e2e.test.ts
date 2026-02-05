@@ -23,16 +23,19 @@ describe("E2E: Module Exports", () => {
 
 describe("E2E: Plugin Loading", () => {
   let originalEnv: NodeJS.ProcessEnv;
+  let originalCwd: string;
   let tempDir: string;
 
   beforeEach(() => {
     originalEnv = { ...process.env };
+    originalCwd = process.cwd();
     tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "tps-meter-test-"));
     process.chdir(tempDir);
   });
 
   afterEach(() => {
     process.env = originalEnv;
+    process.chdir(originalCwd);
     try {
       fs.rmSync(tempDir, { recursive: true, force: true });
     } catch {
