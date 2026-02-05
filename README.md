@@ -7,6 +7,7 @@
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.0+-3178C6?logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
 [![Bun](https://img.shields.io/badge/Bun-Runtime-000?logo=bun&logoColor=white)](https://bun.sh)
 [![OpenCode](https://img.shields.io/badge/OpenCode-Plugin-7C3AED?logo=code&logoColor=white)](https://opencode.ai)
+[![NPM Version](https://img.shields.io/npm/v/opencode-tps-meter.svg)](https://www.npmjs.com/package/opencode-tps-meter)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
 </div>
@@ -106,17 +107,23 @@ bun link opencode-tps-meter
 
 ### As OpenCode Plugin (Recommended)
 
-Create a plugin file in your OpenCode project:
+Add the plugin to your OpenCode configuration file (`~/.config/opencode/opencode.json`):
 
-```typescript
-// File: tps-meter-plugin.ts (or .js)
-import TpsMeterPlugin from 'opencode-tps-meter';
-
-// Export the plugin - it automatically hooks into OpenCode events
-export default TpsMeterPlugin;
+```json
+{
+  "plugin": ["opencode-tps-meter@0.1.1"]
+}
 ```
 
-Then configure it in your OpenCode config (see Configuration section below).
+Or use the latest version:
+
+```json
+{
+  "plugin": ["opencode-tps-meter@latest"]
+}
+```
+
+The plugin will automatically hook into OpenCode events and start tracking TPS.
 
 ### Programmatic Usage
 
