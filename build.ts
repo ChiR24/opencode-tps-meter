@@ -49,11 +49,11 @@ async function build(): Promise<void> {
   let cjsContent = await Bun.file(cjsPath).text();
   
   // Replace the original module.exports line with our fix
-  // We need to call exports_src.default() to unwrap () => TpsMeterPlugin
+  // Export the plugin function itself (not the result of calling it)
   cjsContent = cjsContent.replace(
     /module\.exports = __toCommonJS\(exports_src\);/,
-    `// OpenCode compatibility: unwrap plugin function from getter\n` +
-    `module.exports = exports_src.default();`
+    `// OpenCode compatibility: export plugin function\n` +
+    `module.exports = exports_src.default;`
   );
   
   await Bun.write(cjsPath, cjsContent);
