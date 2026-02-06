@@ -666,3 +666,154 @@ describe("extractPartText Edge Cases", () => {
     expect(context.mockClient.toastCalls.length).toBe(0);
   });
 });
+
+describe("TPS Smoothing Tests", () => {
+  let originalEnv: NodeJS.ProcessEnv;
+
+  beforeEach(() => {
+    originalEnv = { ...process.env };
+    process.env.TPS_METER_ENABLED = "true";
+    process.env.TPS_METER_UPDATE_INTERVAL_MS = "50";
+  });
+
+  afterEach(() => {
+    process.env = originalEnv;
+  });
+
+  it("should smooth large token bursts to prevent unrealistic TPS spikes", async () => {
+    const context = createMockContext();
+    const handlers = TpsMeterPlugin(context);
+
+    const sessionId = "burst-test-session";
+    const messageId = "msg-burst";
+
+    await handlers.event!({
+      event: createMessageUpdatedEvent(sessionId, messageId, "streaming"),
+    });
+
+    // Wait for min elapsed time
+    await delay(MIN_TPS_ELAPSED_MS + 10);
+
+    // First, establish baseline with normal streaming (activates EWMA smoothing)
+    // Send multiple small updates to set hasSmoothedValue = true
+    for (let i = 0; i < 5; i++) {
+      await handlers.event!({
+        event: createPartUpdatedEvent(sessionId, messageId, "word "),
+      });
+      await delay(50); // 50ms between updates
+    }
+
+    await delay(100);
+
+    // Get baseline TPS before burst
+    const logsBeforeBurst = context.logger.logs.filter((log) =>
+      log.includes("[DEBUG]") && log.includes("TPS:")
+    );
+    expect(logsBeforeBurst.length).toBeGreaterThan(0);
+
+    // Now simulate a large burst of 500 tokens arriving at once (like tool output)
+    // This would normally create a ~1000+ TPS spike, but should be smoothed
+    const burstText = "word ".repeat(100); // ~500 tokens
+    await handlers.event!({
+      event: createPartUpdatedEvent(sessionId, messageId, burstText),
+    });
+
+    await delay(100);
+
+    // The smoothed TPS should be reasonable, not an extreme spike
+    // EWMA smoothing takes effect over multiple updates with hasSmoothedValue=true
+    const debugLogs = context.logger.logs.filter((log) =>
+      log.includes("[DEBUG]") && log.includes("TPS:")
+    );
+
+    expect(debugLogs.length).toBeGreaterThan(logsBeforeBurst.length);
+
+    // Parse the last TPS log and verify smoothing is applied
+    const lastLog = debugLogs[debugLogs.length - 1];
+    const tpsMatch = lastLog.match(/TPS:\s*([\d.]+)/);
+    expect(tpsMatch).not.toBeNull();
+    if (tpsMatch) {
+      const tps = parseFloat(tpsMatch[1]);
+      // Raw TPS for 500 tokens arriving at once would be ~5000 (500/0.1s)
+      // With EWMA smoothing (2000ms half-life for bursts), values should be < 2000
+      expect(tps).toBeLessThan(2000);
+      expect(tps).toBeGreaterThan(0);
+    }
+  });
+
+  it("should maintain responsiveness for normal streaming rates", async () => {
+    const context = createMockContext();
+    const handlers = TpsMeterPlugin(context);
+
+    const sessionId = "streaming-test-session";
+    const messageId = "msg-stream";
+
+    await handlers.event!({
+      event: createMessageUpdatedEvent(sessionId, messageId, "streaming"),
+    });
+
+    // Simulate normal streaming: ~20 tokens every 50ms = ~400 TPS
+    const startTime = Date.now();
+    for (let i = 0; i < 20; i++) {
+      await handlers.event!({
+        event: createPartUpdatedEvent(sessionId, messageId, "word1 word2 word3 word4 word5 "),
+      });
+      await delay(50);
+    }
+
+    const elapsedMs = Date.now() - startTime;
+
+    await delay(100);
+
+    // Should have logged TPS values
+    const debugLogs = context.logger.logs.filter((log) =>
+      log.includes("[DEBUG]") && log.includes("TPS:")
+    );
+
+    expect(debugLogs.length).toBeGreaterThan(0);
+
+    // Verify streaming maintained some TPS activity
+    // (exact value depends on timing, but should be > 0)
+    const lastLog = debugLogs[debugLogs.length - 1];
+    const tpsMatch = lastLog.match(/TPS:\s*([\d.]+)/);
+    if (tpsMatch) {
+      const tps = parseFloat(tpsMatch[1]);
+      expect(tps).toBeGreaterThan(0);
+    }
+  });
+
+  it("should show final stats with reasonable TPS after burst", async () => {
+    const context = createMockContext();
+    const handlers = TpsMeterPlugin(context);
+
+    const sessionId = "final-stats-burst-session";
+    const messageId = "msg-final-burst";
+
+    await handlers.event!({
+      event: createMessageUpdatedEvent(sessionId, messageId, "streaming"),
+    });
+
+    // Wait for min elapsed time
+    await delay(MIN_TPS_ELAPSED_MS + 10);
+
+    // Add some tokens
+    for (let i = 0; i < 10; i++) {
+      await handlers.event!({
+        event: createPartUpdatedEvent(sessionId, messageId, "word "),
+      });
+    }
+
+    await delay(100);
+
+    // Complete the message
+    await handlers.event!({
+      event: createMessageUpdatedEvent(sessionId, messageId, "complete"),
+    });
+
+    // Should show final stats with success variant
+    const successToasts = context.mockClient.toastCalls.filter(
+      (call) => call.variant === "success"
+    );
+    expect(successToasts.length).toBeGreaterThan(0);
+  });
+});

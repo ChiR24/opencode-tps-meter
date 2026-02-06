@@ -1,10 +1,11 @@
 /**
  * Token tracking logic for OpenCode TPS Meter Plugin
  * Implements a TPS tracker with a configurable rolling window using a ring buffer
+ * Includes EWMA smoothing to prevent spikes from bursty token arrivals
  */
 
 import type { TPSTrackerOptions, BufferEntry, TPSTracker } from "./types.js";
-import { MAX_BUFFER_SIZE, DEFAULT_ROLLING_WINDOW_MS, MIN_WINDOW_DURATION_SECONDS } from "./constants.js";
+import { MAX_BUFFER_SIZE, DEFAULT_ROLLING_WINDOW_MS, MIN_WINDOW_DURATION_SECONDS, BURST_TOKEN_THRESHOLD, DEFAULT_EWMA_HALF_LIFE_MS, BURST_EWMA_HALF_LIFE_MS } from "./constants.js";
 
 /**
  * Creates a TPSTracker instance - Tracks tokens per second with a rolling window
@@ -27,6 +28,11 @@ export function createTracker(options: TPSTrackerOptions = {}): TPSTracker {
       ? options.rollingWindowMs
       : DEFAULT_ROLLING_WINDOW_MS;
 
+  // EWMA smoothing state
+  let smoothedTps = 0;
+  let lastSmoothedAt = 0;
+  let hasSmoothedValue = false;
+
   /**
    * Prunes entries older than the rolling window and enforces max buffer size
    * @param now - Current timestamp for age calculations
@@ -35,26 +41,71 @@ export function createTracker(options: TPSTrackerOptions = {}): TPSTracker {
     const cutoff = now - windowMs;
 
     // Find first valid entry index (first entry not older than cutoff)
-    let validStartIndex = 0;
-    while (validStartIndex < buffer.length && buffer[validStartIndex].timestamp < cutoff) {
-      validStartIndex++;
-    }
+    const validStartIndex = buffer.findIndex(e => e.timestamp >= cutoff);
 
-    // Batch remove all expired entries at once with slice (O(n) total, not O(n²))
-    if (validStartIndex > 0) {
-      buffer = buffer.slice(validStartIndex);
+    // Remove expired entries in place
+    if (validStartIndex === -1) {
+      // All entries are expired — clear the buffer
+      buffer.length = 0;
+    } else if (validStartIndex > 0) {
+      buffer.splice(0, validStartIndex);
     }
 
     // Trim to max size from the end if needed
     if (buffer.length > MAX_BUFFER_SIZE) {
-      buffer = buffer.slice(-MAX_BUFFER_SIZE);
+      buffer.splice(0, buffer.length - MAX_BUFFER_SIZE);
     }
+  }
+
+  /**
+   * Calculates the instantaneous TPS from the buffer (unsmoothed raw value)
+   * @param now - Current timestamp
+   * @returns Raw instantaneous TPS
+   */
+  function calculateRawTPS(now: number): number {
+    if (buffer.length === 0) {
+      return 0;
+    }
+
+    const cutoff = now - windowMs;
+
+    // Calculate total tokens in the window
+    let tokensInWindow = 0;
+    let oldestTimestamp = now;
+    let newestTimestamp = 0;
+
+    for (const entry of buffer) {
+      if (entry.timestamp >= cutoff) {
+        tokensInWindow += entry.count;
+        if (entry.timestamp < oldestTimestamp) {
+          oldestTimestamp = entry.timestamp;
+        }
+        if (entry.timestamp > newestTimestamp) {
+          newestTimestamp = entry.timestamp;
+        }
+      }
+    }
+
+    // If no valid entries in window, return 0
+    if (tokensInWindow === 0) {
+      return 0;
+    }
+
+    // Calculate actual window duration in seconds
+    const windowDurationMs = newestTimestamp - oldestTimestamp;
+    const windowDurationSeconds = windowDurationMs / 1000;
+
+    // If window is too short (single entry or < 100ms), use minimum duration
+    const effectiveDuration = Math.max(windowDurationSeconds, MIN_WINDOW_DURATION_SECONDS);
+
+    return tokensInWindow / effectiveDuration;
   }
 
   // Return the public interface
   return {
     /**
      * Records a token count at the specified time (or now if not specified)
+     * Uses token-duration smoothing to prevent spikes from large bursts
      * @param count - Number of tokens to record
      * @param timestamp - Optional timestamp (defaults to current time)
      */
@@ -69,6 +120,23 @@ export function createTracker(options: TPSTrackerOptions = {}): TPSTracker {
 
       // Prune old entries and maintain buffer size
       pruneBuffer(ts);
+
+      // Update smoothed TPS using EWMA
+      const rawTPS = calculateRawTPS(ts);
+      if (!hasSmoothedValue) {
+        smoothedTps = rawTPS;
+        hasSmoothedValue = true;
+      } else {
+        // Ensure minimum time delta of 1ms to avoid alpha=1 (no update)
+        const timeDelta = Math.max(1, ts - lastSmoothedAt);
+        // Use longer half-life for bursts to smooth them more
+        const halfLife = count > BURST_TOKEN_THRESHOLD
+          ? BURST_EWMA_HALF_LIFE_MS
+          : DEFAULT_EWMA_HALF_LIFE_MS;
+        const alpha = Math.exp(-Math.LN2 * timeDelta / halfLife);
+        smoothedTps = alpha * smoothedTps + (1 - alpha) * rawTPS;
+      }
+      lastSmoothedAt = ts;
     },
 
     /**
@@ -76,43 +144,15 @@ export function createTracker(options: TPSTrackerOptions = {}): TPSTracker {
      * @returns Tokens per second over the rolling window, or 0 if no data
      */
     getInstantTPS(): number {
-      if (buffer.length === 0) {
-        return 0;
-      }
+      return calculateRawTPS(Date.now());
+    },
 
-      const now = Date.now();
-      const cutoff = now - windowMs;
-
-      // Calculate total tokens in the window
-      let tokensInWindow = 0;
-      let oldestTimestamp = now;
-      let newestTimestamp = 0;
-
-      for (const entry of buffer) {
-        if (entry.timestamp >= cutoff) {
-          tokensInWindow += entry.count;
-          if (entry.timestamp < oldestTimestamp) {
-            oldestTimestamp = entry.timestamp;
-          }
-          if (entry.timestamp > newestTimestamp) {
-            newestTimestamp = entry.timestamp;
-          }
-        }
-      }
-
-      // If no valid entries in window, return 0
-      if (tokensInWindow === 0) {
-        return 0;
-      }
-
-      // Calculate actual window duration in seconds
-      const windowDurationMs = newestTimestamp - oldestTimestamp;
-      const windowDurationSeconds = windowDurationMs / 1000;
-
-      // If window is too short (single entry or < 100ms), use minimum duration
-      const effectiveDuration = Math.max(windowDurationSeconds, MIN_WINDOW_DURATION_SECONDS);
-
-      return tokensInWindow / effectiveDuration;
+    /**
+     * Gets the smoothed TPS using EWMA to prevent spikes
+     * @returns Smoothed tokens per second
+     */
+    getSmoothedTPS(): number {
+      return hasSmoothedValue ? smoothedTps : calculateRawTPS(Date.now());
     },
 
     /**
@@ -162,6 +202,9 @@ export function createTracker(options: TPSTrackerOptions = {}): TPSTracker {
       startTime = Date.now();
       totalTokens = 0;
       buffer = [];
+      smoothedTps = 0;
+      hasSmoothedValue = false;
+      lastSmoothedAt = 0;
       // Note: sessionId is preserved across resets
     },
 
