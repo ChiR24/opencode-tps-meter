@@ -694,7 +694,24 @@ describe("TPS Smoothing Tests", () => {
     // Wait for min elapsed time
     await delay(MIN_TPS_ELAPSED_MS + 10);
 
-    // Simulate a large burst of 500 tokens arriving at once (like tool output)
+    // First, establish baseline with normal streaming (activates EWMA smoothing)
+    // Send multiple small updates to set hasSmoothedValue = true
+    for (let i = 0; i < 5; i++) {
+      await handlers.event!({
+        event: createPartUpdatedEvent(sessionId, messageId, "word "),
+      });
+      await delay(50); // 50ms between updates
+    }
+
+    await delay(100);
+
+    // Get baseline TPS before burst
+    const logsBeforeBurst = context.logger.logs.filter((log) =>
+      log.includes("[DEBUG]") && log.includes("TPS:")
+    );
+    expect(logsBeforeBurst.length).toBeGreaterThan(0);
+
+    // Now simulate a large burst of 500 tokens arriving at once (like tool output)
     // This would normally create a ~1000+ TPS spike, but should be smoothed
     const burstText = "word ".repeat(100); // ~500 tokens
     await handlers.event!({
@@ -703,14 +720,13 @@ describe("TPS Smoothing Tests", () => {
 
     await delay(100);
 
-    // The smoothed TPS should be reasonable (< 800), not an extreme spike to 2000+
-    // Note: EWMA smoothing takes effect over multiple updates, so initial bursts
-    // may still show elevated TPS, but significantly less than the raw calculation
+    // The smoothed TPS should be reasonable, not an extreme spike
+    // EWMA smoothing takes effect over multiple updates with hasSmoothedValue=true
     const debugLogs = context.logger.logs.filter((log) =>
       log.includes("[DEBUG]") && log.includes("TPS:")
     );
 
-    expect(debugLogs.length).toBeGreaterThan(0);
+    expect(debugLogs.length).toBeGreaterThan(logsBeforeBurst.length);
 
     // Parse the last TPS log and verify smoothing is applied
     const lastLog = debugLogs[debugLogs.length - 1];
@@ -719,7 +735,7 @@ describe("TPS Smoothing Tests", () => {
     if (tpsMatch) {
       const tps = parseFloat(tpsMatch[1]);
       // Raw TPS for 500 tokens arriving at once would be ~5000 (500/0.1s)
-      // With EWMA smoothing (500ms half-life), initial values should still be < 2000
+      // With EWMA smoothing (2000ms half-life for bursts), values should be < 2000
       expect(tps).toBeLessThan(2000);
       expect(tps).toBeGreaterThan(0);
     }

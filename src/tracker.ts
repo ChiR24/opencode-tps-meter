@@ -43,8 +43,11 @@ export function createTracker(options: TPSTrackerOptions = {}): TPSTracker {
     // Find first valid entry index (first entry not older than cutoff)
     const validStartIndex = buffer.findIndex(e => e.timestamp >= cutoff);
 
-    // Remove expired entries in place (mutate to avoid reference issues)
-    if (validStartIndex > 0) {
+    // Remove expired entries in place
+    if (validStartIndex === -1) {
+      // All entries are expired — clear the buffer
+      buffer.length = 0;
+    } else if (validStartIndex > 0) {
       buffer.splice(0, validStartIndex);
     }
 

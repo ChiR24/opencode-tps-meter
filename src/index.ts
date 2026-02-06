@@ -306,7 +306,7 @@ export default function TpsMeterPlugin(
     messageCache.set(messageId, previousTokens + tokenCount);
 
     // Get current stats
-    const instantTps = tracker.getSmoothedTPS();
+    const smoothedTps = tracker.getSmoothedTPS();
     const avgTps = tracker.getAverageTPS();
     const totalTokens = tracker.getTotalTokens();
     const elapsedMs = tracker.getElapsedMs();
@@ -315,13 +315,13 @@ export default function TpsMeterPlugin(
     // Update UI (throttled internally)
     if (
       elapsedSinceFirstToken >= MIN_TPS_ELAPSED_MS &&
-      instantTps >= resolvedConfig.minVisibleTPS
+      smoothedTps >= resolvedConfig.minVisibleTPS
     ) {
-      ui.updateDisplay(instantTps, avgTps, totalTokens, elapsedMs);
+      ui.updateDisplay(smoothedTps, avgTps, totalTokens, elapsedMs);
     }
 
     logger.debug(
-      `[TpsMeter] Session ${sessionId}: +${tokenCount} tokens, TPS: ${instantTps.toFixed(1)} (avg: ${avgTps.toFixed(1)})`
+      `[TpsMeter] Session ${sessionId}: +${tokenCount} tokens, TPS: ${smoothedTps.toFixed(1)} (avg: ${avgTps.toFixed(1)})`
     );
   }
 
