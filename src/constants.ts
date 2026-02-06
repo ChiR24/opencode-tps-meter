@@ -23,6 +23,15 @@ export const MAX_BUFFER_SIZE = 100;
 /** Minimum window duration for TPS calculation (seconds) to avoid division by near-zero */
 export const MIN_WINDOW_DURATION_SECONDS = 0.1;
 
+/** Token count threshold to trigger burst smoothing (tokens) */
+export const BURST_TOKEN_THRESHOLD = 120;
+
+/** Default EWMA half-life (ms) for smoothing normal streaming */
+export const DEFAULT_EWMA_HALF_LIFE_MS = 500;
+
+/** EWMA half-life (ms) applied during bursts */
+export const BURST_EWMA_HALF_LIFE_MS = 2000;
+
 // =============================================================================
 // UI Display Constants
 // =============================================================================

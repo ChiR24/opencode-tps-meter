@@ -317,6 +317,8 @@ export interface TPSTracker {
   recordTokens(count: number, timestamp?: number): void;
   /** Calculates the instantaneous TPS over the last 2-second rolling window */
   getInstantTPS(): number;
+  /** Gets the EWMA-smoothed TPS to prevent spikes from bursts */
+  getSmoothedTPS(): number;
   /** Calculates the average TPS over the entire session */
   getAverageTPS(): number;
   /** Gets the total number of tokens recorded */

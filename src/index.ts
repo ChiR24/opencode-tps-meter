@@ -306,7 +306,7 @@ export default function TpsMeterPlugin(
     messageCache.set(messageId, previousTokens + tokenCount);
 
     // Get current stats
-    const instantTps = tracker.getInstantTPS();
+    const instantTps = tracker.getSmoothedTPS();
     const avgTps = tracker.getAverageTPS();
     const totalTokens = tracker.getTotalTokens();
     const elapsedMs = tracker.getElapsedMs();
