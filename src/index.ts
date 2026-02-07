@@ -721,9 +721,17 @@ export default function TpsMeterPlugin(
     roleCache.set(info.id, info.role);
 
     // Cache agent name for this session (for labeling background agents)
-    // info.agent contains the agent name like "explore", "librarian", "build", etc.
-    if (info.agent && typeof info.agent === "string") {
-      sessionAgentNameCache.set(info.sessionID, info.agent);
+    // info.agent is AgentIdentity object with id, type, name properties
+    // Priority: agent.name > agent.type > agentType string > agent.id
+    if (info.agent || info.agentType) {
+      const agentName =
+        info.agent?.name ||
+        info.agent?.type ||
+        info.agentType ||
+        info.agent?.id;
+      if (agentName && typeof agentName === "string") {
+        sessionAgentNameCache.set(info.sessionID, agentName);
+      }
     }
 
     if (info.role === "assistant") {

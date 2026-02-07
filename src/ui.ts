@@ -95,8 +95,23 @@ export function createUIManager(
 
   function formatAgentLine(agent: AgentDisplayState): string {
     const segments: string[] = [];
-    segments.push(`${agent.instantTps.toFixed(1)} (avg ${agent.avgTps.toFixed(1)})`);
-    segments.push(`tokens: ${formatNumberWithCommas(agent.totalTokens)}`);
+
+    if (uiConfig.showInstant || uiConfig.showAverage) {
+      const tpsParts: string[] = [];
+      if (uiConfig.showInstant) {
+        tpsParts.push(`${agent.instantTps.toFixed(1)}`);
+      }
+      if (uiConfig.showAverage) {
+        tpsParts.push(`(avg ${agent.avgTps.toFixed(1)})`);
+      }
+      if (tpsParts.length > 0) {
+        segments.push(tpsParts.join(" "));
+      }
+    }
+
+    if (uiConfig.showTotalTokens) {
+      segments.push(`tokens: ${formatNumberWithCommas(agent.totalTokens)}`);
+    }
     if (uiConfig.showElapsed) {
       segments.push(formatElapsedTime(agent.elapsedMs));
     }
@@ -247,7 +262,12 @@ export function createUIManager(
   function flushPendingUpdate(): void {
     if (pendingState) {
       const formatted = formatDisplay(pendingState);
-      display(formatted, false, pendingState.instantTps);
+      // For color coding: use main session TPS if active, otherwise use max agent TPS
+      let tpsForColor = pendingState.instantTps;
+      if (pendingState.totalTokens === 0 && pendingState.agents?.length) {
+        tpsForColor = Math.max(...pendingState.agents.map(a => a.instantTps));
+      }
+      display(formatted, false, tpsForColor);
       lastDisplayedState = { ...pendingState };
       pendingState = null;
     }
