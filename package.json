@@ -1,6 +1,6 @@
 {
   "name": "opencode-tps-meter",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "description": "Live tokens-per-second meter for OpenCode",
   "type": "module",
   "main": "./dist/index.js",
