@@ -176,6 +176,16 @@ export interface FilePartSource {
   uri?: string;
 }
 
+/**
+ * Agent identity metadata for primary and sub-agents
+ */
+export interface AgentIdentity {
+  id?: string;
+  type?: string;
+  name?: string;
+  description?: string;
+}
+
 export interface Part {
   id: string;
   sessionID: string;
@@ -195,6 +205,10 @@ export interface Part {
   name?: string;
   error?: unknown;
   auto?: boolean;
+  metadata?: Record<string, unknown>;
+  agent?: AgentIdentity;
+  agentId?: string;
+  agentType?: string;
 }
 
 /**
@@ -242,6 +256,10 @@ export interface MessageEvent {
       };
       finish?: string;
       error?: unknown;
+      agent?: AgentIdentity;
+      metadata?: Record<string, unknown>;
+      agentId?: string;
+      agentType?: string;
     };
     sessionID?: string;
   };
@@ -280,6 +298,26 @@ export interface DisplayState {
   /** Total token count */
   totalTokens: number;
   /** Elapsed time in milliseconds */
+  elapsedMs: number;
+  /** Optional per-agent display entries */
+  agents?: AgentDisplayState[];
+}
+
+/**
+ * Display data for an individual agent/subagent stream
+ */
+export interface AgentDisplayState {
+  /** Unique identifier (message ID or agent ID) */
+  id: string;
+  /** Label describing the agent/subagent */
+  label: string;
+  /** Instantaneous TPS value */
+  instantTps: number;
+  /** Average TPS value */
+  avgTps: number;
+  /** Total tokens processed */
+  totalTokens: number;
+  /** Elapsed time since first token */
   elapsedMs: number;
 }
 
@@ -344,7 +382,13 @@ export interface TPSTracker {
  */
 export interface UIManager {
   /** Updates the display with current TPS statistics */
-  updateDisplay(instantTps: number, avgTps: number, totalTokens: number, elapsedMs: number): void;
+  updateDisplay(
+    instantTps: number,
+    avgTps: number,
+    totalTokens: number,
+    elapsedMs: number,
+    agents?: AgentDisplayState[]
+  ): void;
   /** Displays final statistics immediately */
   showFinalStats(totalTokens: number, avgTps: number, elapsedMs: number): void;
   /** Clears the display and cleans up resources */

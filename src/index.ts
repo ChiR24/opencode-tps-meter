@@ -13,6 +13,8 @@ import type {
   Config,
   Part,
   ToolState,
+  AgentIdentity,
+  AgentDisplayState,
 } from "./types.js";
 import { createTracker } from "./tracker.js";
 import { createUIManager } from "./ui.js";
@@ -172,15 +174,57 @@ export default function TpsMeterPlugin(
   }
 
   // Initialize tracking components
-  const trackers = new Map<string, ReturnType<typeof createTracker>>();
+  type TrackerInstance = ReturnType<typeof createTracker>;
+
+  interface TrackerMetadata {
+    agent?: AgentIdentity;
+    agentId?: string;
+    agentType?: string;
+    name?: string;
+  }
+
+  interface MessageTrackerState {
+    /** Composite key for this tracker (sessionId:messageId:partId or similar) */
+    key: string;
+    /** The message ID this tracker is associated with */
+    messageId: string;
+    /** Optional part ID for sub-part tracking */
+    partId?: string;
+    tracker: TrackerInstance;
+    label: string;
+    firstTokenAt: number | null;
+    lastUpdated: number;
+    agent?: AgentIdentity;
+    agentId?: string;
+    agentType?: string;
+  }
+
+  interface SessionTrackingState {
+    aggregate: TrackerInstance;
+    aggregateFirstTokenAt: number | null;
+    messageTrackers: Map<string, MessageTrackerState>;
+  }
+
+  const sessionTrackers = new Map<string, SessionTrackingState>();
   const partTextCache = new Map<string, Map<string, string>>();
   const messageTokenCache = new Map<string, Map<string, number>>();
   const messageRoleCache = new Map<
     string,
     Map<string, "user" | "assistant" | "system">
   >();
-  const messageFirstTokenCache = new Map<string, Map<string, number>>();
-  const activeMessageCache = new Map<string, string>();
+  
+  // Cache agent names per session (from message.updated events)
+  // Key: sessionId, Value: agent name (e.g., "explore", "librarian", "build")
+  const sessionAgentNameCache = new Map<string, string>();
+  
+  // Track the PRIMARY session ID explicitly
+  // Primary = the FIRST session that receives assistant tokens (main chat)
+  // Background agents run in DIFFERENT sessions, so they won't overwrite this
+  let primarySessionId: string | null = null;
+  
+  // Timer-based fallback to show TPS even when stream pauses
+  // Maps sessionId -> timer handle
+  const pendingDisplayTimers = new Map<string, ReturnType<typeof setTimeout>>();
   
   // Config is guaranteed to be defined (either from loadConfigSync or defaultConfig in catch)
   const resolvedConfig: Config = config;
@@ -201,19 +245,313 @@ export default function TpsMeterPlugin(
    * @param {string} sessionId - Session identifier
    * @returns {TPSTracker} - Tracker instance for the session
    */
-  function getOrCreateTracker(sessionId: string): ReturnType<typeof createTracker> {
-    let tracker = trackers.get(sessionId);
-    if (!tracker) {
-      tracker = createTracker({
-        sessionId,
-        rollingWindowMs: resolvedConfig.rollingWindowMs,
-      });
-      trackers.set(sessionId, tracker);
-      logger.debug(
-        `[TpsMeter] Created tracker for session: ${sessionId}`
-      );
+  function getOrCreateSessionState(sessionId: string): SessionTrackingState {
+    let state = sessionTrackers.get(sessionId);
+    if (!state) {
+      state = {
+        aggregate: createTracker({
+          sessionId,
+          rollingWindowMs: resolvedConfig.rollingWindowMs,
+        }),
+        aggregateFirstTokenAt: null,
+        messageTrackers: new Map<string, MessageTrackerState>(),
+      };
+      sessionTrackers.set(sessionId, state);
+      logger.debug(`[TpsMeter] Created tracker for session: ${sessionId}`);
     }
-    return tracker;
+    return state;
+  }
+
+  function abbreviateId(id: string): string {
+    if (!id || id.length <= 4) return id;
+    return `${id.slice(0, 4)}…`;
+  }
+
+  function buildAgentLabel(
+    messageId: string,
+    metadata?: TrackerMetadata
+  ): string {
+    const typeLabel =
+      metadata?.agent?.type?.trim() ||
+      metadata?.agentType?.trim() ||
+      metadata?.agent?.name?.trim() ||
+      metadata?.name?.trim() ||
+      "Subagent";
+    const rawId =
+      metadata?.agentId?.trim() ||
+      metadata?.agent?.id?.trim() ||
+      messageId;
+    const identifier = abbreviateId(rawId);
+    return `${typeLabel}(${identifier})`;
+  }
+
+  /**
+   * Builds a composite tracker key from session, message, part, and metadata.
+   * Prefers agentId → metadata.agent.id → metadata.agentType → partId → `${sessionId}:${messageId}`
+   */
+  function buildTrackerKey(
+    sessionId: string,
+    messageId: string,
+    partId?: string,
+    metadata?: TrackerMetadata
+  ): string {
+    const agentId =
+      metadata?.agentId?.trim() ||
+      metadata?.agent?.id?.trim() ||
+      metadata?.agentType?.trim();
+    if (agentId) {
+      return `${sessionId}:${messageId}:${agentId}`;
+    }
+    if (partId) {
+      return `${sessionId}:${messageId}:${partId}`;
+    }
+    return `${sessionId}:${messageId}`;
+  }
+
+  function getOrCreateMessageTrackerState(
+    sessionId: string,
+    messageId: string,
+    partId?: string,
+    metadata?: TrackerMetadata
+  ): MessageTrackerState {
+    const sessionState = getOrCreateSessionState(sessionId);
+    const key = buildTrackerKey(sessionId, messageId, partId, metadata);
+    let trackerState = sessionState.messageTrackers.get(key);
+    const nextLabel = buildAgentLabel(messageId, metadata);
+    if (!trackerState) {
+      trackerState = {
+        key,
+        messageId,
+        partId,
+        tracker: createTracker({
+          sessionId: key,
+          rollingWindowMs: resolvedConfig.rollingWindowMs,
+        }),
+        label: nextLabel,
+        firstTokenAt: null,
+        lastUpdated: 0,
+        agent: metadata?.agent,
+        agentId: metadata?.agentId,
+        agentType: metadata?.agentType,
+      };
+      sessionState.messageTrackers.set(key, trackerState);
+    } else if (trackerState.label !== nextLabel) {
+      trackerState.label = nextLabel;
+    }
+
+    if (metadata?.agent) {
+      trackerState.agent = metadata.agent;
+    }
+    if (metadata?.agentId) {
+      trackerState.agentId = metadata.agentId;
+    }
+    if (metadata?.agentType) {
+      trackerState.agentType = metadata.agentType;
+    }
+
+    return trackerState;
+  }
+
+  /**
+   * Gets ALL active background agents across ALL sessions.
+   * Includes both:
+   * - Same-session agents (detected via agent metadata)
+   * - Cross-session agents (different sessionId than primary)
+   * Uses cached agent names from message.updated events.
+   */
+  function getAllActiveAgentsGlobally(now: number): AgentDisplayState[] {
+    const activityWindow = Math.max(
+      resolvedConfig.rollingWindowMs,
+      MIN_TPS_ELAPSED_MS * 4
+    );
+    const entries: AgentDisplayState[] = [];
+
+    for (const [sessionId, sessionState] of sessionTrackers) {
+      for (const [trackerKey, trackerState] of sessionState.messageTrackers) {
+        if (!trackerState.firstTokenAt) continue;
+        if (now - trackerState.lastUpdated > activityWindow) continue;
+        
+        const hasAgentMetadata = Boolean(
+          trackerState.agent || trackerState.agentId || trackerState.agentType
+        );
+        
+        let isSubagent = false;
+        let label = trackerState.label;
+        
+        if (hasAgentMetadata) {
+          // Has agent metadata - definitely a subagent (same-session)
+          isSubagent = true;
+        } else if (sessionId !== primarySessionId) {
+          // Different session than primary - treat as subagent (cross-session)
+          isSubagent = true;
+          // Get cached agent name for this session
+          const agentName = sessionAgentNameCache.get(sessionId) || "bg";
+          const shortId = abbreviateId(sessionId.replace(/^ses_/, ""));
+          label = `${agentName}(${shortId})`;
+        }
+        
+        if (!isSubagent) continue;
+        
+        entries.push({
+          id: trackerKey,
+          label,
+          instantTps: trackerState.tracker.getSmoothedTPS(),
+          avgTps: trackerState.tracker.getAverageTPS(),
+          totalTokens: trackerState.tracker.getTotalTokens(),
+          elapsedMs: now - trackerState.firstTokenAt,
+        });
+      }
+    }
+
+    entries.sort((a, b) => b.instantTps - a.instantTps);
+    return entries;
+  }
+  
+  /**
+   * Checks if the primary session is currently active.
+   * Only considers trackers WITHOUT agent metadata as primary activity.
+   */
+  function isPrimarySessionActive(now: number): boolean {
+    if (!primarySessionId) return false;
+    
+    const sessionState = sessionTrackers.get(primarySessionId);
+    if (!sessionState) return false;
+    
+    const activityWindow = Math.max(
+      resolvedConfig.rollingWindowMs,
+      MIN_TPS_ELAPSED_MS * 4
+    );
+    
+    for (const trackerState of sessionState.messageTrackers.values()) {
+      // Only consider NON-agent trackers as primary activity
+      const hasAgentMetadata = Boolean(
+        trackerState.agent || trackerState.agentId || trackerState.agentType
+      );
+      if (hasAgentMetadata) continue;
+      
+      if (trackerState.firstTokenAt && now - trackerState.lastUpdated <= activityWindow) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  function getActiveAgentDisplayStates(
+    sessionState: SessionTrackingState,
+    now: number
+  ): AgentDisplayState[] {
+    const activityWindow = Math.max(
+      resolvedConfig.rollingWindowMs,
+      MIN_TPS_ELAPSED_MS * 4
+    );
+    const entries: AgentDisplayState[] = [];
+
+    for (const trackerState of sessionState.messageTrackers.values()) {
+      if (!trackerState.firstTokenAt) {
+        continue;
+      }
+      if (now - trackerState.lastUpdated > activityWindow) {
+        continue;
+      }
+      // Only show subagents/background agents that have agent metadata
+      const hasAgentMetadata = Boolean(trackerState.agent || trackerState.agentId || trackerState.agentType);
+      if (!hasAgentMetadata) {
+        continue;
+      }
+      entries.push({
+        id: trackerState.messageId,
+        label: trackerState.label,
+        instantTps: trackerState.tracker.getSmoothedTPS(),
+        avgTps: trackerState.tracker.getAverageTPS(),
+        totalTokens: trackerState.tracker.getTotalTokens(),
+        elapsedMs: now - trackerState.firstTokenAt,
+      });
+    }
+
+    entries.sort((a, b) => b.instantTps - a.instantTps);
+    return entries;
+  }
+
+  function removeMessageTrackerState(
+    sessionId: string,
+    messageId: string
+  ): void {
+    const sessionState = sessionTrackers.get(sessionId);
+    if (!sessionState) {
+      return;
+    }
+    // Remove all tracker states that share the same messageId
+    // (since multiple keys may map to the same message)
+    for (const [key, state] of sessionState.messageTrackers) {
+      if (state.messageId === messageId) {
+        sessionState.messageTrackers.delete(key);
+      }
+    }
+    if (sessionState.messageTrackers.size === 0) {
+      sessionState.aggregate.reset();
+      sessionState.aggregateFirstTokenAt = null;
+    }
+  }
+
+  /**
+   * Schedules a timer to show TPS display after MIN_TPS_ELAPSED_MS
+   * This ensures the TPS is shown even if the stream pauses or ends
+   * before another part arrives.
+   */
+  function scheduleDisplayTimer(sessionId: string): void {
+    // Clear any existing timer for this session
+    const existingTimer = pendingDisplayTimers.get(sessionId);
+    if (existingTimer) {
+      clearTimeout(existingTimer);
+    }
+    
+    // Schedule new timer
+    const timer = setTimeout(() => {
+      pendingDisplayTimers.delete(sessionId);
+      
+      const sessionState = sessionTrackers.get(sessionId);
+      if (!sessionState || !sessionState.aggregateFirstTokenAt) {
+        return;
+      }
+      
+      const now = Date.now();
+      const elapsedSinceFirstToken = now - sessionState.aggregateFirstTokenAt;
+      
+      // Only show if enough time has passed
+      if (elapsedSinceFirstToken < MIN_TPS_ELAPSED_MS) return;
+      
+      // Get all agents and check primary activity
+      const allAgents = getAllActiveAgentsGlobally(now);
+      const hasPrimaryActivity = isPrimarySessionActive(now);
+      
+      if (hasPrimaryActivity) {
+        const smoothedTps = sessionState.aggregate.getSmoothedTPS();
+        const avgTps = sessionState.aggregate.getAverageTPS();
+        const totalTokens = sessionState.aggregate.getTotalTokens();
+        const elapsedMs = sessionState.aggregate.getElapsedMs();
+        
+        if (smoothedTps >= resolvedConfig.minVisibleTPS) {
+          ui.updateDisplay(smoothedTps, avgTps, totalTokens, elapsedMs, allAgents);
+        }
+      } else if (allAgents.length > 0) {
+        ui.updateDisplay(0, 0, 0, 0, allAgents);
+      }
+      
+      logger.debug(`[TpsMeter] Timer-triggered display for session ${sessionId}`);
+    }, MIN_TPS_ELAPSED_MS + 10);
+    
+    pendingDisplayTimers.set(sessionId, timer);
+  }
+  
+  /**
+   * Clears the pending display timer for a session
+   */
+  function clearDisplayTimer(sessionId: string): void {
+    const timer = pendingDisplayTimers.get(sessionId);
+    if (timer) {
+      clearTimeout(timer);
+      pendingDisplayTimers.delete(sessionId);
+    }
   }
 
   /**
@@ -223,13 +561,19 @@ export default function TpsMeterPlugin(
   function cleanup(): void {
     logger.debug("[TpsMeter] Cleaning up all trackers and UI");
 
-    // Clear all trackers
-    trackers.clear();
-    messageRoleCache.clear();
-    messageFirstTokenCache.clear();
-    activeMessageCache.clear();
+    // Clear all pending display timers
+    for (const timer of pendingDisplayTimers.values()) {
+      clearTimeout(timer);
+    }
+    pendingDisplayTimers.clear();
 
-    // Clear UI
+    sessionTrackers.clear();
+    partTextCache.clear();
+    messageTokenCache.clear();
+    messageRoleCache.clear();
+    sessionAgentNameCache.clear();
+    primarySessionId = null;
+
     ui.clear();
   }
 
@@ -252,15 +596,14 @@ export default function TpsMeterPlugin(
     const sessionId = part.sessionID || "default";
     const partText = extractPartText(part);
     if (!delta && partText.length > 0) {
-      const sessionCache = partTextCache.get(sessionId) || new Map<string, string>();
+      const sessionCache =
+        partTextCache.get(sessionId) || new Map<string, string>();
       partTextCache.set(sessionId, sessionCache);
       const cacheKey = `${part.messageID}:${part.id}:${part.type}`;
       const previousText = sessionCache.get(cacheKey) || "";
-      if (partText.startsWith(previousText)) {
-        delta = partText.slice(previousText.length);
-      } else {
-        delta = partText;
-      }
+      delta = partText.startsWith(previousText)
+        ? partText.slice(previousText.length)
+        : partText;
       sessionCache.set(cacheKey, partText);
     }
 
@@ -274,54 +617,92 @@ export default function TpsMeterPlugin(
       return;
     }
 
-    const tracker = getOrCreateTracker(sessionId);
-    const messageId = part.messageID;
-    const activeMessageId = activeMessageCache.get(sessionId);
-    if (activeMessageId !== messageId) {
-      tracker.reset();
-      activeMessageCache.set(sessionId, messageId);
-    }
-    const now = Date.now();
+    const sessionState = getOrCreateSessionState(sessionId);
+    const messageTracker = getOrCreateMessageTrackerState(
+      sessionId,
+      part.messageID,
+      part.id,
+      {
+        agent: part.agent,
+        agentId: part.agentId,
+        agentType: part.agentType,
+        name: part.name,
+      }
+    );
 
-    // Periodically clean up stale message entries to prevent memory leaks
+    const now = Date.now();
     cleanupStaleMessages(now);
 
-    const firstTokenCache = messageFirstTokenCache.get(sessionId) || new Map<string, number>();
-    messageFirstTokenCache.set(sessionId, firstTokenCache);
-    let firstTokenAt = firstTokenCache.get(messageId);
-    if (firstTokenAt === undefined) {
-      firstTokenAt = now;
-      firstTokenCache.set(messageId, firstTokenAt);
+    if (!sessionState.aggregateFirstTokenAt) {
+      sessionState.aggregateFirstTokenAt = now;
+      // Schedule timer-based fallback display in case stream pauses
+      scheduleDisplayTimer(sessionId);
     }
+    if (!messageTracker.firstTokenAt) {
+      messageTracker.firstTokenAt = now;
+      
+      // Set as primary session if this is a non-agent tracker and primary not set
+      const hasAgentMetadata = Boolean(
+        messageTracker.agent || messageTracker.agentId || messageTracker.agentType
+      );
+      if (!hasAgentMetadata && primarySessionId === null) {
+        primarySessionId = sessionId;
+        logger.debug(`[TpsMeter] Primary session set to: ${sessionId}`);
+      }
+      
+      const metaLabel = messageTracker.label;
+      const metaInfo = messageTracker.agent || messageTracker.agentId || messageTracker.agentType
+        ? `agent=${messageTracker.agent?.type ?? messageTracker.agentType ?? "?"} id=${messageTracker.agent?.id ?? messageTracker.agentId ?? "?"}`
+        : "agent=none";
+      logger.info(`[TpsMeter][Debug] tracker initialized ${metaLabel} (${metaInfo}) session=${sessionId} message=${part.messageID} part=${part.id ?? "?"}`);
+    }
+    messageTracker.lastUpdated = now;
 
-    // Count tokens in the delta
     const tokenCount = tokenizer.count(delta);
 
-    // Record the tokens
-    tracker.recordTokens(tokenCount, now);
+    sessionState.aggregate.recordTokens(tokenCount, now);
+    messageTracker.tracker.recordTokens(tokenCount, now);
 
-    const messageCache = messageTokenCache.get(sessionId) || new Map<string, number>();
+    const messageCache =
+      messageTokenCache.get(sessionId) || new Map<string, number>();
     messageTokenCache.set(sessionId, messageCache);
-    const previousTokens = messageCache.get(messageId) ?? 0;
-    messageCache.set(messageId, previousTokens + tokenCount);
+    const previousTokens = messageCache.get(part.messageID) ?? 0;
+    messageCache.set(part.messageID, previousTokens + tokenCount);
 
-    // Get current stats
-    const smoothedTps = tracker.getSmoothedTPS();
-    const avgTps = tracker.getAverageTPS();
-    const totalTokens = tracker.getTotalTokens();
-    const elapsedMs = tracker.getElapsedMs();
-    const elapsedSinceFirstToken = Math.max(0, now - firstTokenAt);
+    const smoothedTps = sessionState.aggregate.getSmoothedTPS();
+    const avgTps = sessionState.aggregate.getAverageTPS();
+    const totalTokens = sessionState.aggregate.getTotalTokens();
+    const elapsedMs = sessionState.aggregate.getElapsedMs();
+    const elapsedSinceFirstToken =
+      sessionState.aggregateFirstTokenAt === null
+        ? 0
+        : Math.max(0, now - sessionState.aggregateFirstTokenAt);
 
-    // Update UI (throttled internally)
     if (
-      elapsedSinceFirstToken >= MIN_TPS_ELAPSED_MS &&
-      smoothedTps >= resolvedConfig.minVisibleTPS
+      elapsedSinceFirstToken >= MIN_TPS_ELAPSED_MS
     ) {
-      ui.updateDisplay(smoothedTps, avgTps, totalTokens, elapsedMs);
+      // Clear the timer-based fallback since we're showing naturally
+      clearDisplayTimer(sessionId);
+      
+      // Get ALL background agents across ALL sessions
+      const allAgents = getAllActiveAgentsGlobally(now);
+      
+      // Determine if we should show the main TPS line
+      const hasPrimaryActivity = isPrimarySessionActive(now) && smoothedTps >= resolvedConfig.minVisibleTPS;
+      
+      if (hasPrimaryActivity) {
+        // Primary is active - show main TPS + agents
+        ui.updateDisplay(smoothedTps, avgTps, totalTokens, elapsedMs, allAgents);
+      } else if (allAgents.length > 0) {
+        // Only agents active (no primary) - show ONLY agent rows, no main line
+        ui.updateDisplay(0, 0, 0, 0, allAgents);
+      }
     }
 
     logger.debug(
-      `[TpsMeter] Session ${sessionId}: +${tokenCount} tokens, TPS: ${smoothedTps.toFixed(1)} (avg: ${avgTps.toFixed(1)})`
+      `[TpsMeter] Session ${sessionId}: +${tokenCount} tokens, TPS: ${smoothedTps.toFixed(
+        1
+      )} (avg: ${avgTps.toFixed(1)})`
     );
   }
 
@@ -339,27 +720,36 @@ export default function TpsMeterPlugin(
     messageRoleCache.set(info.sessionID, roleCache);
     roleCache.set(info.id, info.role);
 
+    // Cache agent name for this session (for labeling background agents)
+    // info.agent contains the agent name like "explore", "librarian", "build", etc.
+    if (info.agent && typeof info.agent === "string") {
+      sessionAgentNameCache.set(info.sessionID, info.agent);
+    }
+
     if (info.role === "assistant") {
       const sessionId = info.sessionID;
-      const tracker = trackers.get(sessionId);
       const sessionCache = partTextCache.get(sessionId);
       const tokenCache = messageTokenCache.get(sessionId) || new Map<string, number>();
       messageTokenCache.set(sessionId, tokenCache);
-      const firstTokenCache = messageFirstTokenCache.get(sessionId) || new Map<string, number>();
-      messageFirstTokenCache.set(sessionId, firstTokenCache);
       const outputTokens = info.tokens?.output ?? 0;
       const reasoningTokens = info.tokens?.reasoning ?? 0;
       const reportedTokens = outputTokens + reasoningTokens;
       const messageId = info.id;
 
+      const messageTracker = getOrCreateMessageTrackerState(sessionId, messageId, undefined, {
+        agent: info.agent,
+        agentId: info.agentId,
+        agentType: info.agentType,
+      });
+
       const previous = tokenCache.get(messageId) ?? 0;
       const nextTokens = Math.max(previous, reportedTokens);
       tokenCache.set(messageId, nextTokens);
 
-      if (info.time?.completed && tracker) {
+      if (info.time?.completed) {
         const completedAt = info.time?.completed ?? Date.now();
         const createdAt = info.time?.created ?? completedAt;
-        const firstTokenAt = firstTokenCache.get(messageId) ?? createdAt;
+        const firstTokenAt = messageTracker.firstTokenAt ?? createdAt;
         const elapsedMs = Math.max(0, completedAt - firstTokenAt);
         const cachedTokens = tokenCache.get(messageId) ?? 0;
         const totalTokens = reportedTokens > 0 ? reportedTokens : cachedTokens;
@@ -393,7 +783,7 @@ export default function TpsMeterPlugin(
       if (info.time?.completed) {
         tokenCache.delete(messageId);
         roleCache.delete(messageId);
-        firstTokenCache.delete(messageId);
+        removeMessageTrackerState(sessionId, messageId);
       }
     }
 
@@ -413,16 +803,18 @@ export default function TpsMeterPlugin(
     const sessionId = event.properties.sessionID || "default";
     logger.debug(`[TpsMeter] Session idle: ${sessionId}`);
 
+    // Clear any pending display timer
+    clearDisplayTimer(sessionId);
+
     // Remove tracker for this specific session
-    trackers.delete(sessionId);
+    sessionTrackers.delete(sessionId);
     partTextCache.delete(sessionId);
     messageTokenCache.delete(sessionId);
     messageRoleCache.delete(sessionId);
-    messageFirstTokenCache.delete(sessionId);
-    activeMessageCache.delete(sessionId);
+    sessionAgentNameCache.delete(sessionId);
 
     // If no more active sessions, clean up UI
-    if (trackers.size === 0) {
+    if (sessionTrackers.size === 0) {
       cleanup();
     }
   }
@@ -442,18 +834,45 @@ export default function TpsMeterPlugin(
     lastCleanupTime = now;
 
     let cleanedCount = 0;
-    for (const [sessionId, firstTokenCache] of messageFirstTokenCache) {
+    for (const [sessionId, sessionState] of sessionTrackers) {
       const tokenCache = messageTokenCache.get(sessionId);
       const roleCache = messageRoleCache.get(sessionId);
+      const sessionCache = partTextCache.get(sessionId);
 
-      for (const [messageId, firstTokenAt] of firstTokenCache) {
-        if (now - firstTokenAt > MAX_MESSAGE_AGE_MS) {
-          // Clean up stale message entries
-          firstTokenCache.delete(messageId);
+      // Collect keys to delete first to avoid mutation during iteration
+      const keysToDelete: string[] = [];
+      for (const [key, messageTracker] of sessionState.messageTrackers) {
+        if (
+          messageTracker.lastUpdated > 0 &&
+          now - messageTracker.lastUpdated > MAX_MESSAGE_AGE_MS
+        ) {
+          keysToDelete.push(key);
+        }
+      }
+
+      // Now delete by key
+      for (const key of keysToDelete) {
+        const messageTracker = sessionState.messageTrackers.get(key);
+        if (messageTracker) {
+          sessionState.messageTrackers.delete(key);
+          const messageId = messageTracker.messageId;
           tokenCache?.delete(messageId);
           roleCache?.delete(messageId);
+          if (sessionCache) {
+            for (const cacheKey of sessionCache.keys()) {
+              if (cacheKey.startsWith(`${messageId}:`)) {
+                sessionCache.delete(cacheKey);
+              }
+            }
+          }
           cleanedCount++;
         }
+      }
+
+      // Reset aggregate if map is empty after cleanup
+      if (sessionState.messageTrackers.size === 0) {
+        sessionState.aggregate.reset();
+        sessionState.aggregateFirstTokenAt = null;
       }
     }
 
@@ -503,6 +922,8 @@ export type {
   Config,
   OpenCodeClient,
   DisplayState,
+  AgentDisplayState,
+  AgentIdentity,
   PluginContext,
   Logger,
   MessageEvent,

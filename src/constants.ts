@@ -24,13 +24,22 @@ export const MAX_BUFFER_SIZE = 100;
 export const MIN_WINDOW_DURATION_SECONDS = 0.1;
 
 /** Token count threshold to trigger burst smoothing (tokens) */
-export const BURST_TOKEN_THRESHOLD = 120;
+export const BURST_TOKEN_THRESHOLD = 50;
 
 /** Default EWMA half-life (ms) for smoothing normal streaming */
 export const DEFAULT_EWMA_HALF_LIFE_MS = 500;
 
-/** EWMA half-life (ms) applied during bursts */
-export const BURST_EWMA_HALF_LIFE_MS = 2000;
+/** EWMA half-life (ms) applied during medium bursts (50-200 tokens) */
+export const BURST_EWMA_HALF_LIFE_MS = 3000;
+
+/** Token count threshold for very large bursts (tool outputs) */
+export const LARGE_BURST_THRESHOLD = 200;
+
+/** EWMA half-life (ms) for very large bursts */
+export const LARGE_BURST_EWMA_HALF_LIFE_MS = 5000;
+
+/** Maximum initial TPS value to prevent startup spikes */
+export const MAX_INITIAL_TPS = 100;
 
 // =============================================================================
 // UI Display Constants
