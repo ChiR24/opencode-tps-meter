@@ -3,7 +3,7 @@
  * Handles display of token processing statistics with throttling and dual-mode support
  */
 
-import type { Config, OpenCodeClient, DisplayState, UIManager as IUIManager } from "./types.js";
+import type { Config, OpenCodeClient, DisplayState, AgentDisplayState, UIManager as IUIManager } from "./types.js";
 import { MIN_TOAST_INTERVAL_MS, DEFAULT_TOAST_DURATION_MS, FINAL_STATS_DURATION_MS } from "./constants.js";
 
 /**
@@ -66,14 +66,9 @@ export function createUIManager(
     return num.toLocaleString("en-US");
   }
 
-  /**
-   * Formats the display string according to spec
-   * "TPS: {instant} (avg {average}) | tokens: {total} | {elapsed}"
-   */
-  function formatDisplay(state: DisplayState): string {
+  function formatPrimaryLine(state: DisplayState): string {
     const parts: string[] = [];
 
-    // TPS display
     if (uiConfig.showInstant || uiConfig.showAverage) {
       const tpsParts: string[] = [];
       if (uiConfig.showInstant) {
@@ -82,20 +77,58 @@ export function createUIManager(
       if (uiConfig.showAverage) {
         tpsParts.push(`(avg ${state.avgTps.toFixed(1)})`);
       }
-      parts.push(tpsParts.join(" "));
+      if (tpsParts.length > 0) {
+        parts.push(tpsParts.join(" "));
+      }
     }
 
-    // Token count
     if (uiConfig.showTotalTokens) {
       parts.push(`tokens: ${formatNumberWithCommas(state.totalTokens)}`);
     }
 
-    // Elapsed time
     if (uiConfig.showElapsed) {
       parts.push(formatElapsedTime(state.elapsedMs));
     }
 
-    return parts.join(" | ");
+    return parts.length > 0 ? parts.join(" | ") : "TPS meter";
+  }
+
+  function formatAgentLine(agent: AgentDisplayState): string {
+    const segments: string[] = [];
+    segments.push(`${agent.instantTps.toFixed(1)} (avg ${agent.avgTps.toFixed(1)})`);
+    segments.push(`tokens: ${formatNumberWithCommas(agent.totalTokens)}`);
+    if (uiConfig.showElapsed) {
+      segments.push(formatElapsedTime(agent.elapsedMs));
+    }
+    return `${agent.label} ${segments.join(" | ")}`.trim();
+  }
+
+  /**
+   * Formats the display string
+   * - If main session is active (totalTokens > 0): show main line + agent lines
+   * - If only agents are active (totalTokens = 0): show only agent lines
+   */
+  function formatDisplay(state: DisplayState): string {
+    const lines: string[] = [];
+    
+    // Only show primary line if main session has actual activity
+    const hasMainActivity = state.totalTokens > 0;
+    if (hasMainActivity) {
+      lines.push(formatPrimaryLine(state));
+    }
+
+    const agentLines = (state.agents ?? [])
+      .filter((agent) => agent.totalTokens > 0)
+      .map((agent) => formatAgentLine(agent));
+
+    lines.push(...agentLines);
+
+    // If no lines at all, show a placeholder
+    if (lines.length === 0) {
+      return "TPS meter (idle)";
+    }
+
+    return lines.join("\n");
   }
 
   /**
@@ -252,13 +285,15 @@ export function createUIManager(
       instantTps: number,
       avgTps: number,
       totalTokens: number,
-      elapsedMs: number
+      elapsedMs: number,
+      agents?: AgentDisplayState[]
     ): void {
       pendingState = {
         instantTps,
         avgTps,
         totalTokens,
         elapsedMs,
+        agents: agents && agents.length > 0 ? agents : undefined,
       };
       scheduleFlush();
     },

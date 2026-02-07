@@ -5,7 +5,7 @@
  */
 
 import type { TPSTrackerOptions, BufferEntry, TPSTracker } from "./types.js";
-import { MAX_BUFFER_SIZE, DEFAULT_ROLLING_WINDOW_MS, MIN_WINDOW_DURATION_SECONDS, BURST_TOKEN_THRESHOLD, DEFAULT_EWMA_HALF_LIFE_MS, BURST_EWMA_HALF_LIFE_MS } from "./constants.js";
+import { MAX_BUFFER_SIZE, DEFAULT_ROLLING_WINDOW_MS, MIN_WINDOW_DURATION_SECONDS, BURST_TOKEN_THRESHOLD, DEFAULT_EWMA_HALF_LIFE_MS, BURST_EWMA_HALF_LIFE_MS, LARGE_BURST_THRESHOLD, LARGE_BURST_EWMA_HALF_LIFE_MS, MAX_INITIAL_TPS } from "./constants.js";
 
 /**
  * Creates a TPSTracker instance - Tracks tokens per second with a rolling window
@@ -124,15 +124,26 @@ export function createTracker(options: TPSTrackerOptions = {}): TPSTracker {
       // Update smoothed TPS using EWMA
       const rawTPS = calculateRawTPS(ts);
       if (!hasSmoothedValue) {
-        smoothedTps = rawTPS;
+        // Cap initial TPS to prevent burst spikes from setting unreasonably high baseline
+        smoothedTps = Math.min(rawTPS, MAX_INITIAL_TPS);
         hasSmoothedValue = true;
       } else {
         // Ensure minimum time delta of 1ms to avoid alpha=1 (no update)
         const timeDelta = Math.max(1, ts - lastSmoothedAt);
-        // Use longer half-life for bursts to smooth them more
-        const halfLife = count > BURST_TOKEN_THRESHOLD
-          ? BURST_EWMA_HALF_LIFE_MS
-          : DEFAULT_EWMA_HALF_LIFE_MS;
+        
+        // 3-level burst detection with progressively stronger smoothing
+        let halfLife: number;
+        if (count > LARGE_BURST_THRESHOLD) {
+          // Very large bursts (tool outputs) - strongest smoothing
+          halfLife = LARGE_BURST_EWMA_HALF_LIFE_MS;
+        } else if (count > BURST_TOKEN_THRESHOLD) {
+          // Medium bursts - moderate smoothing
+          halfLife = BURST_EWMA_HALF_LIFE_MS;
+        } else {
+          // Normal streaming - responsive
+          halfLife = DEFAULT_EWMA_HALF_LIFE_MS;
+        }
+        
         const alpha = Math.exp(-Math.LN2 * timeDelta / halfLife);
         smoothedTps = alpha * smoothedTps + (1 - alpha) * rawTPS;
       }
