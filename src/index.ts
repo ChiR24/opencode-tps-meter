@@ -184,16 +184,15 @@ export default function TpsMeterPlugin(
   }
 
   interface MessageTrackerState {
-    /** Composite key for this tracker (sessionId:messageId:partId or similar) */
+    /** Composite key for this tracker (sessionId:messageId) */
     key: string;
     /** The message ID this tracker is associated with */
     messageId: string;
-    /** Optional part ID for sub-part tracking */
-    partId?: string;
     tracker: TrackerInstance;
     label: string;
     firstTokenAt: number | null;
     lastUpdated: number;
+    /** Agent metadata - may not be populated for cross-session agents */
     agent?: AgentIdentity;
     agentId?: string;
     agentType?: string;
@@ -216,6 +215,11 @@ export default function TpsMeterPlugin(
   // Cache agent names per session (from message.updated events)
   // Key: sessionId, Value: agent name (e.g., "explore", "librarian", "build")
   const sessionAgentNameCache = new Map<string, string>();
+  
+  // Cache agent names per MESSAGE (from message.updated events)
+  // Key: messageId, Value: agent name (e.g., "explore", "librarian", "build")
+  // This is the PRIMARY cache for agent identification since parts don't have agent metadata
+  const messageAgentCache = new Map<string, string>();
   
   // Track the PRIMARY session ID explicitly
   // Primary = the FIRST session that receives assistant tokens (main chat)
@@ -292,43 +296,48 @@ export default function TpsMeterPlugin(
   }
 
   /**
-   * Builds a composite tracker key from session, message, part, and metadata.
-   * Prefers agentId → metadata.agent.id → metadata.agentType → partId → `${sessionId}:${messageId}`
+   * Builds a composite tracker key from session and message.
+   * Key format: `${sessionId}:${messageId}`
+   * 
+   * NOTE: We no longer include agentId or partId in the key because:
+   * 1. Parts don't have agent metadata (OpenCode SDK limitation)
+   * 2. Using partId fragments tokens across multiple trackers for same message
+   * 3. One tracker per message is correct - agent name comes from messageAgentCache
    */
   function buildTrackerKey(
     sessionId: string,
-    messageId: string,
-    partId?: string,
-    metadata?: TrackerMetadata
+    messageId: string
   ): string {
-    const agentId =
-      metadata?.agentId?.trim() ||
-      metadata?.agent?.id?.trim() ||
-      metadata?.agentType?.trim();
-    if (agentId) {
-      return `${sessionId}:${messageId}:${agentId}`;
-    }
-    if (partId) {
-      return `${sessionId}:${messageId}:${partId}`;
-    }
     return `${sessionId}:${messageId}`;
   }
 
   function getOrCreateMessageTrackerState(
     sessionId: string,
     messageId: string,
-    partId?: string,
     metadata?: TrackerMetadata
   ): MessageTrackerState {
     const sessionState = getOrCreateSessionState(sessionId);
-    const key = buildTrackerKey(sessionId, messageId, partId, metadata);
+    const key = buildTrackerKey(sessionId, messageId);
     let trackerState = sessionState.messageTrackers.get(key);
-    const nextLabel = buildAgentLabel(messageId, metadata);
+    
+    // Get agent name from messageAgentCache (populated by message.updated events)
+    const cachedAgentName = messageAgentCache.get(messageId);
+    
+    // Build label - prefer cached agent name over metadata (which is usually empty from parts)
+    const agentName = cachedAgentName || 
+      metadata?.agent?.type ||
+      metadata?.agentType ||
+      metadata?.agent?.name ||
+      null;
+    
+    const nextLabel = agentName 
+      ? `${agentName}(${abbreviateId(messageId)})`
+      : abbreviateId(messageId);
+    
     if (!trackerState) {
       trackerState = {
         key,
         messageId,
-        partId,
         tracker: createTracker({
           sessionId: key,
           rollingWindowMs: resolvedConfig.rollingWindowMs,
@@ -341,7 +350,8 @@ export default function TpsMeterPlugin(
         agentType: metadata?.agentType,
       };
       sessionState.messageTrackers.set(key, trackerState);
-    } else if (trackerState.label !== nextLabel) {
+    } else if (trackerState.label !== nextLabel && nextLabel) {
+      // Update label if we now have agent info
       trackerState.label = nextLabel;
     }
 
@@ -360,10 +370,12 @@ export default function TpsMeterPlugin(
 
   /**
    * Gets ALL active background agents across ALL sessions.
-   * Includes both:
-   * - Same-session agents (detected via agent metadata)
-   * - Cross-session agents (different sessionId than primary)
-   * Uses cached agent names from message.updated events.
+   * Uses messageAgentCache (keyed by messageId) to get agent names.
+   * Uses messageId (not sessionId) for unique identifiers to prevent collisions.
+   * 
+   * Background agents are identified by:
+   * 1. Cross-session: sessionId !== primarySessionId
+   * 2. Same-session: Has cached agent name in messageAgentCache (not the primary message)
    */
   function getAllActiveAgentsGlobally(now: number): AgentDisplayState[] {
     const activityWindow = Math.max(
@@ -377,42 +389,25 @@ export default function TpsMeterPlugin(
         if (!trackerState.firstTokenAt) continue;
         if (now - trackerState.lastUpdated > activityWindow) continue;
         
-        const hasAgentMetadata = Boolean(
-          trackerState.agent || trackerState.agentId || trackerState.agentType
-        );
+        // Get agent name from messageAgentCache (primary source)
+        const cachedAgentName = messageAgentCache.get(trackerState.messageId);
         
-        let isSubagent = false;
-        let label = trackerState.label;
+        // Determine if this is a background agent:
+        // 1. Cross-session (different sessionId from primary)
+        // 2. Same-session but has agent name (subagent within primary session)
+        const isCrossSession = sessionId !== primarySessionId;
+        const isSameSessionAgent = sessionId === primarySessionId && cachedAgentName;
         
-        if (hasAgentMetadata) {
-          // Has agent metadata - definitely a subagent (same-session)
-          isSubagent = true;
-          // Try to get agent name from tracker metadata first, then cache
-          const agentName = 
-            trackerState.agent?.type ||
-            trackerState.agentType ||
-            trackerState.agent?.name ||
-            sessionAgentNameCache.get(sessionId);
-          
-          if (agentName) {
-            // Rebuild label with proper agent name
-            const rawId = trackerState.agentId || trackerState.agent?.id || trackerState.messageId;
-            const identifier = abbreviateId(rawId);
-            label = `${agentName}(${identifier})`;
-          } else if (!label.includes("(")) {
-            // Label is just identifier, add fallback agent name
-            label = `agent(${label})`;
-          }
-        } else if (sessionId !== primarySessionId) {
-          // Different session than primary - treat as subagent (cross-session)
-          isSubagent = true;
-          // Get cached agent name for this session
-          const agentName = sessionAgentNameCache.get(sessionId) || "bg";
-          const shortId = abbreviateId(sessionId.replace(/^ses_/, ""));
-          label = `${agentName}(${shortId})`;
-        }
+        if (!isCrossSession && !isSameSessionAgent) continue;
         
-        if (!isSubagent) continue;
+        // Get agent name from cache or fallback
+        const agentName = cachedAgentName || 
+          sessionAgentNameCache.get(sessionId) || 
+          "bg";
+        
+        // Use messageId for unique identifier (prevents collision when sessions share IDs)
+        const identifier = abbreviateId(trackerState.messageId);
+        const label = `${agentName}(${identifier})`;
         
         entries.push({
           id: trackerKey,
@@ -452,10 +447,9 @@ export default function TpsMeterPlugin(
     
     for (const trackerState of sessionState.messageTrackers.values()) {
       // Only consider NON-agent trackers as primary activity
-      const hasAgentMetadata = Boolean(
-        trackerState.agent || trackerState.agentId || trackerState.agentType
-      );
-      if (hasAgentMetadata) continue;
+      // Check messageAgentCache - if this messageId has a cached agent name, it's an agent
+      const isAgent = Boolean(messageAgentCache.get(trackerState.messageId));
+      if (isAgent) continue;
       
       if (trackerState.firstTokenAt && now - trackerState.lastUpdated <= activityWindow) {
         return true;
@@ -600,6 +594,7 @@ export default function TpsMeterPlugin(
     messageTokenCache.clear();
     messageRoleCache.clear();
     sessionAgentNameCache.clear();
+    messageAgentCache.clear();
     primarySessionId = null;
 
     ui.clear();
@@ -646,16 +641,12 @@ export default function TpsMeterPlugin(
     }
 
     const sessionState = getOrCreateSessionState(sessionId);
+    // Note: part.agent, part.agentId, part.agentType are ALWAYS undefined for TextPart/ReasoningPart
+    // Agent name is looked up from messageAgentCache (populated by message.updated events)
     const messageTracker = getOrCreateMessageTrackerState(
       sessionId,
-      part.messageID,
-      part.id,
-      {
-        agent: part.agent,
-        agentId: part.agentId,
-        agentType: part.agentType,
-        name: part.name,
-      }
+      part.messageID
+      // No metadata passed - agent name comes from messageAgentCache
     );
 
     const now = Date.now();
@@ -669,11 +660,10 @@ export default function TpsMeterPlugin(
     if (!messageTracker.firstTokenAt) {
       messageTracker.firstTokenAt = now;
       
-      // Set as primary session if this is a non-agent tracker and primary not set
-      const hasAgentMetadata = Boolean(
-        messageTracker.agent || messageTracker.agentId || messageTracker.agentType
-      );
-      if (!hasAgentMetadata && primarySessionId === null) {
+      // Set as primary session if this is NOT an agent tracker and primary not set
+      // Check messageAgentCache - if this messageId has a cached agent name, it's an agent
+      const isAgent = Boolean(messageAgentCache.get(part.messageID));
+      if (!isAgent && primarySessionId === null) {
         primarySessionId = sessionId;
         logger.debug(`[TpsMeter] Primary session set to: ${sessionId}`);
       }
@@ -750,19 +740,29 @@ export default function TpsMeterPlugin(
     messageRoleCache.set(info.sessionID, roleCache);
     roleCache.set(info.id, info.role);
 
-    // Cache agent name for this session (for labeling background agents)
-    // info.agent is AgentIdentity object with id, type, name properties
-    // Priority: agent.name > agent.type > agentType string > agent.id
-    if (info.agent || info.agentType) {
-      const agentName =
-        info.agent?.name ||
-        info.agent?.type ||
-        info.agentType ||
-        info.agent?.id;
-      if (agentName && typeof agentName === "string") {
-        sessionAgentNameCache.set(info.sessionID, agentName);
-        logger.debug(`[TpsMeter] Cached agent name "${agentName}" for session ${info.sessionID}`);
-      }
+    // Cache agent name for this MESSAGE (primary source for agent identification)
+    // info.agent can be either:
+    // - A STRING directly (agent name like "explore", "librarian", "build")
+    // - An AgentIdentity object with .name, .type, .id properties
+    let agentName: string | undefined;
+    if (typeof info.agent === "string") {
+      // Direct string - this is the agent name
+      agentName = info.agent;
+    } else if (info.agent) {
+      // AgentIdentity object - prefer type (lowercase identifier) over name (display name)
+      agentName = info.agent.type || info.agent.name || info.agent.id;
+    } else if (info.agentType) {
+      // Fallback to agentType string
+      agentName = info.agentType;
+    }
+    
+    if (agentName) {
+      // Cache by MESSAGE ID (primary) - this is how we identify agents from parts
+      messageAgentCache.set(info.id, agentName);
+      logger.debug(`[TpsMeter] Cached agent name "${agentName}" for message ${info.id}`);
+      
+      // Also cache by session ID for backwards compatibility
+      sessionAgentNameCache.set(info.sessionID, agentName);
     }
 
     if (info.role === "assistant") {
@@ -775,11 +775,8 @@ export default function TpsMeterPlugin(
       const reportedTokens = outputTokens + reasoningTokens;
       const messageId = info.id;
 
-      const messageTracker = getOrCreateMessageTrackerState(sessionId, messageId, undefined, {
-        agent: info.agent,
-        agentId: info.agentId,
-        agentType: info.agentType,
-      });
+      const messageTracker = getOrCreateMessageTrackerState(sessionId, messageId);
+      // Agent name is already cached in messageAgentCache by the code above
 
       const previous = tokenCache.get(messageId) ?? 0;
       const nextTokens = Math.max(previous, reportedTokens);
