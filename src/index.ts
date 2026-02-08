@@ -271,18 +271,24 @@ export default function TpsMeterPlugin(
     messageId: string,
     metadata?: TrackerMetadata
   ): string {
+    // Priority for agent type: agent.type > agentType > agent.name > name
     const typeLabel =
       metadata?.agent?.type?.trim() ||
       metadata?.agentType?.trim() ||
       metadata?.agent?.name?.trim() ||
       metadata?.name?.trim() ||
-      "Subagent";
+      null;
+    
+    // Priority for ID: agentId > agent.id > messageId
     const rawId =
       metadata?.agentId?.trim() ||
       metadata?.agent?.id?.trim() ||
       messageId;
     const identifier = abbreviateId(rawId);
-    return `${typeLabel}(${identifier})`;
+    
+    // Return full label if we have type, otherwise just identifier
+    // (getAllActiveAgentsGlobally will add agent name from cache if needed)
+    return typeLabel ? `${typeLabel}(${identifier})` : identifier;
   }
 
   /**
@@ -381,6 +387,22 @@ export default function TpsMeterPlugin(
         if (hasAgentMetadata) {
           // Has agent metadata - definitely a subagent (same-session)
           isSubagent = true;
+          // Try to get agent name from tracker metadata first, then cache
+          const agentName = 
+            trackerState.agent?.type ||
+            trackerState.agentType ||
+            trackerState.agent?.name ||
+            sessionAgentNameCache.get(sessionId);
+          
+          if (agentName) {
+            // Rebuild label with proper agent name
+            const rawId = trackerState.agentId || trackerState.agent?.id || trackerState.messageId;
+            const identifier = abbreviateId(rawId);
+            label = `${agentName}(${identifier})`;
+          } else if (!label.includes("(")) {
+            // Label is just identifier, add fallback agent name
+            label = `agent(${label})`;
+          }
         } else if (sessionId !== primarySessionId) {
           // Different session than primary - treat as subagent (cross-session)
           isSubagent = true;
@@ -404,6 +426,12 @@ export default function TpsMeterPlugin(
     }
 
     entries.sort((a, b) => b.instantTps - a.instantTps);
+    
+    // Debug logging for background agents
+    if (entries.length > 0) {
+      logger.debug(`[TpsMeter] getAllActiveAgentsGlobally found ${entries.length} agents: ${entries.map(e => `${e.label}@${e.instantTps.toFixed(1)}`).join(", ")}`);
+    }
+    
     return entries;
   }
   
@@ -654,7 +682,9 @@ export default function TpsMeterPlugin(
       const metaInfo = messageTracker.agent || messageTracker.agentId || messageTracker.agentType
         ? `agent=${messageTracker.agent?.type ?? messageTracker.agentType ?? "?"} id=${messageTracker.agent?.id ?? messageTracker.agentId ?? "?"}`
         : "agent=none";
-      logger.info(`[TpsMeter][Debug] tracker initialized ${metaLabel} (${metaInfo}) session=${sessionId} message=${part.messageID} part=${part.id ?? "?"}`);
+      const trackerKey = messageTracker.key;
+      const isBg = sessionId !== primarySessionId;
+      logger.info(`[TpsMeter][Debug] tracker initialized ${metaLabel} (${metaInfo}) session=${sessionId} primary=${primarySessionId} isBg=${isBg} key=${trackerKey} message=${part.messageID} part=${part.id ?? "?"}`);
     }
     messageTracker.lastUpdated = now;
 
@@ -731,6 +761,7 @@ export default function TpsMeterPlugin(
         info.agent?.id;
       if (agentName && typeof agentName === "string") {
         sessionAgentNameCache.set(info.sessionID, agentName);
+        logger.debug(`[TpsMeter] Cached agent name "${agentName}" for session ${info.sessionID}`);
       }
     }
 
