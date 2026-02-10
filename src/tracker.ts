@@ -58,7 +58,9 @@ export function createTracker(options: TPSTrackerOptions = {}): TPSTracker {
   }
 
   /**
-   * Calculates the instantaneous TPS from the buffer (unsmoothed raw value)
+   * Calculates the instantaneous TPS from the buffer (unsmoothed raw value).
+   * Uses `now - oldestTimestamp` as the denominator so idle time between
+   * bursts naturally lowers the reported rate instead of being ignored.
    * @param now - Current timestamp
    * @returns Raw instantaneous TPS
    */
@@ -72,16 +74,12 @@ export function createTracker(options: TPSTrackerOptions = {}): TPSTracker {
     // Calculate total tokens in the window
     let tokensInWindow = 0;
     let oldestTimestamp = now;
-    let newestTimestamp = 0;
 
     for (const entry of buffer) {
       if (entry.timestamp >= cutoff) {
         tokensInWindow += entry.count;
         if (entry.timestamp < oldestTimestamp) {
           oldestTimestamp = entry.timestamp;
-        }
-        if (entry.timestamp > newestTimestamp) {
-          newestTimestamp = entry.timestamp;
         }
       }
     }
@@ -91,11 +89,13 @@ export function createTracker(options: TPSTrackerOptions = {}): TPSTracker {
       return 0;
     }
 
-    // Calculate actual window duration in seconds
-    const windowDurationMs = newestTimestamp - oldestTimestamp;
+    // Use elapsed from oldest entry to NOW — not to newest entry.
+    // This prevents inflated TPS when tokens arrive in short bursts:
+    // idle time after the burst grows the denominator naturally.
+    const windowDurationMs = now - oldestTimestamp;
     const windowDurationSeconds = windowDurationMs / 1000;
 
-    // If window is too short (single entry or < 100ms), use minimum duration
+    // If window is too short (< 300ms), use minimum duration to avoid spikes
     const effectiveDuration = Math.max(windowDurationSeconds, MIN_WINDOW_DURATION_SECONDS);
 
     return tokensInWindow / effectiveDuration;
