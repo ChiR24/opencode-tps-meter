@@ -267,8 +267,14 @@ export default function TpsMeterPlugin(
   }
 
   function abbreviateId(id: string): string {
-    if (!id || id.length <= 4) return id;
-    return `${id.slice(0, 4)}…`;
+    if (!id) return id;
+    // Strip common prefixes like "msg_" that all IDs share — show the differentiating part
+    let stripped = id;
+    if (stripped.startsWith("msg_")) {
+      stripped = stripped.slice(4);
+    }
+    if (stripped.length <= 6) return stripped;
+    return `${stripped.slice(0, 6)}…`;
   }
 
   function buildAgentLabel(

@@ -175,7 +175,7 @@ export function createUIManager(
    * @param instantTps - Current instantaneous TPS value (for color coding)
    */
   function display(message: string, isFinal: boolean = false, instantTps: number = 0): void {
-    const minToastIntervalMs = Math.max(MIN_TOAST_INTERVAL_MS, uiConfig.updateIntervalMs * 3);
+    const minToastIntervalMs = Math.max(MIN_TOAST_INTERVAL_MS, uiConfig.updateIntervalMs * 2);
     const toastDuration = Math.max(DEFAULT_TOAST_DURATION_MS, minToastIntervalMs * 20);
     const now = Date.now();
 
