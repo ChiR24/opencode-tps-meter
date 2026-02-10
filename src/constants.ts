@@ -12,7 +12,7 @@
 // =============================================================================
 
 /** Minimum elapsed time (ms) before displaying TPS to avoid initial spikes */
-export const MIN_TPS_ELAPSED_MS = 250;
+export const MIN_TPS_ELAPSED_MS = 150;
 
 /** Default rolling window duration for TPS calculation (ms) */
 export const DEFAULT_ROLLING_WINDOW_MS = 1000;
@@ -21,13 +21,13 @@ export const DEFAULT_ROLLING_WINDOW_MS = 1000;
 export const MAX_BUFFER_SIZE = 100;
 
 /** Minimum window duration for TPS calculation (seconds) to avoid division by near-zero */
-export const MIN_WINDOW_DURATION_SECONDS = 0.1;
+export const MIN_WINDOW_DURATION_SECONDS = 0.3;
 
 /** Token count threshold to trigger burst smoothing (tokens) */
 export const BURST_TOKEN_THRESHOLD = 50;
 
 /** Default EWMA half-life (ms) for smoothing normal streaming */
-export const DEFAULT_EWMA_HALF_LIFE_MS = 500;
+export const DEFAULT_EWMA_HALF_LIFE_MS = 250;
 
 /** EWMA half-life (ms) applied during medium bursts (50-200 tokens) */
 export const BURST_EWMA_HALF_LIFE_MS = 3000;
@@ -49,7 +49,7 @@ export const MAX_INITIAL_TPS = 100;
 export const DEFAULT_UPDATE_INTERVAL_MS = 50;
 
 /** Minimum interval between toast updates (ms) - prevents UI flooding */
-export const MIN_TOAST_INTERVAL_MS = 150;
+export const MIN_TOAST_INTERVAL_MS = 80;
 
 /** Default toast display duration in milliseconds */
 export const DEFAULT_TOAST_DURATION_MS = 20000;
