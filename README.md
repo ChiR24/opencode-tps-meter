@@ -28,7 +28,7 @@ A live tokens-per-second meter plugin for OpenCode. Track AI token throughput in
 
 - **Real-time Monitoring** — Live TPS calculation with configurable rolling window
 - **Smart Filtering** — Tracks only assistant text/reasoning, excludes user prompts, tools, patches, snapshots, and files
-- **Noise Suppression** — TPS display starts after 250ms of assistant output to avoid spikes
+- **Noise Suppression** — TPS display starts after 150ms of assistant output to avoid spikes
 - **Multi-Session Support** — Isolated tracking per session with automatic cleanup
 - **Throttled UI Updates** — Configurable update intervals to prevent UI flooding
 - **Optional Time Display** — Elapsed time display (disabled by default, enable with `showElapsed: true`)
@@ -392,7 +392,7 @@ The plugin subscribes to three OpenCode event types:
    - **User prompts excluded**: Prevents TPS spikes from user input (which would appear as thousands of TPS since prompts arrive instantly)
    - **Counted parts**: Only `text` and `reasoning` are counted toward TPS
    - **Ignored parts**: `tool`, `patch`, `snapshot`, `file`, `subtask`, `agent`, `retry`, `compaction`
-   - **Minimum elapsed time**: TPS display begins only after 250ms of assistant output
+   - **Minimum elapsed time**: TPS display begins only after 150ms of assistant output
    - Calculates delta tokens between consecutive updates
    - Updates tracker and throttled UI display
 
@@ -468,7 +468,7 @@ If you see extremely high TPS values (e.g., `TPS: 13590.0`) on the first message
 - Filters out **user prompts** (which would count as instant tokens)
 - Only tracks **assistant responses** (actual AI output)
 - Excludes **file parts** from token counting
-- Applies a **250ms minimum elapsed time** before showing TPS
+- Applies a **150ms minimum elapsed time** before showing TPS
 
 If you still see issues, ensure you're on the latest version with role filtering enabled.
 
