@@ -234,12 +234,15 @@ export interface Logger {
  */
 export interface MessageEvent {
   /** Event type identifier */
-  type: "message.part.updated" | "message.updated" | "session.idle";
+  type: "message.part.updated" | "message.part.delta" | "message.updated" | "session.idle";
 
   /** Event payload */
   properties: {
     part?: Part;
     delta?: string;
+    messageID?: string;
+    partID?: string;
+    field?: string;
     info?: {
       id: string;
       sessionID: string;

@@ -91,7 +91,7 @@ function extractPartText(part: Part): string {
   switch (part.type) {
     case "text":
     case "reasoning":
-      return part.text ?? "";
+      return part.text ?? (part as any).reasoning ?? "";
     case "subtask":
       return [part.prompt, part.description, part.command]
         .filter((value) => typeof value === "string" && value.length > 0)
@@ -395,16 +395,12 @@ export default function TpsMeterPlugin(
         if (!trackerState.firstTokenAt) continue;
         if (now - trackerState.lastUpdated > activityWindow) continue;
         
+        // Background agents run in a different session from the primary
+        const isCrossSession = sessionId !== primarySessionId;
+        if (!isCrossSession) continue;
+        
         // Get agent name from messageAgentCache (primary source)
         const cachedAgentName = messageAgentCache.get(trackerState.messageId);
-        
-        // Determine if this is a background agent:
-        // 1. Cross-session (different sessionId from primary)
-        // 2. Same-session but has agent name (subagent within primary session)
-        const isCrossSession = sessionId !== primarySessionId;
-        const isSameSessionAgent = sessionId === primarySessionId && cachedAgentName;
-        
-        if (!isCrossSession && !isSameSessionAgent) continue;
         
         // Get agent name from cache or fallback
         const agentName = cachedAgentName || 
@@ -452,11 +448,6 @@ export default function TpsMeterPlugin(
     );
     
     for (const trackerState of sessionState.messageTrackers.values()) {
-      // Only consider NON-agent trackers as primary activity
-      // Check messageAgentCache - if this messageId has a cached agent name, it's an agent
-      const isAgent = Boolean(messageAgentCache.get(trackerState.messageId));
-      if (isAgent) continue;
-      
       if (trackerState.firstTokenAt && now - trackerState.lastUpdated <= activityWindow) {
         return true;
       }
@@ -606,25 +597,31 @@ export default function TpsMeterPlugin(
     ui.clear();
   }
 
-  /**
-   * Handles message.part.updated events (streaming token chunks)
-   * @param {MessageEvent} event - The event data
-   */
-  function handleMessagePartUpdated(event: MessageEvent): void {
-    const part = event.properties.part;
-    let delta = event.properties.delta;
+/**
+ * Handles message.part.updated and message.part.delta events (streaming token chunks)
+ *
+ * message.part.updated: carries a full Part object with accumulated text
+ * message.part.delta: carries only { sessionID, messageID, partID, field, delta } — no Part object
+ */
+function handleMessagePartUpdated(event: MessageEvent): void {
+  const part = event.properties.part;
+  const deltaSessionId = event.properties.sessionID;
+  const deltaMessageId = event.properties.messageID;
 
-    if (!part) {
-      return;
-    }
+  let delta: string | undefined;
+  let sessionId: string;
+  let messageId: string;
 
+  if (part) {
+    // message.part.updated path — Part object present
     if (!COUNTABLE_PART_TYPES.has(part.type)) {
       return;
     }
+    sessionId = part.sessionID || deltaSessionId || "default";
+    messageId = part.messageID;
 
-    const sessionId = part.sessionID || "default";
     const partText = extractPartText(part);
-    if (!delta && partText.length > 0) {
+    if (!event.properties.delta && partText.length > 0) {
       const sessionCache =
         partTextCache.get(sessionId) || new Map<string, string>();
       partTextCache.set(sessionId, sessionCache);
@@ -634,103 +631,98 @@ export default function TpsMeterPlugin(
         ? partText.slice(previousText.length)
         : partText;
       sessionCache.set(cacheKey, partText);
+    } else {
+      delta = event.properties.delta;
     }
-
-    if (!delta || delta.length === 0) {
-      return;
-    }
-
-    const roleCache = messageRoleCache.get(sessionId);
-    const role = roleCache?.get(part.messageID);
-    if (role !== "assistant") {
-      return;
-    }
-
-    const sessionState = getOrCreateSessionState(sessionId);
-    // Note: part.agent, part.agentId, part.agentType are ALWAYS undefined for TextPart/ReasoningPart
-    // Agent name is looked up from messageAgentCache (populated by message.updated events)
-    const messageTracker = getOrCreateMessageTrackerState(
-      sessionId,
-      part.messageID
-      // No metadata passed - agent name comes from messageAgentCache
-    );
-
-    const now = Date.now();
-    cleanupStaleMessages(now);
-
-    if (!sessionState.aggregateFirstTokenAt) {
-      sessionState.aggregateFirstTokenAt = now;
-      // Schedule timer-based fallback display in case stream pauses
-      scheduleDisplayTimer(sessionId);
-    }
-    if (!messageTracker.firstTokenAt) {
-      messageTracker.firstTokenAt = now;
-      
-      // Set as primary session if this is NOT an agent tracker and primary not set
-      // Check messageAgentCache - if this messageId has a cached agent name, it's an agent
-      const isAgent = Boolean(messageAgentCache.get(part.messageID));
-      if (!isAgent && primarySessionId === null) {
-        primarySessionId = sessionId;
-        logger.debug(`[TpsMeter] Primary session set to: ${sessionId}`);
-      }
-      
-      const metaLabel = messageTracker.label;
-      const metaInfo = messageTracker.agent || messageTracker.agentId || messageTracker.agentType
-        ? `agent=${messageTracker.agent?.type ?? messageTracker.agentType ?? "?"} id=${messageTracker.agent?.id ?? messageTracker.agentId ?? "?"}`
-        : "agent=none";
-      const trackerKey = messageTracker.key;
-      const isBg = sessionId !== primarySessionId;
-      logger.info(`[TpsMeter][Debug] tracker initialized ${metaLabel} (${metaInfo}) session=${sessionId} primary=${primarySessionId} isBg=${isBg} key=${trackerKey} message=${part.messageID} part=${part.id ?? "?"}`);
-    }
-    messageTracker.lastUpdated = now;
-
-    const tokenCount = tokenizer.count(delta);
-
-    sessionState.aggregate.recordTokens(tokenCount, now);
-    messageTracker.tracker.recordTokens(tokenCount, now);
-
-    const messageCache =
-      messageTokenCache.get(sessionId) || new Map<string, number>();
-    messageTokenCache.set(sessionId, messageCache);
-    const previousTokens = messageCache.get(part.messageID) ?? 0;
-    messageCache.set(part.messageID, previousTokens + tokenCount);
-
-    const smoothedTps = sessionState.aggregate.getSmoothedTPS();
-    const avgTps = sessionState.aggregate.getAverageTPS();
-    const totalTokens = sessionState.aggregate.getTotalTokens();
-    const elapsedMs = sessionState.aggregate.getElapsedMs();
-    const elapsedSinceFirstToken =
-      sessionState.aggregateFirstTokenAt === null
-        ? 0
-        : Math.max(0, now - sessionState.aggregateFirstTokenAt);
-
-    if (
-      elapsedSinceFirstToken >= MIN_TPS_ELAPSED_MS
-    ) {
-      // Clear the timer-based fallback since we're showing naturally
-      clearDisplayTimer(sessionId);
-      
-      // Get ALL background agents across ALL sessions
-      const allAgents = getAllActiveAgentsGlobally(now);
-      
-      // Determine if we should show the main TPS line
-      const hasPrimaryActivity = isPrimarySessionActive(now) && smoothedTps >= resolvedConfig.minVisibleTPS;
-      
-      if (hasPrimaryActivity) {
-        // Primary is active - show main TPS + agents
-        ui.updateDisplay(smoothedTps, avgTps, totalTokens, elapsedMs, allAgents);
-      } else if (allAgents.length > 0) {
-        // Only agents active (no primary) - show ONLY agent rows, no main line
-        ui.updateDisplay(0, 0, 0, 0, allAgents);
-      }
-    }
-
-    logger.debug(
-      `[TpsMeter] Session ${sessionId}: +${tokenCount} tokens, TPS: ${smoothedTps.toFixed(
-        1
-      )} (avg: ${avgTps.toFixed(1)})`
-    );
+  } else if (deltaSessionId && deltaMessageId && event.properties.delta) {
+    // message.part.delta path — no Part object, delta string is the token chunk
+    sessionId = deltaSessionId;
+    messageId = deltaMessageId;
+    delta = event.properties.delta;
+  } else {
+    return;
   }
+
+  if (!delta || delta.length === 0) {
+    return;
+  }
+
+  const roleCache = messageRoleCache.get(sessionId);
+  const role = roleCache?.get(messageId);
+  if (role !== "assistant") {
+    return;
+  }
+
+  const sessionState = getOrCreateSessionState(sessionId);
+  const messageTracker = getOrCreateMessageTrackerState(sessionId, messageId);
+
+  const now = Date.now();
+  cleanupStaleMessages(now);
+
+  if (!sessionState.aggregateFirstTokenAt) {
+    sessionState.aggregateFirstTokenAt = now;
+    scheduleDisplayTimer(sessionId);
+  }
+  if (!messageTracker.firstTokenAt) {
+    messageTracker.firstTokenAt = now;
+
+    // Set as primary session if primary not set
+    if (primarySessionId === null) {
+      primarySessionId = sessionId;
+      logger.debug(`[TpsMeter] Primary session set to: ${sessionId}`);
+    }
+
+    const metaLabel = messageTracker.label;
+    const metaInfo = messageTracker.agent || messageTracker.agentId || messageTracker.agentType
+      ? `agent=${messageTracker.agent?.type ?? messageTracker.agentType ?? "?"} id=${messageTracker.agent?.id ?? messageTracker.agentId ?? "?"}`
+      : "agent=none";
+    const trackerKey = messageTracker.key;
+    const isBg = sessionId !== primarySessionId;
+    logger.info(`[TpsMeter][Debug] tracker initialized ${metaLabel} (${metaInfo}) session=${sessionId} primary=${primarySessionId} isBg=${isBg} key=${trackerKey} message=${messageId} part=${part?.id ?? event.properties.partID ?? "?"}`);
+  }
+  messageTracker.lastUpdated = now;
+
+  const tokenCount = tokenizer.count(delta);
+
+  sessionState.aggregate.recordTokens(tokenCount, now);
+  messageTracker.tracker.recordTokens(tokenCount, now);
+
+  const messageCache =
+    messageTokenCache.get(sessionId) || new Map<string, number>();
+  messageTokenCache.set(sessionId, messageCache);
+  const previousTokens = messageCache.get(messageId) ?? 0;
+  messageCache.set(messageId, previousTokens + tokenCount);
+
+  const smoothedTps = sessionState.aggregate.getSmoothedTPS();
+  const avgTps = sessionState.aggregate.getAverageTPS();
+  const totalTokens = sessionState.aggregate.getTotalTokens();
+  const elapsedMs = sessionState.aggregate.getElapsedMs();
+  const elapsedSinceFirstToken =
+    sessionState.aggregateFirstTokenAt === null
+    ? 0
+    : Math.max(0, now - sessionState.aggregateFirstTokenAt);
+
+  if (
+    elapsedSinceFirstToken >= MIN_TPS_ELAPSED_MS
+  ) {
+    clearDisplayTimer(sessionId);
+
+    const allAgents = getAllActiveAgentsGlobally(now);
+    const hasPrimaryActivity = isPrimarySessionActive(now) && smoothedTps >= resolvedConfig.minVisibleTPS;
+
+    if (hasPrimaryActivity) {
+      ui.updateDisplay(smoothedTps, avgTps, totalTokens, elapsedMs, allAgents);
+    } else if (allAgents.length > 0) {
+      ui.updateDisplay(0, 0, 0, 0, allAgents);
+    }
+  }
+
+  logger.debug(
+    `[TpsMeter] Session ${sessionId}: +${tokenCount} tokens, TPS: ${smoothedTps.toFixed(
+      1
+    )} (avg: ${avgTps.toFixed(1)})`
+  );
+}
 
   /**
    * Handles message.updated events (message status changes)
@@ -929,6 +921,7 @@ export default function TpsMeterPlugin(
       try {
         switch (event.type) {
           case "message.part.updated":
+          case "message.part.delta":
             handleMessagePartUpdated(event);
             break;
 
