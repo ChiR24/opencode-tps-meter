@@ -1,5 +1,10 @@
 /**
  * Multi-Agent TPS Meter Tests
+ *
+ * The original code identifies background agents via cross-session detection:
+ * - `primarySessionId` is set to the FIRST session that receives assistant tokens
+ * - `getAllActiveAgentsGlobally()` only shows trackers from sessions != primarySessionId
+ * - `isPrimarySessionActive()` checks if primary session has recent token activity
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "bun:test";
@@ -178,40 +183,50 @@ describe("Multi-Agent TPS Meter Tests", () => {
       const context = createMockContext();
       const handlers = TpsMeterPlugin(context);
 
-      const sessionId = "multi-agent-session";
-      
+      const primarySessionId = "primary-session";
+      const exploreSessionId = "explore-session";
+      const librarianSessionId = "librarian-session";
+
       const exploreAgent = {
         agent: { id: "agent-explore-001", type: "explore", name: "Explore" },
         agentId: "agent-explore-001",
         agentType: "explore",
       };
-      
+
       const librarianAgent = {
         agent: { id: "agent-librarian-002", type: "librarian", name: "Librarian" },
         agentId: "agent-librarian-002",
         agentType: "librarian",
       };
 
-      // Start agent sessions
+      // Register roles and cache agent names for all sessions
       await handlers.event!({
-        event: createMessageUpdatedEvent(sessionId, "msg-explore", "streaming", exploreAgent),
+        event: createMessageUpdatedEvent(primarySessionId, "msg-primary", "streaming"),
       });
       await handlers.event!({
-        event: createMessageUpdatedEvent(sessionId, "msg-librarian", "streaming", librarianAgent),
+        event: createMessageUpdatedEvent(exploreSessionId, "msg-explore", "streaming", exploreAgent),
+      });
+      await handlers.event!({
+        event: createMessageUpdatedEvent(librarianSessionId, "msg-librarian", "streaming", librarianAgent),
       });
 
-      // Send tokens to explore agent
+      // Send primary tokens first to establish primarySessionId
+      await handlers.event!({
+        event: createPartUpdatedEvent(primarySessionId, "msg-primary", "primary-start "),
+      });
+
+      // Send tokens to explore agent (cross-session)
       for (let i = 0; i < 40; i++) {
         await handlers.event!({
-          event: createPartUpdatedEvent(sessionId, "msg-explore", `explore-word${i} `, "text", exploreAgent),
+          event: createPartUpdatedEvent(exploreSessionId, "msg-explore", `explore-word${i} `, "text", exploreAgent),
         });
         if (i % 10 === 0) await delay(10);
       }
 
-      // Send tokens to librarian agent
+      // Send tokens to librarian agent (cross-session)
       for (let i = 0; i < 20; i++) {
         await handlers.event!({
-          event: createPartUpdatedEvent(sessionId, "msg-librarian", `lib-data${i} `, "text", librarianAgent),
+          event: createPartUpdatedEvent(librarianSessionId, "msg-librarian", `lib-data${i} `, "text", librarianAgent),
         });
         if (i % 5 === 0) await delay(20);
       }
@@ -223,13 +238,13 @@ describe("Multi-Agent TPS Meter Tests", () => {
       const lastToast = context.mockClient.toastCalls[context.mockClient.toastCalls.length - 1];
       const lines = lastToast.message.split("\n");
 
-      // Should have at least 2 lines (one per agent)
+      // Should have at least 2 lines (one per agent, plus possible primary line)
       expect(lines.length).toBeGreaterThanOrEqual(2);
 
       // Check that both agent labels appear
       const hasExploreLabel = lines.some(line => line.includes("explore"));
       const hasLibrarianLabel = lines.some(line => line.includes("librarian"));
-      
+
       expect(hasExploreLabel).toBe(true);
       expect(hasLibrarianLabel).toBe(true);
     });
@@ -240,22 +255,33 @@ describe("Multi-Agent TPS Meter Tests", () => {
       const context = createMockContext();
       const handlers = TpsMeterPlugin(context);
 
-      const sessionId = "tps-differentiation-session";
-      
+      const primarySessionId = "tps-primary-session";
+      const fastSessionId = "fast-agent-session";
+      const slowSessionId = "slow-agent-session";
+
       const fastAgent = { agentType: "fast", agentId: "fast-1" };
       const slowAgent = { agentType: "slow", agentId: "slow-1" };
 
+      // Register roles and cache agent names
       await handlers.event!({
-        event: createMessageUpdatedEvent(sessionId, "msg-fast", "streaming", fastAgent),
+        event: createMessageUpdatedEvent(primarySessionId, "msg-primary", "streaming"),
       });
       await handlers.event!({
-        event: createMessageUpdatedEvent(sessionId, "msg-slow", "streaming", slowAgent),
+        event: createMessageUpdatedEvent(fastSessionId, "msg-fast", "streaming", fastAgent),
+      });
+      await handlers.event!({
+        event: createMessageUpdatedEvent(slowSessionId, "msg-slow", "streaming", slowAgent),
+      });
+
+      // Establish primary session
+      await handlers.event!({
+        event: createPartUpdatedEvent(primarySessionId, "msg-primary", "primary-start "),
       });
 
       // Fast agent: 50 tokens per burst
       for (let i = 0; i < 10; i++) {
         await handlers.event!({
-          event: createPartUpdatedEvent(sessionId, "msg-fast", "word ".repeat(50), "text", fastAgent),
+          event: createPartUpdatedEvent(fastSessionId, "msg-fast", "word ".repeat(50), "text", fastAgent),
         });
         await delay(50);
       }
@@ -263,7 +289,7 @@ describe("Multi-Agent TPS Meter Tests", () => {
       // Slow agent: 10 tokens per burst
       for (let i = 0; i < 10; i++) {
         await handlers.event!({
-          event: createPartUpdatedEvent(sessionId, "msg-slow", "word ".repeat(10), "text", slowAgent),
+          event: createPartUpdatedEvent(slowSessionId, "msg-slow", "word ".repeat(10), "text", slowAgent),
         });
         await delay(50);
       }
@@ -273,7 +299,6 @@ describe("Multi-Agent TPS Meter Tests", () => {
       const lastToast = context.mockClient.toastCalls[context.mockClient.toastCalls.length - 1];
       const lines = lastToast.message.split("\n");
 
-      // Extract TPS values from lines containing agent names
       const fastAgentLine = lines.find(line => line.includes("fast"));
       const slowAgentLine = lines.find(line => line.includes("slow"));
 
@@ -288,7 +313,7 @@ describe("Multi-Agent TPS Meter Tests", () => {
       const handlers = TpsMeterPlugin(context);
 
       const sessionId = "primary-only-session";
-      
+
       await handlers.event!({
         event: createMessageUpdatedEvent(sessionId, "msg-primary", "streaming"),
       });
@@ -305,35 +330,45 @@ describe("Multi-Agent TPS Meter Tests", () => {
       expect(context.mockClient.toastCalls.length).toBeGreaterThan(0);
 
       const lastToast = context.mockClient.toastCalls[context.mockClient.toastCalls.length - 1];
-      
+
       // Should show "TPS:" at the start (main line format)
       expect(lastToast.message).toMatch(/^TPS:/m);
     });
 
-    it("should hide main TPS line when only agents are active", async () => {
+    it("should show agent labels when agents are active alongside primary", async () => {
       const context = createMockContext();
       const handlers = TpsMeterPlugin(context);
 
-      const sessionId = "agents-only-session";
-      
+      const primarySessionId = "agents-primary-session";
+      const workerSessionId = "worker-agent-session";
+      const helperSessionId = "helper-agent-session";
+
       const agent1 = { agentType: "worker", agentId: "worker-1" };
       const agent2 = { agentType: "helper", agentId: "helper-1" };
 
-      // Start agents (NO primary session)
+      // Register roles
       await handlers.event!({
-        event: createMessageUpdatedEvent(sessionId, "msg-worker", "streaming", agent1),
+        event: createMessageUpdatedEvent(primarySessionId, "msg-primary", "streaming"),
       });
       await handlers.event!({
-        event: createMessageUpdatedEvent(sessionId, "msg-helper", "streaming", agent2),
+        event: createMessageUpdatedEvent(workerSessionId, "msg-worker", "streaming", agent1),
+      });
+      await handlers.event!({
+        event: createMessageUpdatedEvent(helperSessionId, "msg-helper", "streaming", agent2),
       });
 
-      // Send tokens to agents only
+      // Send primary tokens to establish primarySessionId
+      await handlers.event!({
+        event: createPartUpdatedEvent(primarySessionId, "msg-primary", "primary-start "),
+      });
+
+      // Send tokens to agents (cross-session)
       for (let i = 0; i < 20; i++) {
         await handlers.event!({
-          event: createPartUpdatedEvent(sessionId, "msg-worker", `worker-data${i} `, "text", agent1),
+          event: createPartUpdatedEvent(workerSessionId, "msg-worker", `worker-data${i} `, "text", agent1),
         });
         await handlers.event!({
-          event: createPartUpdatedEvent(sessionId, "msg-helper", `helper-data${i} `, "text", agent2),
+          event: createPartUpdatedEvent(helperSessionId, "msg-helper", `helper-data${i} `, "text", agent2),
         });
         if (i % 5 === 0) await delay(10);
       }
@@ -341,13 +376,9 @@ describe("Multi-Agent TPS Meter Tests", () => {
       await delay(MIN_TPS_ELAPSED_MS + 50);
 
       const lastToast = context.mockClient.toastCalls[context.mockClient.toastCalls.length - 1];
-      const lines = lastToast.message.split("\n");
 
-      // First line should NOT start with "TPS:" (no primary)
-      const firstLine = lines[0];
-      expect(firstLine).not.toMatch(/^TPS:/);
-      
-      // Should have agent labels
+      // Should have primary TPS line and agent labels
+      expect(lastToast.message).toMatch(/^TPS:/m);
       expect(lastToast.message).toContain("worker");
       expect(lastToast.message).toContain("helper");
     });
@@ -358,16 +389,17 @@ describe("Multi-Agent TPS Meter Tests", () => {
       const context = createMockContext();
       const handlers = TpsMeterPlugin(context);
 
-      const sessionId = "switching-session";
+      const primarySessionId = "switching-primary-session";
+      const bgSessionId = "switching-bg-session";
 
       // Phase 1: Primary only
       await handlers.event!({
-        event: createMessageUpdatedEvent(sessionId, "msg-primary", "streaming"),
+        event: createMessageUpdatedEvent(primarySessionId, "msg-primary", "streaming"),
       });
 
       for (let i = 0; i < 15; i++) {
         await handlers.event!({
-          event: createPartUpdatedEvent(sessionId, "msg-primary", `primary-${i} `),
+          event: createPartUpdatedEvent(primarySessionId, "msg-primary", `primary-${i} `),
         });
       }
 
@@ -381,12 +413,12 @@ describe("Multi-Agent TPS Meter Tests", () => {
       // Phase 2: Add agent
       const agent = { agentType: "background", agentId: "bg-1" };
       await handlers.event!({
-        event: createMessageUpdatedEvent(sessionId, "msg-bg", "streaming", agent),
+        event: createMessageUpdatedEvent(bgSessionId, "msg-bg", "streaming", agent),
       });
 
       for (let i = 0; i < 20; i++) {
         await handlers.event!({
-          event: createPartUpdatedEvent(sessionId, "msg-bg", `bg-${i} `, "text", agent),
+          event: createPartUpdatedEvent(bgSessionId, "msg-bg", `bg-${i} `, "text", agent),
         });
         if (i % 5 === 0) await delay(10); // Small delays to spread updates
       }
