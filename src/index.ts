@@ -28,6 +28,15 @@ import {
   CLEANUP_INTERVAL_MS,
 } from "./constants.js";
 
+function createNoopUIManager(): ReturnType<typeof createUIManager> {
+  return {
+    updateDisplay: () => {},
+    showFinalStats: () => {},
+    clear: () => {},
+    setUpdateInterval: () => {},
+  };
+}
+
 /**
  * Helper function to safely stringify any value
  */
@@ -233,7 +242,9 @@ export default function TpsMeterPlugin(
   // Config is guaranteed to be defined (either from loadConfigSync or defaultConfig in catch)
   const resolvedConfig: Config = config;
   
-  const ui = createUIManager(safeContext.client || {}, resolvedConfig);
+  const ui = resolvedConfig.toastFallback
+    ? createUIManager(safeContext.client || {}, resolvedConfig)
+    : createNoopUIManager();
   const tokenizer = createTokenizer(
     resolvedConfig.fallbackTokenHeuristic === "words_div_0_75"
       ? "word"

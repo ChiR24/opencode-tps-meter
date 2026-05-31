@@ -14,6 +14,9 @@ export interface Config {
   /** Whether the plugin is enabled (default: true) */
   enabled: boolean;
 
+  /** Whether to emit legacy toast notifications from the server plugin (default: false) */
+  toastFallback: boolean;
+
   /** Display update interval in milliseconds (default: 50) */
   updateIntervalMs: number;
 

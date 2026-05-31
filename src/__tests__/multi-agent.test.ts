@@ -170,6 +170,7 @@ describe("Multi-Agent TPS Meter Tests", () => {
   beforeEach(() => {
     originalEnv = { ...process.env };
     process.env.TPS_METER_ENABLED = "true";
+    process.env.TPS_METER_TOAST_FALLBACK = "true";
     process.env.TPS_METER_UPDATE_INTERVAL_MS = "50";
     process.env.TPS_METER_ROLLING_WINDOW_MS = "1000";
   });

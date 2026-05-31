@@ -49,6 +49,7 @@ describe("E2E: Plugin Loading", () => {
     const config = loadConfigSync();
     expect(config).toBeDefined();
     expect(config.enabled).toBe(true);
+    expect(config.toastFallback).toBe(false);
     expect(config.updateIntervalMs).toBe(50);
     expect(config.rollingWindowMs).toBe(1000);
     expect(config.format).toBe("compact");

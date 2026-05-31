@@ -1,20 +1,33 @@
-import type { BunPlugin } from "bun";
+import solidTransformPlugin from "@opentui/solid/bun-plugin";
 import path from "path";
 
 async function build(): Promise<void> {
   const srcDir = path.join(import.meta.dir, "src");
   const outDir = path.join(import.meta.dir, "dist");
+  const entrypoints = [path.join(srcDir, "index.ts"), path.join(srcDir, "tui.tsx")];
+  const external = [
+    "@opencode-ai/plugin",
+    "@opencode-ai/plugin/tui",
+    "@opentui/core",
+    "@opentui/keymap",
+    "@opentui/solid",
+    "@opentui/solid/jsx-runtime",
+    "solid-js",
+    "solid-js/web",
+    "zod",
+  ];
 
   // Build ESM output
   const esmResult = await Bun.build({
-    entrypoints: [path.join(srcDir, "index.ts")],
+    entrypoints,
     outdir: outDir,
     format: "esm",
     naming: {
       entry: "[name].mjs",
     },
     target: "node",
-    external: ["@opencode-ai/plugin", "zod"],
+    external,
+    plugins: [solidTransformPlugin],
     minify: false,
     splitting: false,
   });
@@ -26,14 +39,15 @@ async function build(): Promise<void> {
 
   // Build CommonJS output
   const cjsResult = await Bun.build({
-    entrypoints: [path.join(srcDir, "index.ts")],
+    entrypoints,
     outdir: outDir,
     format: "cjs",
     naming: {
       entry: "[name].js",
     },
     target: "node",
-    external: ["@opencode-ai/plugin", "zod"],
+    external,
+    plugins: [solidTransformPlugin],
     minify: false,
     splitting: false,
   });
@@ -87,7 +101,10 @@ async function build(): Promise<void> {
   console.log("✓ Build completed successfully");
   console.log("  - dist/index.mjs (ESM)");
   console.log("  - dist/index.js (CommonJS - OpenCode compatible)");
+  console.log("  - dist/tui.mjs (TUI plugin)");
+  console.log("  - dist/tui.js (internal CommonJS TUI artifact, not package-exported)");
   console.log("  - dist/index.d.ts (TypeScript declarations)");
+  console.log("  - dist/tui.d.ts (TUI declarations)");
 }
 
 // Run build if this file is executed directly

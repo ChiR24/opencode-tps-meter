@@ -165,6 +165,7 @@ describe("OpenCode TPS Meter - Integration Tests", () => {
   beforeEach(() => {
     originalEnv = { ...process.env };
     process.env.TPS_METER_ENABLED = "true";
+    process.env.TPS_METER_TOAST_FALLBACK = "true";
     process.env.TPS_METER_UPDATE_INTERVAL_MS = "50";
   });
 
@@ -173,6 +174,33 @@ describe("OpenCode TPS Meter - Integration Tests", () => {
   });
 
   describe("Full Event Flow", () => {
+    it("should not emit legacy toasts unless toast fallback is enabled", async () => {
+      process.env.TPS_METER_TOAST_FALLBACK = "false";
+
+      const context = createMockContext();
+      const handlers = TpsMeterPlugin(context);
+      const sessionId = "no-toast-session";
+      const messageId = "no-toast-message";
+
+      await handlers.event!({
+        event: createMessageUpdatedEvent(sessionId, messageId, "streaming"),
+      });
+
+      await handlers.event!({
+        event: createPartUpdatedEvent(sessionId, messageId, "streamed assistant output"),
+      });
+      await delay(MIN_TPS_ELAPSED_MS + 10);
+      await handlers.event!({
+        event: createPartUpdatedEvent(sessionId, messageId, " more assistant output"),
+      });
+      await delay(100);
+      await handlers.event!({
+        event: createMessageUpdatedEvent(sessionId, messageId, "complete"),
+      });
+
+      expect(context.mockClient.toastCalls).toHaveLength(0);
+    });
+
     it("should simulate a complete OpenCode session with streaming and completion", async () => {
       const context = createMockContext();
       const handlers = TpsMeterPlugin(context);
@@ -394,6 +422,7 @@ describe("Color Coding Tests", () => {
   beforeEach(() => {
     originalEnv = { ...process.env };
     process.env.TPS_METER_ENABLED = "true";
+    process.env.TPS_METER_TOAST_FALLBACK = "true";
     process.env.TPS_METER_UPDATE_INTERVAL_MS = "50";
   });
 
@@ -472,6 +501,7 @@ describe("Cleanup Tests", () => {
   beforeEach(() => {
     originalEnv = { ...process.env };
     process.env.TPS_METER_ENABLED = "true";
+    process.env.TPS_METER_TOAST_FALLBACK = "true";
     process.env.TPS_METER_UPDATE_INTERVAL_MS = "50";
   });
 
@@ -559,6 +589,7 @@ describe("extractPartText Edge Cases", () => {
   beforeEach(() => {
     originalEnv = { ...process.env };
     process.env.TPS_METER_ENABLED = "true";
+    process.env.TPS_METER_TOAST_FALLBACK = "true";
     process.env.TPS_METER_UPDATE_INTERVAL_MS = "50";
   });
 
@@ -673,6 +704,7 @@ describe("TPS Smoothing Tests", () => {
   beforeEach(() => {
     originalEnv = { ...process.env };
     process.env.TPS_METER_ENABLED = "true";
+    process.env.TPS_METER_TOAST_FALLBACK = "true";
     process.env.TPS_METER_UPDATE_INTERVAL_MS = "50";
   });
 

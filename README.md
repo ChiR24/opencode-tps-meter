@@ -32,8 +32,9 @@ A live tokens-per-second meter plugin for OpenCode. Track AI token throughput in
 - **Multi-Session Support** — Isolated tracking per session with automatic cleanup
 - **Throttled UI Updates** — Configurable update intervals to prevent UI flooding
 - **Optional Time Display** — Elapsed time display (disabled by default, enable with `showElapsed: true`)
-- **TPS-Based Color Coding** — Visual feedback with color-coded toasts (red/yellow/green) based on throughput speed
-- **Dual Display Modes** — TUI toast notifications with fallback to client.toast
+- **TPS-Based Color Coding** — Visual feedback with color-coded persistent TUI text based on throughput speed
+- **Persistent TUI Meter** — OpenCode TUI slot display beside the session prompt on supported versions
+- **Opt-in Toast Fallback** — Legacy toast UI is disabled by default; enable it only for older OpenCode surfaces
 - **Zero Console Logging** — Safe for TUI environments (no console.* calls)
 - **Dual Format** — ESM and CommonJS builds for maximum compatibility
 - **Heuristic Token Counting** — Fast approximation without heavy dependencies
@@ -42,7 +43,13 @@ A live tokens-per-second meter plugin for OpenCode. Track AI token throughput in
 
 ## Installation
 
-Add the plugin to your OpenCode configuration file (`~/.config/opencode/opencode.json`):
+Install with OpenCode's plugin installer so the persistent TUI entrypoint is registered:
+
+```bash
+opencode plug opencode-tps-meter@latest
+```
+
+For manual installation, add the package to your TUI config (`~/.config/opencode/tui.json` or `tui.jsonc`) for persistent display:
 
 ```json
 {
@@ -56,83 +63,41 @@ Add the plugin to your OpenCode configuration file (`~/.config/opencode/opencode
 
 The plugin will automatically hook into OpenCode events and start tracking TPS after installation.
 
-### Programmatic Usage
+On OpenCode versions that support TUI plugins, the package also exposes `opencode-tps-meter/tui`. OpenCode's installer detects that entrypoint; manual installs need the package listed in TUI config for persistent rendering in the session prompt area.
 
-For standalone usage (outside of OpenCode plugin context), import from the source files directly:
+If you intentionally want the old toast UI for an older OpenCode surface, add the package to normal OpenCode plugin config too and set `toastFallback: true` or `TPS_METER_TOAST_FALLBACK=true`.
+
+### Package Exports
+
+When using the plugin with OpenCode, you only need the default package export. OpenCode TUI plugin loading uses the `opencode-tps-meter/tui` subpath automatically when installed through OpenCode's plugin installer or when listed in TUI config.
 
 ```typescript
-// Import from source files (for development/bundler setups)
-import { createTracker } from 'opencode-tps-meter/src/tracker.js';
-import { createUIManager } from 'opencode-tps-meter/src/ui.js';
-import { createTokenizer, countTokens } from 'opencode-tps-meter/src/tokenCounter.js';
-import type { OpenCodeClient } from '@opencode-ai/plugin';
-
-// Or from the built dist files
-import { createTracker } from 'opencode-tps-meter/dist/tracker.js';
-import { createUIManager } from 'opencode-tps-meter/dist/ui.js';
-import { createTokenizer } from 'opencode-tps-meter/dist/tokenCounter.js';
-
-// Initialize components
-const tracker = createTracker({ 
-  sessionId: 'my-session',
-  rollingWindowMs: 2000  // 2-second rolling window
-});
-
-const ui = createUIManager(client, { 
-  updateIntervalMs: 50,
-  format: 'compact',
-  showAverage: true,
-  showInstant: true,
-  showTotalTokens: true,
-  showElapsed: false
-});
-
-const tokenizer = createTokenizer('heuristic');
-
-// Process streaming tokens
-async function processStream(stream: AsyncIterable<string>) {
-  for await (const chunk of stream) {
-    const tokenCount = tokenizer.count(chunk);
-    tracker.recordTokens(tokenCount);
-    
-    ui.updateDisplay(
-      tracker.getInstantTPS(),
-      tracker.getAverageTPS(),
-      tracker.getTotalTokens(),
-      tracker.getElapsedMs()
-    );
-  }
-  
-  // Show final stats
-  ui.showFinalStats(
-    tracker.getTotalTokens(),
-    tracker.getAverageTPS(),
-    tracker.getElapsedMs()
-  );
-}
+import TpsMeterPlugin from 'opencode-tps-meter';
+import TpsMeterTuiPlugin from 'opencode-tps-meter/tui';
 ```
 
-**Note:** When using the plugin with OpenCode, you only need the default export. The programmatic API is for advanced use cases where you want to use the TPS tracking components separately.
+Internal tracker/tokenizer/UI helper modules are not public package exports. For experiments or forks, clone the repository and import helpers from local source paths instead of from the published package.
 
 ---
 
 ## Configuration
 
-Configuration is loaded from multiple sources in priority order (highest to lowest):
+Configuration starts with built-in defaults, then merges these sources in order (later sources override earlier ones):
 
-1. **Environment Variables** (`TPS_METER_*`)
-2. **Global Config** (`~/.config/opencode/tps-meter.json`)
-3. **Project Config** (`.opencode/tps-meter.json`)
-4. **Built-in Defaults**
+1. **Built-in Defaults**
+2. **Project Config** (`.opencode/tps-meter.json`)
+3. **Global Config** (`~/.config/opencode/tps-meter.json`)
+4. **Environment Variables** (`TPS_METER_*`)
 
-> **Note:** Later sources override earlier ones. Environment variables have the highest priority and override all config files. Project config overrides global config.
+> **Note:** Environment variables have the highest priority and override all config files. Global config overrides project config in the current implementation.
 
 ### Environment Variables
 
 ```bash
 # Core settings
-TPS_METER_ENABLED=true                    # Enable/disable plugin
-TPS_METER_UPDATE_INTERVAL_MS=50           # UI update throttle (ms)
+TPS_METER_ENABLED=true                   # Enable/disable plugin
+TPS_METER_TOAST_FALLBACK=false           # Opt into old toast UI when needed
+TPS_METER_UPDATE_INTERVAL_MS=50          # UI update throttle (ms)
 TPS_METER_ROLLING_WINDOW_MS=1000          # TPS calculation window (ms)
 TPS_METER_FORMAT=compact                  # compact | verbose | minimal
 TPS_METER_MIN_VISIBLE_TPS=0               # Minimum TPS to display
@@ -147,7 +112,7 @@ TPS_METER_SHOW_ELAPSED=false
 TPS_METER_FALLBACK_HEURISTIC=chars_div_4  # chars_div_4 | chars_div_3 | words_div_0_75
 
 # Color coding (visual feedback based on TPS speed)
-TPS_METER_ENABLE_COLOR_CODING=false       # Enable color-coded toasts
+TPS_METER_ENABLE_COLOR_CODING=false       # Enable color-coded TUI text
 TPS_METER_SLOW_TPS_THRESHOLD=10           # Below this = red (slow)
 TPS_METER_FAST_TPS_THRESHOLD=50           # Above this = green (fast)
 ```
@@ -159,6 +124,7 @@ Create `.opencode/tps-meter.json` in your project root:
 ```json
 {
   "enabled": true,
+  "toastFallback": false,
   "updateIntervalMs": 50,
   "rollingWindowMs": 1000,
   "showAverage": true,
@@ -166,7 +132,7 @@ Create `.opencode/tps-meter.json` in your project root:
   "showTotalTokens": true,
   "showElapsed": false,
   "format": "compact",
-  "minVisibleTps": 0,
+  "minVisibleTPS": 0,
   "fallbackTokenHeuristic": "chars_div_4",
   "enableColorCoding": false,
   "slowTpsThreshold": 10,
@@ -192,6 +158,7 @@ Output: `TPS: 92.4 (avg 78.1) | tokens: 1,842 | 00:23`
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `enabled` | `boolean` | `true` | Enable/disable the plugin |
+| `toastFallback` | `boolean` | `false` | Emit legacy toast notifications from the server plugin |
 | `updateIntervalMs` | `number` | `50` | UI update interval in milliseconds |
 | `rollingWindowMs` | `number` | `1000` | Rolling window for TPS calculation |
 | `showAverage` | `boolean` | `true` | Show average TPS in display |
@@ -199,7 +166,7 @@ Output: `TPS: 92.4 (avg 78.1) | tokens: 1,842 | 00:23`
 | `showTotalTokens` | `boolean` | `true` | Show total token count |
 | `showElapsed` | `boolean` | `false` | Show elapsed time |
 | `format` | `string` | `"compact"` | Display format: `compact`, `verbose`, `minimal` |
-| `minVisibleTps` | `number` | `0` | Minimum TPS value to trigger display |
+| `minVisibleTPS` | `number` | `0` | Minimum TPS value to trigger display |
 | `fallbackTokenHeuristic` | `string` | `"chars_div_4"` | Token counting method |
 | `enableColorCoding` | `boolean` | `false` | Enable TPS-based color coding |
 | `slowTpsThreshold` | `number` | `10` | TPS below this shows red (slow) |
@@ -209,7 +176,7 @@ Output: `TPS: 92.4 (avg 78.1) | tokens: 1,842 | 00:23`
 
 ## Color Coding
 
-Enable visual feedback with color-coded toasts based on token throughput speed:
+Enable visual feedback with color-coded TUI text based on token throughput speed:
 
 ```json
 {
@@ -226,7 +193,7 @@ Enable visual feedback with color-coded toasts based on token throughput speed:
 | 🟢 **Green** | Above `fastTpsThreshold` | Fast generation |
 | 🟢 **Green** | Final stats | Message complete |
 
-**Note:** Color coding requires TUI toast methods (`client.tui.showToast` or `client.tui.publish`). The fallback `client.toast` methods only support info/success variants.
+**Note:** Persistent TUI display supports color coding directly. Legacy toast color coding is available only when `toastFallback` is enabled and OpenCode exposes TUI toast methods (`client.tui.showToast` or `client.tui.publish`); the fallback `client.toast` methods only support info/success variants.
 
 ---
 
@@ -259,113 +226,19 @@ TPS Meter — Instant: 92.4 tokens/sec | Average: 78.1 tokens/sec | Total: 1,842
 
 ---
 
-## API Reference
+## Package API
 
-**Prerequisite:** Build the plugin first to generate the `dist/` folder:
-```bash
-cd opencode-tps-meter
-bun install
-bun run build
-```
-
-### `createTracker(options?)`
-
-Factory function that creates a TPS tracker with rolling window calculation using a ring buffer (max 100 entries).
+The published package exposes only the OpenCode plugin entrypoints:
 
 ```typescript
-import { createTracker } from 'opencode-tps-meter/dist/tracker.js';
-
-interface TPSTrackerOptions {
-  sessionId?: string;        // Optional session identifier
-  rollingWindowMs?: number;  // Window duration (default: 2000ms)
-}
-
-const tracker = createTracker({
-  sessionId: 'my-session',
-  rollingWindowMs: 2000
-});
-
-// Methods
-tracker.recordTokens(count: number, timestamp?: number): void
-tracker.getInstantTPS(): number           // TPS over rolling window
-tracker.getAverageTPS(): number            // TPS over entire session
-tracker.getTotalTokens(): number           // Total tokens recorded
-tracker.getElapsedMs(): number              // Elapsed time in ms
-tracker.getSessionId(): string | undefined  // Session identifier
-tracker.getBufferSize(): number             // Current buffer entries
-tracker.getMaxBufferSize(): number          // Max buffer capacity (100)
-tracker.getWindowMs(): number               // Rolling window duration
-tracker.reset(): void                        // Reset all tracking data
+import TpsMeterPlugin from 'opencode-tps-meter';
+import TpsMeterTuiPlugin from 'opencode-tps-meter/tui';
 ```
 
-### `createUIManager(client, config)`
+- `opencode-tps-meter` is the legacy server/toast fallback plugin entrypoint. It does not emit toasts unless `toastFallback` is enabled.
+- `opencode-tps-meter/tui` is the persistent OpenCode TUI entrypoint.
 
-Factory function that creates a UI manager with throttled display updates and automatic fallback.
-
-```typescript
-import { createUIManager } from 'opencode-tps-meter/dist/ui.js';
-
-const ui = createUIManager(client, {
-  updateIntervalMs: 50,
-  format: 'compact',
-  showAverage: true,
-  showInstant: true,
-  showTotalTokens: true,
-  showElapsed: false
-});
-
-// Methods
-ui.updateDisplay(instantTps, avgTps, totalTokens, elapsedMs): void
-ui.showFinalStats(totalTokens, avgTps, elapsedMs): void  // Immediate display
-ui.clear(): void                                         // Cleanup resources
-ui.setUpdateInterval(ms: number): void                   // Change throttle
-```
-
-**Display Priority:**
-1. `client.tui.showToast()` — Primary method
-2. `client.tui.publish()` — Fallback for TUI events
-3. `client.toast.info/success()` — Final fallback
-
-### `createTokenizer(type?)`
-
-Factory function for heuristic token counters.
-
-```typescript
-import { createTokenizer } from 'opencode-tps-meter/dist/tokenCounter.js';
-
-// Available types
-const tokenizer = createTokenizer('heuristic');  // Math.ceil(chars / 4) - Default
-const tokenizer = createTokenizer('word');       // Math.ceil(words / 0.75)
-const tokenizer = createTokenizer('code');        // Math.ceil(chars / 3)
-
-// Use the counter
-const count = tokenizer.count('Hello, world!');  // Returns: number
-```
-
-### Helper Functions
-
-```typescript
-import { countTokens, encodeText } from 'opencode-tps-meter/dist/tokenCounter.js';
-
-// Direct token counting with default heuristic
-const tokens = countTokens('Hello, world!');
-
-// Encode placeholder (returns empty array)
-const encoded = encodeText('text');  // Returns: []
-```
-
-### Individual Counter Creators
-
-```typescript
-import { 
-  createHeuristicCounter,   // char/4 based
-  createWordHeuristicCounter,  // word/0.75 based
-  createCodeHeuristicCounter   // char/3 based
-} from 'opencode-tps-meter/dist/tokenCounter.js';
-
-const counter = createHeuristicCounter();
-const count = counter.count('Hello, world!');
-```
+Tracker, tokenizer, and UI helper modules are internal implementation details and are not exported as public package subpaths. If you need those helpers for experimentation, clone or fork the repository and import them from local source files.
 
 ---
 
@@ -385,9 +258,13 @@ const count = counter.count('Hello, world!');
 
 ### Event Handling
 
-The plugin subscribes to three OpenCode event types:
+The plugin subscribes to four OpenCode event types:
 
-1. **`message.part.updated`** — Processes streaming token chunks
+1. **`message.part.delta`** — Processes live text deltas when OpenCode emits incremental streaming updates
+   - Updates live TPS while preserving text cache state for later full-part updates
+   - Zero-token text deltas, such as whitespace under word-based heuristics, are cached so later full updates do not re-count already streamed text
+
+2. **`message.part.updated`** — Processes full text/reasoning part updates
    - **Role Filtering**: Only tracks parts belonging to messages with `role: "assistant"`
    - **User prompts excluded**: Prevents TPS spikes from user input (which would appear as thousands of TPS since prompts arrive instantly)
    - **Counted parts**: Only `text` and `reasoning` are counted toward TPS
@@ -396,16 +273,16 @@ The plugin subscribes to three OpenCode event types:
    - Calculates delta tokens between consecutive updates
    - Updates tracker and throttled UI display
 
-2. **`message.updated`** — Handles message status changes
+3. **`message.updated`** — Handles message status changes
    - Records role information (`user`, `assistant`, `system`) for each message ID
    - Used to filter parts in `message.part.updated` events
    - Processes official token counts from API responses when available
    - Displays final stats when message completes
 
-3. **`session.idle`** — Cleanup trigger
+4. **`session.idle`** — Cleanup trigger
    - Removes tracker for the specific session
    - Clears all session-specific caches (role cache, token cache, part text cache)
-   - Cleans up UI when no active sessions remain
+   - Clears active in-progress display for that session while preserving completed session stats
 
 ### Part Types Counted
 
@@ -444,11 +321,14 @@ bun run build
 - `dist/index.mjs` — ESM build
 - `dist/index.js` — CommonJS build (with OpenCode compatibility fix)
 - `dist/index.d.ts` — TypeScript declarations
+- `dist/tui.mjs` — OpenCode TUI plugin ESM build
+- `dist/tui.js` — internal CommonJS TUI artifact generated by the build; public TUI loading uses the ESM `opencode-tps-meter/tui` export
+- `dist/tui.d.ts` — OpenCode TUI plugin declarations
 
 **Note:** The CJS build requires a manual export fix for OpenCode compatibility:
 ```typescript
 // Replaces: module.exports = __toCommonJS(exports_src);
-// With: module.exports = exports_src.default();
+// With: module.exports = exports_src.default;
 ```
 
 ---
@@ -458,9 +338,12 @@ bun run build
 ### Plugin Not Displaying
 
 - ✅ Verify `TPS_METER_ENABLED` is not set to `false`
-- ✅ Check that OpenCode client has `tui.showToast`, `tui.publish`, or `toast.info` methods
+- ✅ For persistent TUI display, install with `opencode plug install opencode-tps-meter@latest` or add the package to OpenCode's TUI config (`~/.config/opencode/tui.json` or `tui.jsonc`)
+- ✅ Verify your installed package exposes `opencode-tps-meter/tui` for TUI plugin loading
+- ✅ If you still see a `TPS Meter` popup, you are seeing the old server plugin toast path; remove the package from normal OpenCode plugin config or set `toastFallback: false` / `TPS_METER_TOAST_FALLBACK=false`
+- ✅ For intentional toast fallback, set `toastFallback: true` and check that OpenCode client has `tui.showToast`, `tui.publish`, or `toast.info` methods
 - ✅ Ensure you're viewing **assistant role** messages (user/system are filtered)
-- ✅ Check that `minVisibleTps` threshold is not set too high
+- ✅ Check that `minVisibleTPS` threshold is not set too high
 
 ### High TPS on First Message (Fixed)
 
@@ -496,20 +379,12 @@ import TpsMeterPlugin from 'opencode-tps-meter';
 const TpsMeterPlugin = require('opencode-tps-meter');
 ```
 
-**Source/Dist files (for programmatic API):**
+**OpenCode TUI Plugin:**
 ```typescript
-// From built dist files
-import { createTracker } from 'opencode-tps-meter/dist/tracker.js';
-import { createUIManager } from 'opencode-tps-meter/dist/ui.js';
-import { createTokenizer } from 'opencode-tps-meter/dist/tokenCounter.js';
-
-// Or from source (if your bundler supports it)
-import { createTracker } from 'opencode-tps-meter/src/tracker.js';
-import { createUIManager } from 'opencode-tps-meter/src/ui.js';
-import { createTokenizer } from 'opencode-tps-meter/src/tokenCounter.js';
+import TpsMeterTuiPlugin from 'opencode-tps-meter/tui';
 ```
 
-Both formats include full TypeScript declarations.
+Helper modules are internal and are not exported as package subpaths. If you need tracker/tokenizer internals, use a local repository checkout or fork.
 
 ---
 
@@ -524,8 +399,9 @@ export type {
   TokenCounter,        // Token counter interface
   Config,              // Plugin configuration
   OpenCodeClient,      // OpenCode client interface
-  UIManagerConfig,     // UI configuration
   DisplayState,        // Display state structure
+  AgentDisplayState,   // Per-agent display structure
+  AgentIdentity,       // Agent identity metadata
   PluginContext,       // Plugin context
   Logger,              // Logger interface
   MessageEvent,        // Event structure

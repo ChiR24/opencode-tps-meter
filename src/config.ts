@@ -28,6 +28,7 @@ import {
  */
 export const defaultConfig: Config = {
   enabled: true,
+  toastFallback: false,
   updateIntervalMs: DEFAULT_UPDATE_INTERVAL_MS,
   rollingWindowMs: DEFAULT_ROLLING_WINDOW_MS,
   showAverage: true,
@@ -122,6 +123,9 @@ function mergeConfig(partial: Partial<Config>, defaults: Config): Config {
 
   return {
     enabled: isBoolean(partial.enabled) ? partial.enabled : defaults.enabled,
+    toastFallback: isBoolean(partial.toastFallback)
+      ? partial.toastFallback
+      : defaults.toastFallback,
     updateIntervalMs,
     rollingWindowMs,
     showAverage: isBoolean(partial.showAverage)
@@ -192,6 +196,7 @@ function loadConfigFile(filePath: string): Partial<Config> | null {
  *
  * Supported environment variables:
  * - TPS_METER_ENABLED (boolean: true/false)
+ * - TPS_METER_TOAST_FALLBACK (boolean: true/false)
  * - TPS_METER_UPDATE_INTERVAL_MS (number)
  * - TPS_METER_ROLLING_WINDOW_MS (number)
  * - TPS_METER_SHOW_AVERAGE (boolean)
@@ -212,6 +217,10 @@ function loadEnvConfig(): Partial<Config> {
 
   if (process.env.TPS_METER_ENABLED !== undefined) {
     envConfig.enabled = process.env.TPS_METER_ENABLED === "true";
+  }
+
+  if (process.env.TPS_METER_TOAST_FALLBACK !== undefined) {
+    envConfig.toastFallback = process.env.TPS_METER_TOAST_FALLBACK === "true";
   }
 
   if (process.env.TPS_METER_UPDATE_INTERVAL_MS !== undefined) {

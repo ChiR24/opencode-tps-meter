@@ -1,6 +1,6 @@
 {
   "name": "opencode-tps-meter",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "Live tokens-per-second meter for OpenCode",
   "type": "module",
   "main": "./dist/index.js",
@@ -8,11 +8,25 @@
   "types": "./dist/index.d.ts",
   "exports": {
     ".": {
-      "import": { "types": "./dist/index.d.ts", "default": "./dist/index.mjs" },
-      "require": { "types": "./dist/index.d.ts", "default": "./dist/index.js" }
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.mjs"
+      },
+      "require": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      }
+    },
+    "./tui": {
+      "types": "./dist/tui.d.ts",
+      "import": "./dist/tui.mjs"
     }
   },
-  "files": ["dist", "README.md", "LICENSE"],
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
     "build": "bun run build.ts",
     "test": "bun test",
@@ -25,12 +39,23 @@
   "homepage": "https://github.com/ChiR24/opencode-tps-meter#readme",
   "bugs": "https://github.com/ChiR24/opencode-tps-meter/issues",
   "dependencies": {
-    "@opencode-ai/plugin": "^1.0.0"
+    "@opentui/solid": "^0.3.0",
+    "solid-js": "1.9.12"
   },
   "devDependencies": {
+    "@opencode-ai/plugin": "^1.15.13",
+    "@opentui/core": "^0.3.0",
     "typescript": "^5.0.0",
     "@types/node": "^20.0.0"
   },
-  "keywords": ["opencode", "opencode-plugin", "ai", "tokens"],
+  "peerDependencies": {
+    "@opencode-ai/plugin": ">=1.15.13"
+  },
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "ai",
+    "tokens"
+  ],
   "license": "MIT"
 }
