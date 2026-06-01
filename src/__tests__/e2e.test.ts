@@ -51,6 +51,7 @@ describe("E2E: Plugin Loading", () => {
     expect(config.enabled).toBe(true);
     expect(config.toastFallback).toBe(false);
     expect(config.updateIntervalMs).toBe(50);
+    expect(config.initialDisplayDelayMs).toBe(10);
     expect(config.rollingWindowMs).toBe(1000);
     expect(config.format).toBe("compact");
   });
@@ -146,6 +147,7 @@ describe("E2E: Configuration Loading", () => {
       JSON.stringify({
         enabled: false,
         updateIntervalMs: 500,
+        initialDisplayDelayMs: 25,
         format: "verbose",
       })
     );
@@ -153,6 +155,7 @@ describe("E2E: Configuration Loading", () => {
     const config = loadConfigSync();
     expect(config.enabled).toBe(false);
     expect(config.updateIntervalMs).toBe(500);
+    expect(config.initialDisplayDelayMs).toBe(25);
     expect(config.format).toBe("verbose");
     expect(config.rollingWindowMs).toBe(1000);
   });
@@ -221,11 +224,13 @@ describe("E2E: Config Validation Edge Cases", () => {
     const { loadConfigSync } = await import("../config.js");
 
     process.env.TPS_METER_UPDATE_INTERVAL_MS = "1"; // Below min (10)
+    process.env.TPS_METER_INITIAL_DISPLAY_DELAY_MS = "5000";
     process.env.TPS_METER_ROLLING_WINDOW_MS = "50000"; // Above max (30000)
     process.env.TPS_METER_MIN_VISIBLE_TPS = "50000"; // Above max (10000)
 
     const config = loadConfigSync();
     expect(config.updateIntervalMs).toBe(10); // Clamped to min
+    expect(config.initialDisplayDelayMs).toBe(1000);
     expect(config.rollingWindowMs).toBe(30000); // Clamped to max
     expect(config.minVisibleTPS).toBe(10000); // Clamped to max
   });

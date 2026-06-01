@@ -20,6 +20,9 @@ export interface Config {
   /** Display update interval in milliseconds (default: 50) */
   updateIntervalMs: number;
 
+  /** Startup delay before the first live TPS display in milliseconds (default: 10) */
+  initialDisplayDelayMs: number;
+
   /** Rolling window duration for TPS calculation in milliseconds (default: 1000) */
   rollingWindowMs: number;
 
@@ -195,6 +198,7 @@ export interface Part {
   messageID: string;
   type: string;
   text?: string;
+  reasoning?: string;
   prompt?: string;
   description?: string;
   command?: string;

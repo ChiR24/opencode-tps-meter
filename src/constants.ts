@@ -11,8 +11,8 @@
 // TPS Calculation Constants
 // =============================================================================
 
-/** Minimum elapsed time (ms) before displaying TPS to avoid initial spikes */
-export const MIN_TPS_ELAPSED_MS = 150;
+/** Default startup stabilization delay (ms) before displaying live TPS */
+export const DEFAULT_INITIAL_DISPLAY_DELAY_MS = 10;
 
 /** Default rolling window duration for TPS calculation (ms) */
 export const DEFAULT_ROLLING_WINDOW_MS = 1000;

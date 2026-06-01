@@ -15,6 +15,7 @@ import * as os from "os";
 import type { Config } from "./types.js";
 import {
   DEFAULT_UPDATE_INTERVAL_MS,
+  DEFAULT_INITIAL_DISPLAY_DELAY_MS,
   DEFAULT_ROLLING_WINDOW_MS,
   DEFAULT_SLOW_TPS_THRESHOLD,
   DEFAULT_FAST_TPS_THRESHOLD,
@@ -30,6 +31,7 @@ export const defaultConfig: Config = {
   enabled: true,
   toastFallback: false,
   updateIntervalMs: DEFAULT_UPDATE_INTERVAL_MS,
+  initialDisplayDelayMs: DEFAULT_INITIAL_DISPLAY_DELAY_MS,
   rollingWindowMs: DEFAULT_ROLLING_WINDOW_MS,
   showAverage: true,
   showInstant: true,
@@ -99,6 +101,10 @@ function mergeConfig(partial: Partial<Config>, defaults: Config): Config {
     ? clamp(partial.updateIntervalMs, 10, 5000)
     : defaults.updateIntervalMs;
 
+  const initialDisplayDelayMs = isNumber(partial.initialDisplayDelayMs)
+    ? clamp(partial.initialDisplayDelayMs, 0, 1000)
+    : defaults.initialDisplayDelayMs;
+
   const rollingWindowMs = isNumber(partial.rollingWindowMs)
     ? clamp(partial.rollingWindowMs, 100, 30000)
     : defaults.rollingWindowMs;
@@ -127,6 +133,7 @@ function mergeConfig(partial: Partial<Config>, defaults: Config): Config {
       ? partial.toastFallback
       : defaults.toastFallback,
     updateIntervalMs,
+    initialDisplayDelayMs,
     rollingWindowMs,
     showAverage: isBoolean(partial.showAverage)
       ? partial.showAverage
@@ -198,6 +205,7 @@ function loadConfigFile(filePath: string): Partial<Config> | null {
  * - TPS_METER_ENABLED (boolean: true/false)
  * - TPS_METER_TOAST_FALLBACK (boolean: true/false)
  * - TPS_METER_UPDATE_INTERVAL_MS (number)
+ * - TPS_METER_INITIAL_DISPLAY_DELAY_MS (number)
  * - TPS_METER_ROLLING_WINDOW_MS (number)
  * - TPS_METER_SHOW_AVERAGE (boolean)
  * - TPS_METER_SHOW_INSTANT (boolean)
@@ -226,6 +234,11 @@ function loadEnvConfig(): Partial<Config> {
   if (process.env.TPS_METER_UPDATE_INTERVAL_MS !== undefined) {
     const val = parseInt(process.env.TPS_METER_UPDATE_INTERVAL_MS, 10);
     if (!isNaN(val)) envConfig.updateIntervalMs = val;
+  }
+
+  if (process.env.TPS_METER_INITIAL_DISPLAY_DELAY_MS !== undefined) {
+    const val = parseInt(process.env.TPS_METER_INITIAL_DISPLAY_DELAY_MS, 10);
+    if (!isNaN(val)) envConfig.initialDisplayDelayMs = val;
   }
 
   if (process.env.TPS_METER_ROLLING_WINDOW_MS !== undefined) {
