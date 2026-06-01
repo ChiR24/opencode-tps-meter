@@ -28,7 +28,7 @@ A live tokens-per-second meter plugin for OpenCode. Track AI token throughput in
 
 - **Real-time Monitoring** — Live TPS calculation with configurable rolling window
 - **Smart Filtering** — Tracks only assistant text/reasoning, excludes user prompts, tools, patches, snapshots, and files
-- **Noise Suppression** — TPS display starts after 150ms of assistant output to avoid spikes
+- **Noise Suppression** — TPS display starts after a configurable 10ms startup delay for fast live feedback
 - **Multi-Session Support** — Isolated tracking per session with automatic cleanup
 - **Throttled UI Updates** — Configurable update intervals to prevent UI flooding
 - **Optional Time Display** — Elapsed time display (disabled by default, enable with `showElapsed: true`)
@@ -98,6 +98,7 @@ Configuration starts with built-in defaults, then merges these sources in order 
 TPS_METER_ENABLED=true                   # Enable/disable plugin
 TPS_METER_TOAST_FALLBACK=false           # Opt into old toast UI when needed
 TPS_METER_UPDATE_INTERVAL_MS=50          # UI update throttle (ms)
+TPS_METER_INITIAL_DISPLAY_DELAY_MS=10    # First live display delay; set 0 for absolute fastest
 TPS_METER_ROLLING_WINDOW_MS=1000          # TPS calculation window (ms)
 TPS_METER_FORMAT=compact                  # compact | verbose | minimal
 TPS_METER_MIN_VISIBLE_TPS=0               # Minimum TPS to display
@@ -126,6 +127,7 @@ Create `.opencode/tps-meter.json` in your project root:
   "enabled": true,
   "toastFallback": false,
   "updateIntervalMs": 50,
+  "initialDisplayDelayMs": 10,
   "rollingWindowMs": 1000,
   "showAverage": true,
   "showInstant": true,
@@ -160,6 +162,7 @@ Output: `TPS: 92.4 (avg 78.1) | tokens: 1,842 | 00:23`
 | `enabled` | `boolean` | `true` | Enable/disable the plugin |
 | `toastFallback` | `boolean` | `false` | Emit legacy toast notifications from the server plugin |
 | `updateIntervalMs` | `number` | `50` | UI update interval in milliseconds |
+| `initialDisplayDelayMs` | `number` | `10` | Startup delay before the first live TPS display; set `0` for absolute fastest updates |
 | `rollingWindowMs` | `number` | `1000` | Rolling window for TPS calculation |
 | `showAverage` | `boolean` | `true` | Show average TPS in display |
 | `showInstant` | `boolean` | `true` | Show instantaneous TPS in display |
@@ -269,7 +272,7 @@ The plugin subscribes to four OpenCode event types:
    - **User prompts excluded**: Prevents TPS spikes from user input (which would appear as thousands of TPS since prompts arrive instantly)
    - **Counted parts**: Only `text` and `reasoning` are counted toward TPS
    - **Ignored parts**: `tool`, `patch`, `snapshot`, `file`, `subtask`, `agent`, `retry`, `compaction`
-   - **Minimum elapsed time**: TPS display begins only after 150ms of assistant output
+   - **Startup delay**: TPS display begins after `initialDisplayDelayMs` (10ms by default) for fast live feedback
    - Calculates delta tokens between consecutive updates
    - Updates tracker and throttled UI display
 
@@ -279,10 +282,11 @@ The plugin subscribes to four OpenCode event types:
    - Processes official token counts from API responses when available
    - Displays final stats when message completes
 
-4. **`session.idle`** — Cleanup trigger
+4. **`session.idle`** — Persistence and cleanup trigger
+   - Keeps the latest streamed TPS stats visible as an inactive status once the startup delay has elapsed
    - Removes tracker for the specific session
    - Clears all session-specific caches (role cache, token cache, part text cache)
-   - Clears active in-progress display for that session while preserving completed session stats
+   - Preserves completed session stats
 
 ### Part Types Counted
 
@@ -351,7 +355,7 @@ If you see extremely high TPS values (e.g., `TPS: 13590.0`) on the first message
 - Filters out **user prompts** (which would count as instant tokens)
 - Only tracks **assistant responses** (actual AI output)
 - Excludes **file parts** from token counting
-- Applies a **150ms minimum elapsed time** before showing TPS
+- Applies a configurable **10ms startup delay** before showing TPS; set `initialDisplayDelayMs` to `0` for the lowest latency if you accept a jumpier first reading
 
 If you still see issues, ensure you're on the latest version with role filtering enabled.
 
@@ -366,6 +370,7 @@ If you still see issues, ensure you're on the latest version with role filtering
 ### High CPU Usage
 
 - Increase `updateIntervalMs` (try 100ms or 200ms)
+- Increase `initialDisplayDelayMs` if the first live reading is too jumpy
 - Increase `rollingWindowMs` if using short windows
 - Disable `showElapsed` if not needed
 - Check buffer size with `tracker.getBufferSize()`

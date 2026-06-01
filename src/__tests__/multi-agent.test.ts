@@ -404,7 +404,6 @@ describe("Multi-Agent TPS Meter Tests", () => {
         });
       }
 
-      // Wait for timer-based toast + extra time to clear UI throttling (150ms min interval)
       await delay(MIN_TPS_ELAPSED_MS + 200);
 
       // Check primary-only display

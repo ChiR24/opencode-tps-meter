@@ -105,7 +105,7 @@ OpenCode plugin that tracks AI token throughput in real-time. Displays TPS stati
 ### Event Flow
 1. `message.part.updated` → Count delta tokens → Update tracker → Throttled UI update
 2. `message.updated` (completed) → Show final stats
-3. `session.idle` → Cleanup tracker
+3. `session.idle` → Keep latest visible stats after startup delay → cleanup tracker
 
 ---
 
@@ -135,6 +135,7 @@ bun run build                  # Build dual-format output
 ### Environment Variables
 - `TPS_METER_ENABLED` (boolean)
 - `TPS_METER_UPDATE_INTERVAL_MS` (number, default: 50)
+- `TPS_METER_INITIAL_DISPLAY_DELAY_MS` (number, default: 10)
 - `TPS_METER_ROLLING_WINDOW_MS` (number, default: 1000)
 - `TPS_METER_FORMAT` (compact|verbose|minimal)
 - `TPS_METER_FALLBACK_HEURISTIC` (chars_div_4|chars_div_3|words_div_0_75)
