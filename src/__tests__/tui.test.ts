@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 const stableEnv = {
   TPS_METER_ENABLED: "true",
   TPS_METER_UPDATE_INTERVAL_MS: "50",
+  TPS_METER_INITIAL_DISPLAY_DELAY_MS: "10",
   TPS_METER_ROLLING_WINDOW_MS: "1000",
   TPS_METER_SHOW_AVERAGE: "true",
   TPS_METER_SHOW_INSTANT: "true",
@@ -17,6 +18,10 @@ const stableEnv = {
 } as const;
 
 const originalEnv = new Map<keyof typeof stableEnv, string | undefined>();
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 interface RegisteredSlotPlugin {
   slots: {
@@ -388,7 +393,7 @@ describe("TUI plugin", () => {
     await setup.flush();
     const frame = setup.captureCharFrame();
 
-    expect(frame).toContain("4 tok");
+    expect(frame).toContain("3 tok");
     expect(frame).not.toContain("7 tok");
   });
 
@@ -554,6 +559,306 @@ describe("TUI plugin", () => {
 
     expect(frame).toContain("2 tok");
     expect(frame).not.toContain("25 tok");
+  });
+
+  it("counts tiny streamed chunks by cumulative text instead of per-chunk ceilings", async () => {
+    const { handlers, slotPlugin, testRender, theme } = await createHarness();
+
+    const messageUpdated = handlers.get("message.updated");
+    const partDelta = handlers.get("message.part.delta");
+    if (!messageUpdated || !partDelta) {
+      throw new Error("required TUI handlers were not registered");
+    }
+
+    const createdAt = Date.now();
+    const completedAt = createdAt + 10_000;
+    messageUpdated({
+      type: "message.updated",
+      properties: {
+        sessionID: "session-tiny-chunks",
+        info: {
+          id: "message-tiny-chunks",
+          sessionID: "session-tiny-chunks",
+          role: "assistant",
+          time: { created: createdAt },
+          parentID: "parent-1",
+          modelID: "model",
+          providerID: "provider",
+          mode: "chat",
+          agent: "build",
+          path: { cwd: ".", root: "." },
+          cost: 0,
+          tokens: {
+            input: 0,
+            output: 0,
+            reasoning: 0,
+            cache: { read: 0, write: 0 },
+          },
+        },
+      },
+    });
+
+    for (let i = 0; i < 10; i += 1) {
+      partDelta({
+        type: "message.part.delta",
+        properties: {
+          sessionID: "session-tiny-chunks",
+          messageID: "message-tiny-chunks",
+          partID: "part-1",
+          field: "text",
+          delta: "x",
+        },
+      });
+    }
+
+    messageUpdated({
+      type: "message.updated",
+      properties: {
+        sessionID: "session-tiny-chunks",
+        info: {
+          id: "message-tiny-chunks",
+          sessionID: "session-tiny-chunks",
+          role: "assistant",
+          time: { created: createdAt, completed: completedAt },
+          parentID: "parent-1",
+          modelID: "model",
+          providerID: "provider",
+          mode: "chat",
+          agent: "build",
+          path: { cwd: ".", root: "." },
+          cost: 0,
+          tokens: {
+            input: 0,
+            output: 0,
+            reasoning: 0,
+            cache: { read: 0, write: 0 },
+          },
+          finish: "stop",
+        },
+      },
+    });
+
+    const slot = slotPlugin?.slots.session_prompt_right;
+    if (!slot) {
+      throw new Error("session_prompt_right slot was not registered");
+    }
+
+    const setup = await testRender(() => slot({ theme }, { session_id: "session-tiny-chunks" }), { width: 80, height: 5 });
+    await setup.flush();
+    const frame = setup.captureCharFrame();
+
+    expect(frame).toContain("3 tok");
+    expect(frame).not.toContain("10 tok");
+  });
+
+  it("publishes the first live snapshot after the configured latency without waiting for another delta", async () => {
+    const { disposeCallbacks, handlers, slotPlugin, testRender, theme } = await createHarness();
+
+    const messageUpdated = handlers.get("message.updated");
+    const partDelta = handlers.get("message.part.delta");
+    if (!messageUpdated || !partDelta) {
+      throw new Error("required TUI handlers were not registered");
+    }
+
+    messageUpdated({
+      type: "message.updated",
+      properties: {
+        sessionID: "session-live-latency",
+        info: {
+          id: "message-live-latency",
+          sessionID: "session-live-latency",
+          role: "assistant",
+          time: { created: Date.now() },
+          parentID: "parent-1",
+          modelID: "model",
+          providerID: "provider",
+          mode: "chat",
+          agent: "build",
+          path: { cwd: ".", root: "." },
+          cost: 0,
+          tokens: {
+            input: 0,
+            output: 0,
+            reasoning: 0,
+            cache: { read: 0, write: 0 },
+          },
+        },
+      },
+    });
+
+    partDelta({
+      type: "message.part.delta",
+      properties: {
+        sessionID: "session-live-latency",
+        messageID: "message-live-latency",
+        partID: "part-1",
+        field: "text",
+        delta: "abcd",
+      },
+    });
+
+    const slot = slotPlugin?.slots.session_prompt_right;
+    if (!slot) {
+      throw new Error("session_prompt_right slot was not registered");
+    }
+
+    await delay(40);
+
+    const delayed = await testRender(() => slot({ theme }, { session_id: "session-live-latency" }), { width: 80, height: 5 });
+    await delayed.flush();
+    const frame = delayed.captureCharFrame();
+
+    expect(frame).toContain("TPS");
+    expect(frame).toContain("1 tok");
+
+    for (const callback of disposeCallbacks) {
+      await callback();
+    }
+  });
+
+  it("keeps the latest streamed stats visible after the session idles", async () => {
+    const { disposeCallbacks, handlers, slotPlugin, testRender, theme } = await createHarness();
+
+    const messageUpdated = handlers.get("message.updated");
+    const partDelta = handlers.get("message.part.delta");
+    const sessionIdle = handlers.get("session.idle");
+    if (!messageUpdated || !partDelta || !sessionIdle) {
+      throw new Error("required TUI handlers were not registered");
+    }
+
+    messageUpdated({
+      type: "message.updated",
+      properties: {
+        sessionID: "session-idle-persist",
+        info: {
+          id: "message-idle-persist",
+          sessionID: "session-idle-persist",
+          role: "assistant",
+          time: { created: Date.now() },
+          parentID: "parent-1",
+          modelID: "model",
+          providerID: "provider",
+          mode: "chat",
+          agent: "build",
+          path: { cwd: ".", root: "." },
+          cost: 0,
+          tokens: {
+            input: 0,
+            output: 0,
+            reasoning: 0,
+            cache: { read: 0, write: 0 },
+          },
+        },
+      },
+    });
+
+    partDelta({
+      type: "message.part.delta",
+      properties: {
+        sessionID: "session-idle-persist",
+        messageID: "message-idle-persist",
+        partID: "part-1",
+        field: "text",
+        delta: "abcd",
+      },
+    });
+
+    await delay(40);
+
+    sessionIdle({
+      type: "session.idle",
+      properties: {
+        sessionID: "session-idle-persist",
+      },
+    });
+
+    const slot = slotPlugin?.slots.session_prompt_right;
+    if (!slot) {
+      throw new Error("session_prompt_right slot was not registered");
+    }
+
+    const setup = await testRender(() => slot({ theme }, { session_id: "session-idle-persist" }), { width: 80, height: 5 });
+    await setup.flush();
+    const frame = setup.captureCharFrame();
+
+    expect(frame).toContain("TPS");
+    expect(frame).toContain("1 tok");
+
+    for (const callback of disposeCallbacks) {
+      await callback();
+    }
+  });
+
+  it("does not create an idle snapshot before the startup delay", async () => {
+    process.env.TPS_METER_INITIAL_DISPLAY_DELAY_MS = "1000";
+    const { disposeCallbacks, handlers, slotPlugin, testRender, theme } = await createHarness();
+
+    const messageUpdated = handlers.get("message.updated");
+    const partDelta = handlers.get("message.part.delta");
+    const sessionIdle = handlers.get("session.idle");
+    if (!messageUpdated || !partDelta || !sessionIdle) {
+      throw new Error("required TUI handlers were not registered");
+    }
+
+    messageUpdated({
+      type: "message.updated",
+      properties: {
+        sessionID: "session-idle-before-delay",
+        info: {
+          id: "message-idle-before-delay",
+          sessionID: "session-idle-before-delay",
+          role: "assistant",
+          time: { created: Date.now() },
+          parentID: "parent-1",
+          modelID: "model",
+          providerID: "provider",
+          mode: "chat",
+          agent: "build",
+          path: { cwd: ".", root: "." },
+          cost: 0,
+          tokens: {
+            input: 0,
+            output: 0,
+            reasoning: 0,
+            cache: { read: 0, write: 0 },
+          },
+        },
+      },
+    });
+
+    partDelta({
+      type: "message.part.delta",
+      properties: {
+        sessionID: "session-idle-before-delay",
+        messageID: "message-idle-before-delay",
+        partID: "part-1",
+        field: "text",
+        delta: "abcd",
+      },
+    });
+
+    sessionIdle({
+      type: "session.idle",
+      properties: {
+        sessionID: "session-idle-before-delay",
+      },
+    });
+
+    const slot = slotPlugin?.slots.session_prompt_right;
+    if (!slot) {
+      throw new Error("session_prompt_right slot was not registered");
+    }
+
+    const setup = await testRender(() => slot({ theme }, { session_id: "session-idle-before-delay" }), { width: 80, height: 5 });
+    await setup.flush();
+    const frame = setup.captureCharFrame();
+
+    expect(frame).not.toContain("TPS");
+    expect(frame).not.toContain("1 tok");
+
+    for (const callback of disposeCallbacks) {
+      await callback();
+    }
   });
 
   it("removes event handlers on lifecycle dispose", async () => {

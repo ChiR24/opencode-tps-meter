@@ -3,7 +3,7 @@ import { createMemo, createSignal, Show } from "solid-js";
 import { createTracker } from "./tracker.js";
 import { createTokenizer } from "./tokenCounter.js";
 import { defaultConfig, loadConfigSync } from "./config.js";
-import { COUNTABLE_PART_TYPES, INVALID_FINISH_REASONS, MIN_TPS_ELAPSED_MS } from "./constants.js";
+import { COUNTABLE_PART_TYPES, INVALID_FINISH_REASONS } from "./constants.js";
 import type { Config } from "./types.js";
 
 type TrackerInstance = ReturnType<typeof createTracker>;
@@ -117,6 +117,7 @@ const tui: TuiPlugin = async (api) => {
   const sessions = new Map<string, SessionState>();
   const partTextCache = new Map<string, Map<string, string>>();
   const messageRoles = new Map<string, Map<string, Role>>();
+  const publishTimers = new Map<string, ReturnType<typeof setTimeout>>();
   const disposers: Array<() => void> = [];
 
   function getPartTextCache(sessionId: string): Map<string, string> {
@@ -150,6 +151,7 @@ const tui: TuiPlugin = async (api) => {
       return;
     }
 
+    clearPublishTimer(sessionId);
     state.lastPublishedAt = now;
     const nextSnapshot = {
       sessionId,
@@ -162,8 +164,64 @@ const tui: TuiPlugin = async (api) => {
     setSnapshots((current) => new Map(current).set(sessionId, nextSnapshot));
   }
 
+  function clearPublishTimer(sessionId: string): void {
+    const timer = publishTimers.get(sessionId);
+    if (timer) {
+      clearTimeout(timer);
+      publishTimers.delete(sessionId);
+    }
+  }
+
+  function scheduleActivePublish(sessionId: string, delayMs: number): void {
+    if (publishTimers.has(sessionId)) {
+      return;
+    }
+
+    const timer = setTimeout(() => {
+      publishTimers.delete(sessionId);
+      const state = sessions.get(sessionId);
+      const now = Date.now();
+      if (
+        state !== undefined &&
+        state.firstTokenAt !== null &&
+        now - state.firstTokenAt >= config.initialDisplayDelayMs &&
+        now - state.lastPublishedAt >= config.updateIntervalMs &&
+        state.tracker.getTotalTokens() > 0 &&
+        state.tracker.getSmoothedTPS() >= config.minVisibleTPS
+      ) {
+        publish(sessionId, true, now);
+      }
+    }, delayMs);
+    publishTimers.set(sessionId, timer);
+  }
+
+  function maybePublishActive(sessionId: string, now: number): void {
+    const state = sessions.get(sessionId);
+    if (!state || state.firstTokenAt === null) {
+      return;
+    }
+
+    const elapsedSinceFirstToken = now - state.firstTokenAt;
+    const elapsedSinceLastPublish = now - state.lastPublishedAt;
+    const initialDelayRemaining = config.initialDisplayDelayMs - elapsedSinceFirstToken;
+    const throttleDelayRemaining = config.updateIntervalMs - elapsedSinceLastPublish;
+
+    if (
+      initialDelayRemaining <= 0 &&
+      throttleDelayRemaining <= 0 &&
+      state.tracker.getSmoothedTPS() >= config.minVisibleTPS
+    ) {
+      publish(sessionId, true, now);
+      return;
+    }
+
+    if (state.tracker.getSmoothedTPS() >= config.minVisibleTPS) {
+      scheduleActivePublish(sessionId, Math.max(1, initialDelayRemaining, throttleDelayRemaining));
+    }
+  }
+
   function publishFinal(sessionId: string, totalTokens: number, avgTps: number, elapsedMs: number): void {
-    if (totalTokens === 0 || elapsedMs < MIN_TPS_ELAPSED_MS) {
+    if (totalTokens === 0 || elapsedMs < config.initialDisplayDelayMs) {
       return;
     }
 
@@ -179,6 +237,7 @@ const tui: TuiPlugin = async (api) => {
   }
 
   function resetSession(sessionId: string): void {
+    clearPublishTimer(sessionId);
     sessions.delete(sessionId);
     partTextCache.delete(sessionId);
     messageRoles.delete(sessionId);
@@ -195,44 +254,68 @@ const tui: TuiPlugin = async (api) => {
     }
   }
 
-  function rememberDeltaText(sessionId: string, messageId: string, partId: string, delta: string): void {
+  function persistIdleSnapshot(sessionId: string, now: number = Date.now()): void {
+    const state = sessions.get(sessionId);
+    if (state?.tracker.getTotalTokens()) {
+      if (state.firstTokenAt !== null && now - state.firstTokenAt >= config.initialDisplayDelayMs) {
+        publish(sessionId, false, now);
+        return;
+      }
+
+      const current = snapshots().get(sessionId);
+      if (!current?.active) {
+        return;
+      }
+
+      setSnapshots((existing) => new Map(existing).set(sessionId, { ...current, active: false }));
+      return;
+    }
+
+    const current = snapshots().get(sessionId);
+    if (current?.active) {
+      setSnapshots((existing) => new Map(existing).set(sessionId, { ...current, active: false }));
+    }
+  }
+
+  function countTokenDifference(previousText: string, nextText: string): number {
+    return Math.max(0, tokenizer.count(nextText) - tokenizer.count(previousText));
+  }
+
+  function rememberDeltaText(sessionId: string, messageId: string, partId: string, delta: string): number {
     const cache = getPartTextCache(sessionId);
+    const liveKey = `${messageId}:${partId}:live`;
+    const previousLiveText = cache.get(liveKey) ?? "";
+    const nextLiveText = `${previousLiveText}${delta}`;
+    cache.set(liveKey, nextLiveText);
+
     for (const partType of COUNTABLE_PART_TYPES) {
       const key = `${messageId}:${partId}:${partType}`;
       cache.set(key, `${cache.get(key) ?? ""}${delta}`);
     }
+
+    return countTokenDifference(previousLiveText, nextLiveText);
   }
 
-  function shouldTrackDelta(sessionId: string, messageId: string, delta: string): boolean {
-    if (delta.length === 0) {
+  function shouldTrackText(sessionId: string, messageId: string, text: string): boolean {
+    if (text.length === 0) {
       return false;
     }
     return messageRoles.get(sessionId)?.get(messageId) === "assistant";
   }
 
-  function recordDelta(sessionId: string, messageId: string, delta: string): boolean {
-    if (!shouldTrackDelta(sessionId, messageId, delta)) {
+  function recordTokenCount(sessionId: string, tokenCount: number): boolean {
+    if (tokenCount === 0) {
       return false;
     }
+
     const now = Date.now();
     const state = getSessionState(sessionId);
     if (state.firstTokenAt === null) {
       state.firstTokenAt = now;
     }
 
-    const tokenCount = tokenizer.count(delta);
-    if (tokenCount === 0) {
-      return false;
-    }
-
     state.tracker.recordTokens(tokenCount, now);
-    if (
-      now - state.firstTokenAt >= MIN_TPS_ELAPSED_MS &&
-      now - state.lastPublishedAt >= config.updateIntervalMs &&
-      state.tracker.getSmoothedTPS() >= config.minVisibleTPS
-    ) {
-      publish(sessionId, true, now);
-    }
+    maybePublishActive(sessionId, now);
     return true;
   }
 
@@ -279,14 +362,14 @@ const tui: TuiPlugin = async (api) => {
     if (event.properties.field !== "text") {
       return;
     }
-    if (shouldTrackDelta(event.properties.sessionID, event.properties.messageID, event.properties.delta)) {
-      rememberDeltaText(
+    if (shouldTrackText(event.properties.sessionID, event.properties.messageID, event.properties.delta)) {
+      const tokenCount = rememberDeltaText(
         event.properties.sessionID,
         event.properties.messageID,
         event.properties.partID,
         event.properties.delta
       );
-      recordDelta(event.properties.sessionID, event.properties.messageID, event.properties.delta);
+      recordTokenCount(event.properties.sessionID, tokenCount);
     }
   }));
 
@@ -310,16 +393,18 @@ const tui: TuiPlugin = async (api) => {
 
     const cacheKey = `${part.messageID}:${part.id}:${part.type}`;
     const previousText = sessionCache.get(cacheKey) ?? "";
-    const delta = text.startsWith(previousText) ? text.slice(previousText.length) : text;
-    if (shouldTrackDelta(event.properties.sessionID, part.messageID, delta)) {
-      recordDelta(event.properties.sessionID, part.messageID, delta);
+    if (shouldTrackText(event.properties.sessionID, part.messageID, text)) {
+      const tokenCount = text.startsWith(previousText)
+        ? countTokenDifference(previousText, text)
+        : tokenizer.count(text);
       sessionCache.set(cacheKey, text);
+      recordTokenCount(event.properties.sessionID, tokenCount);
     }
   }));
 
   disposers.push(api.event.on("session.idle", (event) => {
+    persistIdleSnapshot(event.properties.sessionID);
     resetSession(event.properties.sessionID);
-    clearActiveSnapshot(event.properties.sessionID);
   }));
 
   api.lifecycle.onDispose(() => {
@@ -329,6 +414,10 @@ const tui: TuiPlugin = async (api) => {
     sessions.clear();
     partTextCache.clear();
     messageRoles.clear();
+    for (const timer of publishTimers.values()) {
+      clearTimeout(timer);
+    }
+    publishTimers.clear();
     setSnapshots(new Map<string, TuiSnapshot>());
   });
 };
