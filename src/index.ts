@@ -21,7 +21,6 @@ import { createUIManager } from "./ui.js";
 import { createTokenizer } from "./tokenCounter.js";
 import { loadConfigSync, defaultConfig } from "./config.js";
 import {
-  MIN_TPS_ELAPSED_MS,
   INVALID_FINISH_REASONS,
   COUNTABLE_PART_TYPES,
   MAX_MESSAGE_AGE_MS,
@@ -100,7 +99,7 @@ function extractPartText(part: Part): string {
   switch (part.type) {
     case "text":
     case "reasoning":
-      return part.text ?? (part as any).reasoning ?? "";
+      return part.text ?? part.reasoning ?? "";
     case "subtask":
       return [part.prompt, part.description, part.command]
         .filter((value) => typeof value === "string" && value.length > 0)
@@ -397,7 +396,7 @@ export default function TpsMeterPlugin(
   function getAllActiveAgentsGlobally(now: number): AgentDisplayState[] {
     const activityWindow = Math.max(
       resolvedConfig.rollingWindowMs,
-      MIN_TPS_ELAPSED_MS * 4
+      resolvedConfig.initialDisplayDelayMs * 4
     );
     const entries: AgentDisplayState[] = [];
 
@@ -455,7 +454,7 @@ export default function TpsMeterPlugin(
     
     const activityWindow = Math.max(
       resolvedConfig.rollingWindowMs,
-      MIN_TPS_ELAPSED_MS * 4
+      resolvedConfig.initialDisplayDelayMs * 4
     );
     
     for (const trackerState of sessionState.messageTrackers.values()) {
@@ -472,7 +471,7 @@ export default function TpsMeterPlugin(
   ): AgentDisplayState[] {
     const activityWindow = Math.max(
       resolvedConfig.rollingWindowMs,
-      MIN_TPS_ELAPSED_MS * 4
+      resolvedConfig.initialDisplayDelayMs * 4
     );
     const entries: AgentDisplayState[] = [];
 
@@ -524,7 +523,7 @@ export default function TpsMeterPlugin(
   }
 
   /**
-   * Schedules a timer to show TPS display after MIN_TPS_ELAPSED_MS
+   * Schedules a timer to show TPS display after initialDisplayDelayMs
    * This ensures the TPS is shown even if the stream pauses or ends
    * before another part arrives.
    */
@@ -548,7 +547,7 @@ export default function TpsMeterPlugin(
       const elapsedSinceFirstToken = now - sessionState.aggregateFirstTokenAt;
       
       // Only show if enough time has passed
-      if (elapsedSinceFirstToken < MIN_TPS_ELAPSED_MS) return;
+      if (elapsedSinceFirstToken < resolvedConfig.initialDisplayDelayMs) return;
       
       // Get all agents and check primary activity
       const allAgents = getAllActiveAgentsGlobally(now);
@@ -568,7 +567,7 @@ export default function TpsMeterPlugin(
       }
       
       logger.debug(`[TpsMeter] Timer-triggered display for session ${sessionId}`);
-    }, MIN_TPS_ELAPSED_MS + 10);
+    }, resolvedConfig.initialDisplayDelayMs);
     
     pendingDisplayTimers.set(sessionId, timer);
   }
@@ -608,6 +607,31 @@ export default function TpsMeterPlugin(
     ui.clear();
   }
 
+  function getPartTextCache(sessionId: string): Map<string, string> {
+    const sessionCache = partTextCache.get(sessionId) || new Map<string, string>();
+    partTextCache.set(sessionId, sessionCache);
+    return sessionCache;
+  }
+
+  function countTokenDifference(previousText: string, nextText: string): number {
+    return Math.max(0, tokenizer.count(nextText) - tokenizer.count(previousText));
+  }
+
+  function rememberDeltaText(sessionId: string, messageId: string, partId: string, delta: string): number {
+    const sessionCache = getPartTextCache(sessionId);
+    const liveKey = `${messageId}:${partId}:live`;
+    const previousLiveText = sessionCache.get(liveKey) || "";
+    const nextLiveText = `${previousLiveText}${delta}`;
+    sessionCache.set(liveKey, nextLiveText);
+
+    for (const partType of COUNTABLE_PART_TYPES) {
+      const key = `${messageId}:${partId}:${partType}`;
+      sessionCache.set(key, `${sessionCache.get(key) || ""}${delta}`);
+    }
+
+    return countTokenDifference(previousLiveText, nextLiveText);
+  }
+
 /**
  * Handles message.part.updated and message.part.delta events (streaming token chunks)
  *
@@ -620,6 +644,8 @@ function handleMessagePartUpdated(event: MessageEvent): void {
   const deltaMessageId = event.properties.messageID;
 
   let delta: string | undefined;
+  let partText: string | undefined;
+  let partId: string | undefined;
   let sessionId: string;
   let messageId: string;
 
@@ -630,25 +656,22 @@ function handleMessagePartUpdated(event: MessageEvent): void {
     }
     sessionId = part.sessionID || deltaSessionId || "default";
     messageId = part.messageID;
+    partId = part.id;
 
-    const partText = extractPartText(part);
-    if (!event.properties.delta && partText.length > 0) {
-      const sessionCache =
-        partTextCache.get(sessionId) || new Map<string, string>();
-      partTextCache.set(sessionId, sessionCache);
-      const cacheKey = `${part.messageID}:${part.id}:${part.type}`;
-      const previousText = sessionCache.get(cacheKey) || "";
-      delta = partText.startsWith(previousText)
-        ? partText.slice(previousText.length)
-        : partText;
-      sessionCache.set(cacheKey, partText);
-    } else {
+    partText = extractPartText(part);
+    if (!event.properties.delta && partText.length === 0) {
+      return;
+    }
+    if (event.properties.delta) {
       delta = event.properties.delta;
+    } else {
+      delta = partText;
     }
   } else if (deltaSessionId && deltaMessageId && event.properties.delta) {
     // message.part.delta path — no Part object, delta string is the token chunk
     sessionId = deltaSessionId;
     messageId = deltaMessageId;
+    partId = event.properties.partID || "delta";
     delta = event.properties.delta;
   } else {
     return;
@@ -661,6 +684,23 @@ function handleMessagePartUpdated(event: MessageEvent): void {
   const roleCache = messageRoleCache.get(sessionId);
   const role = roleCache?.get(messageId);
   if (role !== "assistant") {
+    return;
+  }
+
+  let tokenCount: number;
+  if (part && !event.properties.delta && partText !== undefined) {
+    const sessionCache = getPartTextCache(sessionId);
+    const cacheKey = `${part.messageID}:${part.id}:${part.type}`;
+    const previousText = sessionCache.get(cacheKey) || "";
+    tokenCount = partText.startsWith(previousText)
+      ? countTokenDifference(previousText, partText)
+      : tokenizer.count(partText);
+    sessionCache.set(cacheKey, partText);
+  } else {
+    tokenCount = rememberDeltaText(sessionId, messageId, partId || "delta", delta);
+  }
+
+  if (tokenCount === 0) {
     return;
   }
 
@@ -689,11 +729,9 @@ function handleMessagePartUpdated(event: MessageEvent): void {
       : "agent=none";
     const trackerKey = messageTracker.key;
     const isBg = sessionId !== primarySessionId;
-    logger.info(`[TpsMeter][Debug] tracker initialized ${metaLabel} (${metaInfo}) session=${sessionId} primary=${primarySessionId} isBg=${isBg} key=${trackerKey} message=${messageId} part=${part?.id ?? event.properties.partID ?? "?"}`);
+    logger.debug(`[TpsMeter] Tracker initialized ${metaLabel} (${metaInfo}) session=${sessionId} primary=${primarySessionId} isBg=${isBg} key=${trackerKey} message=${messageId} part=${part?.id ?? event.properties.partID ?? "?"}`);
   }
   messageTracker.lastUpdated = now;
-
-  const tokenCount = tokenizer.count(delta);
 
   sessionState.aggregate.recordTokens(tokenCount, now);
   messageTracker.tracker.recordTokens(tokenCount, now);
@@ -714,7 +752,7 @@ function handleMessagePartUpdated(event: MessageEvent): void {
     : Math.max(0, now - sessionState.aggregateFirstTokenAt);
 
   if (
-    elapsedSinceFirstToken >= MIN_TPS_ELAPSED_MS
+    elapsedSinceFirstToken >= resolvedConfig.initialDisplayDelayMs
   ) {
     clearDisplayTimer(sessionId);
 
@@ -806,7 +844,7 @@ function handleMessagePartUpdated(event: MessageEvent): void {
         const shouldShowFinalStats =
           hasValidFinish &&
           totalTokens > 0 &&
-          elapsedMs >= MIN_TPS_ELAPSED_MS;
+          elapsedMs >= resolvedConfig.initialDisplayDelayMs;
 
         if (shouldShowFinalStats) {
           // Display final stats

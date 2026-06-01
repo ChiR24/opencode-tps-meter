@@ -123,6 +123,46 @@ function createPartUpdatedEvent(
   };
 }
 
+function createPartDeltaEvent(
+  sessionId: string,
+  messageId: string,
+  partId: string,
+  delta: string
+): MessageEvent {
+  return {
+    type: "message.part.delta",
+    properties: {
+      sessionID: sessionId,
+      messageID: messageId,
+      partID: partId,
+      field: "text",
+      delta,
+    },
+  };
+}
+
+function createFullPartUpdatedEvent(
+  sessionId: string,
+  messageId: string,
+  partId: string,
+  text: string,
+  partType: string = "text"
+): MessageEvent {
+  return {
+    type: "message.part.updated",
+    properties: {
+      sessionID: sessionId,
+      part: {
+        id: partId,
+        sessionID: sessionId,
+        messageID: messageId,
+        type: partType,
+        text,
+      },
+    },
+  };
+}
+
 function createMessageUpdatedEvent(
   sessionId: string,
   messageId: string,
@@ -242,6 +282,98 @@ describe("OpenCode TPS Meter - Integration Tests", () => {
       expect(finalStatsLog).toBeDefined();
     });
 
+    it("should count delta chunks from cumulative text in toast fallback", async () => {
+      const context = createMockContext();
+      const handlers = TpsMeterPlugin(context);
+
+      const sessionId = "server-tiny-chunks";
+      const messageId = "msg-server-tiny";
+
+      await handlers.event!({
+        event: createMessageUpdatedEvent(sessionId, messageId, "streaming"),
+      });
+
+      for (let i = 0; i < 10; i += 1) {
+        await handlers.event!({
+          event: {
+            type: "message.part.delta",
+            properties: {
+              sessionID: sessionId,
+              messageID: messageId,
+              partID: "part-1",
+              field: "text",
+              delta: "x",
+            },
+          },
+        });
+      }
+
+      await delay(MIN_TPS_ELAPSED_MS + 10);
+      await handlers.event!({
+        event: createMessageUpdatedEvent(sessionId, messageId, "complete"),
+      });
+
+      const finalStatsLog = context.logger.logs.find((log) =>
+        log.includes(`Session ${sessionId} complete:`)
+      );
+      expect(finalStatsLog).toBeDefined();
+      expect(finalStatsLog).toContain("3 tokens");
+      expect(finalStatsLog).not.toContain("10 tokens");
+    });
+
+    it("should not double count delta followed by full part update in toast fallback", async () => {
+      const context = createMockContext();
+      const handlers = TpsMeterPlugin(context);
+
+      const sessionId = "server-dedupe";
+      const messageId = "msg-server-dedupe";
+
+      await handlers.event!({
+        event: createMessageUpdatedEvent(sessionId, messageId, "streaming"),
+      });
+
+      await handlers.event!({
+        event: {
+          type: "message.part.delta",
+          properties: {
+            sessionID: sessionId,
+            messageID: messageId,
+            partID: "part-1",
+            field: "text",
+            delta: "abcd",
+          },
+        },
+      });
+
+      await handlers.event!({
+        event: {
+          type: "message.part.updated",
+          properties: {
+            sessionID: sessionId,
+            part: {
+              id: "part-1",
+              sessionID: sessionId,
+              messageID: messageId,
+              type: "text",
+              text: "abcd",
+            },
+          },
+        },
+      });
+
+      await delay(MIN_TPS_ELAPSED_MS + 10);
+      await handlers.event!({
+        event: createMessageUpdatedEvent(sessionId, messageId, "complete"),
+      });
+
+      const finalStatsLog = context.logger.logs.find((log) =>
+        log.includes(`Session ${sessionId} complete:`)
+      );
+      expect(finalStatsLog).toBeDefined();
+      expect(finalStatsLog).toContain("1 tokens");
+      expect(finalStatsLog).not.toContain("2 tokens");
+    });
+
     it("should handle multiple concurrent sessions correctly", async () => {
       const context = createMockContext();
       const handlers = TpsMeterPlugin(context);
@@ -348,6 +480,33 @@ describe("OpenCode TPS Meter - Integration Tests", () => {
       expect(completionLog).toBeDefined();
       expect(completionLog).toContain("tokens");
       expect(completionLog).toContain("TPS");
+    });
+
+    it("should not double count a delta followed by the full part update", async () => {
+      const context = createMockContext();
+      const handlers = TpsMeterPlugin(context);
+
+      const sessionId = "server-dedupe-session";
+      const messageId = "server-dedupe-message";
+      const partId = "server-dedupe-part";
+
+      await handlers.event!({
+        event: createMessageUpdatedEvent(sessionId, messageId, "streaming"),
+      });
+      await handlers.event!({
+        event: createPartDeltaEvent(sessionId, messageId, partId, "abcd"),
+      });
+      await handlers.event!({
+        event: createFullPartUpdatedEvent(sessionId, messageId, partId, "abcd"),
+      });
+      await handlers.event!({
+        event: createMessageUpdatedEvent(sessionId, messageId, "complete"),
+      });
+
+      const completionLog = context.logger.logs.find((log) => log.includes("complete:"));
+      expect(completionLog).toBeDefined();
+      expect(completionLog).toContain("1 tokens");
+      expect(completionLog).not.toContain("2 tokens");
     });
   });
 
