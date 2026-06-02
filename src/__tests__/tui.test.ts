@@ -789,6 +789,100 @@ describe("TUI plugin", () => {
     }
   });
 
+  it("keeps streamed stats visible when an assistant message finishes for a tool call", async () => {
+    const { disposeCallbacks, handlers, slotPlugin, testRender, theme } = await createHarness();
+
+    const messageUpdated = handlers.get("message.updated");
+    const partDelta = handlers.get("message.part.delta");
+    if (!messageUpdated || !partDelta) {
+      throw new Error("required TUI handlers were not registered");
+    }
+
+    const createdAt = Date.now();
+    const completedAt = createdAt + 1000;
+    messageUpdated({
+      type: "message.updated",
+      properties: {
+        sessionID: "session-tool-call-persist",
+        info: {
+          id: "message-tool-call-persist",
+          sessionID: "session-tool-call-persist",
+          role: "assistant",
+          time: { created: createdAt },
+          parentID: "parent-1",
+          modelID: "model",
+          providerID: "provider",
+          mode: "chat",
+          agent: "build",
+          path: { cwd: ".", root: "." },
+          cost: 0,
+          tokens: {
+            input: 0,
+            output: 0,
+            reasoning: 0,
+            cache: { read: 0, write: 0 },
+          },
+        },
+      },
+    });
+
+    partDelta({
+      type: "message.part.delta",
+      properties: {
+        sessionID: "session-tool-call-persist",
+        messageID: "message-tool-call-persist",
+        partID: "part-1",
+        field: "text",
+        delta: "abcd",
+      },
+    });
+
+    await delay(40);
+
+    messageUpdated({
+      type: "message.updated",
+      properties: {
+        sessionID: "session-tool-call-persist",
+        info: {
+          id: "message-tool-call-persist",
+          sessionID: "session-tool-call-persist",
+          role: "assistant",
+          time: { created: createdAt, completed: completedAt },
+          parentID: "parent-1",
+          modelID: "model",
+          providerID: "provider",
+          mode: "chat",
+          agent: "build",
+          path: { cwd: ".", root: "." },
+          cost: 0,
+          tokens: {
+            input: 0,
+            output: 0,
+            reasoning: 0,
+            cache: { read: 0, write: 0 },
+          },
+          finish: "tool-calls",
+        },
+      },
+    });
+
+    const slot = slotPlugin?.slots.session_prompt_right;
+    if (!slot) {
+      throw new Error("session_prompt_right slot was not registered");
+    }
+
+    const setup = await testRender(() => slot({ theme }, { session_id: "session-tool-call-persist" }), { width: 80, height: 5 });
+    await setup.flush();
+    const frame = setup.captureCharFrame();
+
+    expect(frame).toContain("TPS");
+    expect(frame).toContain("1 tok");
+
+    for (const callback of disposeCallbacks) {
+      await callback();
+    }
+  });
+
   it("does not create an idle snapshot before the startup delay", async () => {
     process.env.TPS_METER_INITIAL_DISPLAY_DELAY_MS = "1000";
     const { disposeCallbacks, handlers, slotPlugin, testRender, theme } = await createHarness();

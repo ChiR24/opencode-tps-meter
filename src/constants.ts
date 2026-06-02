@@ -94,8 +94,10 @@ export const DEFAULT_FAST_TPS_THRESHOLD = 50;
 // Finish Reasons to Exclude from Stats
 // =============================================================================
 
+export const TOOL_CALL_FINISH_REASON = "tool-calls";
+
 /** Set of finish reasons that invalidate TPS statistics */
-export const INVALID_FINISH_REASONS = new Set(["tool-calls", "unknown"]);
+export const INVALID_FINISH_REASONS = new Set([TOOL_CALL_FINISH_REASON, "unknown"]);
 
 /** Set of part types that contribute to token counting */
 export const COUNTABLE_PART_TYPES = new Set(["text", "reasoning"]);

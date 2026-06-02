@@ -3,7 +3,7 @@ import { createMemo, createSignal, Show } from "solid-js";
 import { createTracker } from "./tracker.js";
 import { createTokenizer } from "./tokenCounter.js";
 import { defaultConfig, loadConfigSync } from "./config.js";
-import { COUNTABLE_PART_TYPES, INVALID_FINISH_REASONS } from "./constants.js";
+import { COUNTABLE_PART_TYPES, INVALID_FINISH_REASONS, TOOL_CALL_FINISH_REASON } from "./constants.js";
 import type { Config } from "./types.js";
 
 type TrackerInstance = ReturnType<typeof createTracker>;
@@ -336,6 +336,12 @@ const tui: TuiPlugin = async (api) => {
     roleCache.set(info.id, info.role);
 
     if (info.role !== "assistant" || !info.time.completed) {
+      return;
+    }
+
+    if (info.finish === TOOL_CALL_FINISH_REASON) {
+      persistIdleSnapshot(sessionId, info.time.completed);
+      resetSession(sessionId);
       return;
     }
 
