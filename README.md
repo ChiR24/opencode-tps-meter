@@ -1,3 +1,5 @@
+
+
 <div align="center">
 
 # OpenCode TPS Meter
@@ -332,7 +334,10 @@ bun run build
 **Note:** The CJS build requires a manual export fix for OpenCode compatibility:
 ```typescript
 // Replaces: module.exports = __toCommonJS(exports_src);
-// With: module.exports = exports_src.default;
+// With:
+// module.exports = exports_src.default;
+// module.exports.default = exports_src.default;
+// Object.defineProperty(module.exports, "__esModule", { value: true });
 ```
 
 ---
