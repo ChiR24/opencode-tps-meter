@@ -341,6 +341,14 @@ export interface TPSTrackerOptions {
   sessionId?: string;
   /** Optional rolling window duration in milliseconds */
   rollingWindowMs?: number;
+  /**
+   * EWMA half-life for normal streaming, in milliseconds.
+   *
+   * Lower responds faster at the cost of a jumpier reading. Defaults to
+   * DEFAULT_EWMA_HALF_LIFE_MS so v1 behaviour is unchanged; v2 opts into a faster value
+   * because its rolling window already does the smoothing.
+   */
+  ewmaHalfLifeMs?: number;
 }
 
 /**

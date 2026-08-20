@@ -304,6 +304,7 @@ function loadEnvConfig(): Partial<Config> {
  * 1. .opencode/tps-meter.json (project-level)
  * 2. ~/.config/opencode/tps-meter.json (global)
  * 3. Environment variables (TPS_METER_*)
+ * 4. Inline overrides (v2 plugin `options`)
  *
  * Later sources override earlier ones.
  *
@@ -315,7 +316,7 @@ function loadEnvConfig(): Partial<Config> {
  *   // Initialize plugin
  * }
  */
-export function loadConfigSync(): Config {
+export function loadConfigSync(overrides?: Partial<Config>): Config {
   let mergedConfig: Partial<Config> = {};
 
   // Priority 1: Project-level config (.opencode/tps-meter.json)
@@ -345,6 +346,12 @@ export function loadConfigSync(): Config {
   // Priority 3: Environment variables (override config files)
   const envConfig = loadEnvConfig();
   mergedConfig = { ...mergedConfig, ...envConfig };
+
+  // Priority 4: Inline overrides. On v2 these are the plugin's `options` from
+  // opencode.json; v1 has no equivalent and passes nothing.
+  if (overrides) {
+    mergedConfig = { ...mergedConfig, ...overrides };
+  }
 
   // Merge with defaults and return
   return mergeConfig(mergedConfig, defaultConfig);
