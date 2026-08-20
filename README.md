@@ -28,6 +28,8 @@ A live tokens-per-second meter plugin for OpenCode. Track AI token throughput in
 
 ## Features
 
+- **Runs on both OpenCode generations** — one package, v1 (`opencode`) and v2 beta (`opencode2`)
+- **Exact final totals on v2** — provider-reported token counts replace the heuristic estimate when the turn ends
 - **Real-time Monitoring** — Live TPS calculation with configurable rolling window
 - **Smart Filtering** — Tracks only assistant text/reasoning, excludes user prompts, tools, patches, snapshots, and files
 - **Noise Suppression** — TPS display starts after a configurable 10ms startup delay for fast live feedback
@@ -43,7 +45,25 @@ A live tokens-per-second meter plugin for OpenCode. Track AI token throughput in
 
 ---
 
+## OpenCode version support
+
+One package supports both OpenCode generations. They install as separate binaries (`opencode` and `opencode2`) and can run side by side.
+
+| | OpenCode v1 (`opencode`) | OpenCode v2 beta (`opencode2`) |
+|---|---|---|
+| Config key | `"plugin"` | `"plugins"` |
+| Meter renders in | TUI session prompt | TUI prompt footer status |
+| Registered as | `opencode-tps-meter` | `opencode-tps-meter` |
+| Default export shape | function *or* `{ id, server }` | `{ id, setup }` (object required) |
+| Toast fallback | Available (opt-in) | Not available — v2 server plugins have no UI surface |
+
+> **v2 is beta.** Its plugin API is documented as subject to change before 2.0 is stable. Verified against `opencode2` beta `0.0.0-beta-17639`, whose shipped binary implements the v2 TUI plugin API this package targets — its own built-in TUI plugins (`opencode.notifications`, `diff-viewer`) use `Plugin.define({ id, setup })` with `ctx.ui.slot({ append, render })` and `ctx.data.on(...)`.
+
+---
+
 ## Installation
+
+### OpenCode v1
 
 Install with OpenCode's plugin installer so the persistent TUI entrypoint is registered:
 
@@ -59,26 +79,118 @@ For manual installation, add the package to your TUI config (`~/.config/opencode
 }
 ```
 
+### OpenCode v2 (`opencode2`)
+
+v2 replaced layered `tui.json(c)` files with a single global `cli.json`, and renamed the plugin config key to `plugins`. Register in `opencode.json`:
+
+```json
+{
+  "plugins": ["opencode-tps-meter@latest"]
+}
+```
+
+The single package name is all you need — the default export carries both plugin shapes, so v1 reads `server` and v2 reads `setup`.
+
+> **Do not use subpath specifiers in `plugins`.** v2 treats every string in that array as an npm package name or a local path, so `"opencode-tps-meter/v2"` is not resolved as a subpath — it is attempted as a package install and fails. The `opencode-tps-meter/v2` and `/v2/tui` exports exist for programmatic `import` only.
+
+v2 also accepts inline options, which take priority over config files and environment variables:
+
+```json
+{
+  "plugins": [
+    {
+      "package": "opencode-tps-meter@latest",
+      "options": { "showElapsed": true, "enableColorCoding": true }
+    }
+  ]
+}
+```
+
 ---
 
 ## Quick Start
 
-The plugin will automatically hook into OpenCode events and start tracking TPS after installation.
+The plugin hooks into OpenCode events and starts tracking TPS after installation.
 
-On OpenCode versions that support TUI plugins, the package also exposes `opencode-tps-meter/tui`. OpenCode's installer detects that entrypoint; manual installs need the package listed in TUI config for persistent rendering in the session prompt area.
+On v1, the meter renders in the session prompt area via `opencode-tps-meter/tui`. OpenCode's installer detects that entrypoint; manual installs need the package listed in TUI config.
 
-If you intentionally want the old toast UI for an older OpenCode surface, add the package to normal OpenCode plugin config too and set `toastFallback: true` or `TPS_METER_TOAST_FALLBACK=true`.
+On v2, TUI plugins are registered in the global `~/.config/opencode/cli.json` under `plugins` (auto-migrated from v1's `tui.json`). Per OpenCode's loader spec, a package with an `exports` map is resolved via `./tui` or `./server` and **never** falls back to `exports["."]`, so this package publishes both.
+
+**Registering a local checkout on v2:** a path spec must point at the built TUI **file**, not the
+package directory. v2's TUI loader resolves a directory spec by appending `/tui` and opening that path
+literally — it does not consult `package.json` `exports` and does not try extensions, so a directory
+entry fails with `ENOENT ... open '<dir>/tui'`:
+
+```json
+{ "plugins": ["file:///abs/path/to/opencode-tps-meter/dist/tui.mjs"] }
+```
+
+`exports["./tui"]` is only used for npm-package specs (`"opencode-tps-meter"`).
+
+**Note on the v2 TUI module shape:** v2 requires `{ id, setup }`. Plugins exporting only v1's
+`{ id, tui }` are rejected by the loader. This package's TUI module exports both keys, so it satisfies
+v1 and v2 from one file.
+
+v2 ships a plugin manager dialog — open the command palette (`ctrl+p`) and run **Open plugin manager dialog** (`plugins.list`) to see which TUI plugins loaded, and to enable/disable them with `space`. Runtime enable/disable state is persisted and overrides config at startup, so check there first if the meter does not appear.
+
+If you intentionally want the old toast UI on an older v1 surface, add the package to normal OpenCode plugin config too and set `toastFallback: true` or `TPS_METER_TOAST_FALLBACK=true`. This option does nothing on v2.
 
 ### Package Exports
 
-When using the plugin with OpenCode, you only need the default package export. OpenCode TUI plugin loading uses the `opencode-tps-meter/tui` subpath automatically when installed through OpenCode's plugin installer or when listed in TUI config.
+When using the plugin with OpenCode, you only need the default package export for your host generation.
 
 ```typescript
-import TpsMeterPlugin from 'opencode-tps-meter';
-import TpsMeterTuiPlugin from 'opencode-tps-meter/tui';
+import TpsMeterPlugin from 'opencode-tps-meter';          // v1 server (also carries the v2 shape)
+import TpsMeterTuiPlugin from 'opencode-tps-meter/tui';   // v1 TUI (also carries the v2 shape)
+import TpsMeterV2 from 'opencode-tps-meter/v2';           // v2 server only
+import TpsMeterV2Tui from 'opencode-tps-meter/v2/tui';    // v2 TUI only
 ```
 
 Internal tracker/tokenizer/UI helper modules are not public package exports. For experiments or forks, clone the repository and import helpers from local source paths instead of from the published package.
+
+### v2-only capabilities
+
+These need APIs that do not exist on v1, so they are inert on `opencode`.
+
+| Feature | What you get | v2 API |
+|---|---|---|
+| Calibrated live rate | The streaming estimate is corrected against provider token counts, learned per model | `session.step.started` (model/agent) + `session.step.ended` (tokens) |
+| Generation vs end-to-end TPS | Tool execution subtracted, so a turn that waited on a shell command still reports the model's real rate | `session.tool.called` / `.success` / `.failed` |
+| Time to first token | Measured from turn start on the host clock | `session.execution.started` + event `created` |
+| Hidden overhead | Tokens spent on auto-title and compaction that no step reports | `session.usage.updated` residual |
+| Per-subagent breakdown | Sidebar panel with exact parent/child attribution | `ctx.data.session.root` / `.family` |
+| Durable ledger + dashboard | Per-model mean/best throughput and TTFT, persisted and shared across windows | `ctx.storage.store`, `ctx.ui.router` |
+| Wire-level TTFB | Provider dispatch to response headers, below the streaming pipeline | `ctx.session.hook("http.request"/"http.response")` |
+
+Every one of these is feature-detected. A host that exposes none of the optional APIs still gets
+the footer meter and nothing else.
+
+**Commands** (palette, `/tps`, or a key you bind):
+
+```text
+/tps              open the throughput dashboard
+/tps detail       toast with current stats
+/tps detailed     footer shows gen / ttft / overhead
+/tps compact      default footer
+/tps hidden       hide the meter
+/tps reset        clear the durable ledger
+```
+
+**Latency.** Token counting is incremental — each chunk is scanned once and never re-read, so
+absorbing a long response is linear rather than quadratic. On v2 the displayed rate also uses a
+shorter EWMA half-life (120ms vs v1's 250ms), since host-clock timestamps make the rolling
+window accurate enough that extra exponential smoothing mostly just adds lag. The v2 display throttle defaults to 8ms — the host delivers events in ~10ms batches, so
+publishing faster cannot reveal anything new — and the publish itself is synchronous, so a
+delta is visible in about a millisecond. v1 keeps its 50ms default for the costlier toast path.
+Tune with `updateIntervalMs` (display throttle) and `rollingWindowMs` (averaging window); an
+explicit value overrides the default on either host.
+
+**Clock note.** The TUI delivers events in ~10ms batches, so wall-clock time inside a handler is
+flush time shared by the whole batch. All timing uses each event's host-stamped `created`.
+
+### Peer dependencies
+
+`@opentui/solid` and `solid-js` are optional peer dependencies rather than bundled dependencies. The TUI host supplies the renderer and reactive runtime; installing a second copy inside the plugin would give it a separate reactive graph and the meter would render once and never update.
 
 ---
 
@@ -238,10 +350,13 @@ The published package exposes only the OpenCode plugin entrypoints:
 ```typescript
 import TpsMeterPlugin from 'opencode-tps-meter';
 import TpsMeterTuiPlugin from 'opencode-tps-meter/tui';
+import TpsMeterV2 from 'opencode-tps-meter/v2';
+import TpsMeterV2Tui from 'opencode-tps-meter/v2/tui';
 ```
 
-- `opencode-tps-meter` is the legacy server/toast fallback plugin entrypoint. It does not emit toasts unless `toastFallback` is enabled.
-- `opencode-tps-meter/tui` is the persistent OpenCode TUI entrypoint.
+- `opencode-tps-meter` is the v1 server/toast fallback entrypoint. It does not emit toasts unless `toastFallback` is enabled. The exported function also carries `id` and `setup` properties so a v2 host can load the same module.
+- `opencode-tps-meter/tui` is the persistent v1 TUI entrypoint. The exported object carries both `tui` (v1) and `setup` (v2).
+- `opencode-tps-meter/v2` and `opencode-tps-meter/v2/tui` are plain `{ id, setup }` v2 definitions with no callable v1 shape, for hosts that reject the dual-shaped modules.
 
 Tracker, tokenizer, and UI helper modules are internal implementation details and are not exported as public package subpaths. If you need those helpers for experimentation, clone or fork the repository and import them from local source files.
 
@@ -261,7 +376,7 @@ Tracker, tokenizer, and UI helper modules are internal implementation details an
 
 ## How It Works
 
-### Event Handling
+### Event Handling (OpenCode v1)
 
 The plugin subscribes to four OpenCode event types:
 
@@ -289,6 +404,25 @@ The plugin subscribes to four OpenCode event types:
    - Removes tracker for the specific session
    - Clears all session-specific caches (role cache, token cache, part text cache)
    - Preserves completed session stats
+
+### Event Handling (OpenCode v2)
+
+v2 removed the entire `message.*` event family and replaced it with granular session events. The v2 entries subscribe to five:
+
+| v1 event | v2 replacement |
+|---|---|
+| `message.part.delta` (field `text`) | `session.text.delta` |
+| `message.part.updated` (reasoning) | `session.reasoning.delta` |
+| `message.updated` (completed) | `session.step.ended` |
+| `message.updated` (`info.tokens`) | `session.usage.updated` |
+| `session.idle` | `session.idle` (unchanged) |
+
+Two consequences worth knowing:
+
+- **No role filtering is needed.** `session.text.delta` and `session.reasoning.delta` are assistant output by construction, so v1's message-role cache, part-type filtering, and part-text extraction have no v2 equivalent — user prompts can no longer leak into the count.
+- **Final totals are exact, not heuristic.** `session.step.ended` carries provider-reported `tokens.output` and `tokens.reasoning`, which the meter prefers over its own character-based estimate. The heuristic still drives the live rolling rate, since deltas arrive before any usage report.
+
+`session.step.ended` reports the same finish reasons as v1 (`stop`, `length`, `tool-calls`, `content-filter`, `error`, `unknown`), so tool-call and error handling behave identically across both hosts: a `tool-calls` finish freezes the reading on screen instead of clearing it, and `unknown` discards it.
 
 ### Part Types Counted
 
@@ -330,6 +464,8 @@ bun run build
 - `dist/tui.mjs` — OpenCode TUI plugin ESM build
 - `dist/tui.js` — internal CommonJS TUI artifact generated by the build; public TUI loading uses the ESM `opencode-tps-meter/tui` export
 - `dist/tui.d.ts` — OpenCode TUI plugin declarations
+- `dist/v2/server.mjs` — OpenCode v2 server plugin (`opencode-tps-meter/v2`)
+- `dist/v2/tui.mjs` — OpenCode v2 TUI plugin (`opencode-tps-meter/v2/tui`)
 
 **Note:** The CJS build requires a manual export fix for OpenCode compatibility:
 ```typescript
@@ -347,7 +483,10 @@ bun run build
 ### Plugin Not Displaying
 
 - ✅ Verify `TPS_METER_ENABLED` is not set to `false`
-- ✅ For persistent TUI display, install with `opencode plug install opencode-tps-meter@latest` or add the package to OpenCode's TUI config (`~/.config/opencode/tui.json` or `tui.jsonc`)
+- ✅ **v1:** for persistent TUI display, install with `opencode plug install opencode-tps-meter@latest` or add the package to OpenCode's TUI config (`~/.config/opencode/tui.json` or `tui.jsonc`)
+- ✅ **v2:** use the `"plugins"` key, not `"plugin"` — and note `tui.json`/`tui.jsonc` are no longer read at all, having been replaced by a single global `cli.json`
+- ✅ **v2:** if the bare package name does not load, register the explicit entries `opencode-tps-meter/v2` and `opencode-tps-meter/v2/tui`
+- ✅ **v2:** confirm the host supplies `@opentui/solid` and `solid-js`; a nested copy inside the plugin gives the meter its own reactive graph, so it renders once and then freezes
 - ✅ Verify your installed package exposes `opencode-tps-meter/tui` for TUI plugin loading
 - ✅ If you still see a `TPS Meter` popup, you are seeing the old server plugin toast path; remove the package from normal OpenCode plugin config or set `toastFallback: false` / `TPS_METER_TOAST_FALLBACK=false`
 - ✅ For intentional toast fallback, set `toastFallback: true` and check that OpenCode client has `tui.showToast`, `tui.publish`, or `toast.info` methods
