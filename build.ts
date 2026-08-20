@@ -4,10 +4,19 @@ import path from "path";
 async function build(): Promise<void> {
   const srcDir = path.join(import.meta.dir, "src");
   const outDir = path.join(import.meta.dir, "dist");
-  const entrypoints = [path.join(srcDir, "index.ts"), path.join(srcDir, "tui.tsx")];
+  const entrypoints = [
+    path.join(srcDir, "index.ts"),
+    path.join(srcDir, "tui.tsx"),
+    // Dedicated v2 (opencode2) entries. The v1 entries above also carry the v2 shape,
+    // but these give v2 users an unambiguous target with no callable v1 export.
+    path.join(srcDir, "v2", "server.ts"),
+    path.join(srcDir, "v2", "tui.tsx"),
+  ];
   const external = [
     "@opencode-ai/plugin",
     "@opencode-ai/plugin/tui",
+    "@opencode-ai/plugin/v1",
+    "@opencode-ai/plugin/v1/tui",
     "@opentui/core",
     "@opentui/keymap",
     "@opentui/solid",
@@ -21,9 +30,11 @@ async function build(): Promise<void> {
   const esmResult = await Bun.build({
     entrypoints,
     outdir: outDir,
+    root: srcDir,
     format: "esm",
     naming: {
-      entry: "[name].mjs",
+      // [dir] keeps src/v2/* under dist/v2/*, so v2/tui does not collide with tui.
+      entry: "[dir]/[name].mjs",
     },
     target: "node",
     external,
@@ -41,9 +52,10 @@ async function build(): Promise<void> {
   const cjsResult = await Bun.build({
     entrypoints,
     outdir: outDir,
+    root: srcDir,
     format: "cjs",
     naming: {
-      entry: "[name].js",
+      entry: "[dir]/[name].js",
     },
     target: "node",
     external,
@@ -103,6 +115,8 @@ async function build(): Promise<void> {
   console.log("  - dist/index.js (CommonJS - OpenCode compatible)");
   console.log("  - dist/tui.mjs (TUI plugin)");
   console.log("  - dist/tui.js (internal CommonJS TUI artifact, not package-exported)");
+  console.log("  - dist/v2/server.mjs (opencode2 server plugin)");
+  console.log("  - dist/v2/tui.mjs (opencode2 TUI plugin)");
   console.log("  - dist/index.d.ts (TypeScript declarations)");
   console.log("  - dist/tui.d.ts (TUI declarations)");
 }

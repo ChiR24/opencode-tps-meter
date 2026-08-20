@@ -150,10 +150,99 @@ export function countTokens(text: string): number {
  * @param {string} text - The text to encode
  * @returns {number[]} - Array of token IDs (always empty in this implementation)
  */
-export function encodeText(text: string): number[] {
-  // This is a placeholder - heuristic tokenizers don't provide actual token IDs
+export function encodeText(_text: string): number[] {
+  // Placeholder: heuristic tokenizers do not produce token IDs. The parameter is kept so
+  // the published signature stays stable for anyone who imported it.
   return [];
 }
 
 // Re-export types
 export type { TokenCounter } from "./types.js";
+
+// =============================================================================
+// Incremental counting
+// =============================================================================
+
+/**
+ * A counter that consumes a stream of deltas without ever re-reading what came before.
+ *
+ * The naive approach — accumulate the text and diff `count(before)` against `count(after)`
+ * — is O(total) per delta and therefore O(n^2) per response. With the word heuristic that
+ * measured 10.2s to absorb a 186k-character response; this absorbs the same stream in
+ * roughly the time it takes to scan each chunk once.
+ *
+ * Counts are identical to the batch counters: chars/N uses ceil(totalChars / N), and the
+ * word counter counts maximal non-whitespace runs, joining runs that straddle a chunk
+ * boundary so "fo" + "x" stays one word.
+ */
+export interface IncrementalCounter {
+  /** Returns how many whole tokens this delta added. */
+  add(delta: string): number;
+  /** Total tokens counted so far. */
+  total(): number;
+  reset(): void;
+}
+
+function createCharCounter(divisor: number): IncrementalCounter {
+  let chars = 0;
+  let tokens = 0;
+  return {
+    add(delta) {
+      if (!delta) return 0;
+      chars += delta.length;
+      const next = Math.ceil(chars / divisor);
+      const added = next - tokens;
+      tokens = next;
+      return added > 0 ? added : 0;
+    },
+    total: () => tokens,
+    reset() {
+      chars = 0;
+      tokens = 0;
+    },
+  };
+}
+
+const WHITESPACE = /\s/;
+
+function createWordCounter(divisor: number): IncrementalCounter {
+  let words = 0;
+  let tokens = 0;
+  // Whether the stream so far ends mid-word, so the next chunk may continue it.
+  let openWord = false;
+
+  return {
+    add(delta) {
+      if (!delta) return 0;
+      for (let i = 0; i < delta.length; i++) {
+        const isSpace = WHITESPACE.test(delta[i] as string);
+        if (isSpace) {
+          openWord = false;
+        } else if (!openWord) {
+          // Start of a new maximal non-whitespace run.
+          words += 1;
+          openWord = true;
+        }
+      }
+      const next = Math.ceil(words / divisor);
+      const added = next - tokens;
+      tokens = next;
+      return added > 0 ? added : 0;
+    },
+    total: () => tokens,
+    reset() {
+      words = 0;
+      tokens = 0;
+      openWord = false;
+    },
+  };
+}
+
+/** Creates an incremental counter matching the given batch algorithm. */
+export function createIncrementalCounter(
+  algorithm: TokenizerAlgorithm = "heuristic"
+): IncrementalCounter {
+  if (algorithm === "word") return createWordCounter(WORDS_DIV_0_75);
+  if (algorithm === "code") return createCharCounter(CHARS_DIV_3);
+  return createCharCounter(CHARS_DIV_4);
+}

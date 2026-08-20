@@ -28,6 +28,11 @@ export function createTracker(options: TPSTrackerOptions = {}): TPSTracker {
       ? options.rollingWindowMs
       : DEFAULT_ROLLING_WINDOW_MS;
 
+  const normalHalfLifeMs =
+    typeof options.ewmaHalfLifeMs === "number" && options.ewmaHalfLifeMs > 0
+      ? options.ewmaHalfLifeMs
+      : DEFAULT_EWMA_HALF_LIFE_MS;
+
   // EWMA smoothing state
   let smoothedTps = 0;
   let lastSmoothedAt = 0;
@@ -141,7 +146,7 @@ export function createTracker(options: TPSTrackerOptions = {}): TPSTracker {
           halfLife = BURST_EWMA_HALF_LIFE_MS;
         } else {
           // Normal streaming - responsive
-          halfLife = DEFAULT_EWMA_HALF_LIFE_MS;
+          halfLife = normalHalfLifeMs;
         }
         
         const alpha = Math.exp(-Math.LN2 * timeDelta / halfLife);

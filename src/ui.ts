@@ -41,7 +41,6 @@ export function createUIManager(
   let lastToastAt = 0;
   let lastToastMessage = "";
   let pendingState: DisplayState | null = null;
-  let lastDisplayedState: DisplayState | null = null;
 
   /**
    * Formats milliseconds to MM:SS display
@@ -268,7 +267,6 @@ export function createUIManager(
         tpsForColor = Math.max(...pendingState.agents.map(a => a.instantTps));
       }
       display(formatted, false, tpsForColor);
-      lastDisplayedState = { ...pendingState };
       pendingState = null;
     }
   }
@@ -357,7 +355,6 @@ export function createUIManager(
 
       // Reset state
       pendingState = null;
-      lastDisplayedState = null;
 
     },
 

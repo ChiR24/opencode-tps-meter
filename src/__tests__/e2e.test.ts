@@ -13,10 +13,15 @@ import * as path from "path";
 import * as os from "os";
 
 describe("E2E: Module Exports", () => {
-  it("should export the main plugin function as default", async () => {
+  it("should export the dual-host plugin module as default", async () => {
     const module = await import("../index.js");
     expect(module.default).toBeDefined();
-    expect(typeof module.default).toBe("function");
+    // Must be an OBJECT, not a function: v2 validates the default export against a schema
+    // requiring an object and rejects a callable with `Expected object at ["default"]`.
+    expect(typeof module.default).toBe("object");
+    expect(module.default.id).toBe("opencode-tps-meter");
+    expect(typeof module.default.server).toBe("function");
+    expect(typeof module.default.setup).toBe("function");
     expect(Object.keys(module)).toEqual(["default"]);
   });
 });
@@ -57,7 +62,7 @@ describe("E2E: Plugin Loading", () => {
   });
 
   it("should load successfully with a mock OpenCode context", async () => {
-    const { default: TpsMeterPlugin } = await import("../index.js");
+    const { default: { server: TpsMeterPlugin } } = await import("../index.js");
 
     const mockContext = {
       client: {
@@ -92,7 +97,7 @@ describe("E2E: Plugin Loading", () => {
   it("should return empty handlers when plugin is disabled", async () => {
     process.env.TPS_METER_ENABLED = "false";
 
-    const { default: TpsMeterPlugin } = await import("../index.js");
+    const { default: { server: TpsMeterPlugin } } = await import("../index.js");
 
     const mockContext = {
       client: {},
