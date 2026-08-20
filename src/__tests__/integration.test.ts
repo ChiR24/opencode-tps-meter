@@ -13,7 +13,10 @@ import type {
   Logger,
   Part,
 } from "../types.js";
-import TpsMeterPlugin from "../index.js";
+import tpsMeterModule from "../index.js";
+
+// v1 entry point lives on `.server`; the default export is the dual-host module object.
+const TpsMeterPlugin = tpsMeterModule.server;
 
 const MIN_TPS_ELAPSED_MS = 250;
 
