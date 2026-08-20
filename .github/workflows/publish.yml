@@ -31,6 +31,20 @@ jobs:
       - name: Build package
         run: bun run build
 
+      # A prerelease must NOT take the `latest` dist-tag, or every existing user gets it
+      # from a plain `npm install`. npm-publish defaults `tag` to `latest` regardless of
+      # semver, so derive it from the version instead.
+      - name: Determine npm dist-tag
+        id: disttag
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          if [[ "$VERSION" == *-* ]]; then
+            echo "tag=beta" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=latest" >> "$GITHUB_OUTPUT"
+          fi
+          echo "publishing $VERSION to dist-tag $(grep '^tag=' "$GITHUB_OUTPUT" | tail -1 | cut -d= -f2)"
+
       - name: Publish to NPM (on version tag)
         if: startsWith(github.ref, 'refs/tags/v')
         uses: JS-DevTools/npm-publish@v3
@@ -38,6 +52,7 @@ jobs:
           token: ${{ secrets.NPM_TOKEN }}
           access: public
           provenance: true
+          tag: ${{ steps.disttag.outputs.tag }}
 
       - name: Publish to NPM (on release)
         if: github.event_name == 'release'
@@ -46,3 +61,4 @@ jobs:
           token: ${{ secrets.NPM_TOKEN }}
           access: public
           provenance: true
+          tag: ${{ steps.disttag.outputs.tag }}
