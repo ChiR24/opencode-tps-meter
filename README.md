@@ -81,6 +81,13 @@ For manual installation, add the package to your TUI config (`~/.config/opencode
 
 ### OpenCode v2 (`opencode2`)
 
+v2 support ships as a **prerelease**, because `opencode2` is beta and its plugin API may still
+change. Install it explicitly:
+
+```bash
+npm install opencode-tps-meter@beta
+```
+
 v2 replaced layered `tui.json(c)` files with a single global `cli.json`, and renamed the plugin config key to `plugins`. Register in `opencode.json`:
 
 ```json

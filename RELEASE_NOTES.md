@@ -1,4 +1,8 @@
-## v0.4.0 — OpenCode v2 support
+## v0.4.0-beta.1 — OpenCode v2 support (beta)
+
+> Released as a **prerelease** on purpose. It targets `opencode2`, which is itself beta and
+> whose plugin API is documented as subject to change before 2.0 is stable. v1 support is
+> unchanged and unaffected. Install with `opencode-tps-meter@beta`.
 
 The plugin now runs on **both** OpenCode generations from one package. Nothing about v1 behaviour changes.
 
