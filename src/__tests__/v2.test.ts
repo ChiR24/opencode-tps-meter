@@ -576,9 +576,10 @@ describe("v2 plugin entries", () => {
     } as never);
 
     expect(claims).toHaveLength(1);
-    // Must PREPEND: the host's own flexGrow:1 child would squeeze an appended
-    // meter to zero width whenever a turn is running.
-    expect(claims[0]?.prepend).toBe("prompt.footer.status");
+    // Must be a SIBLING (`after`), not a child: the host's own flexGrow:1 child inside
+    // this slot squeezes anything appended within the boundary to zero width whenever a
+    // turn is running.
+    expect(claims[0]?.after).toBe("prompt.footer.status");
     expect(typeof claims[0]?.render).toBe("function");
 
     // The v2 events that replace v1's message.* family, plus the step/tool/execution
@@ -1003,7 +1004,7 @@ describe("v2 optional surfaces", () => {
       },
     } as never);
 
-    const targets = claims.map((c) => c.append ?? c.prepend).sort();
+    const targets = claims.map((c) => c.append ?? c.prepend ?? c.after).sort();
     expect(targets).toEqual(["app", "prompt.footer.status", "sidebar.content"]);
     expect(routes).toHaveLength(1);
     expect(routes[0]?.name).toBe("tps");
@@ -1043,7 +1044,7 @@ describe("v2 optional surfaces", () => {
       },
     } as never);
 
-    expect(claims.map((c) => c.append ?? c.prepend)).toEqual(["prompt.footer.status"]);
+    expect(claims.map((c) => c.append ?? c.prepend ?? c.after)).toEqual(["prompt.footer.status"]);
     await (cleanup as () => void | Promise<void>)();
   });
 });
@@ -1340,7 +1341,7 @@ describe("v2 resilience", () => {
       ui: {
         slot: (claim: Record<string, unknown>) => {
           claims.push(claim);
-          if (claim.prepend !== "prompt.footer.status") boom();
+          if (claim.after !== "prompt.footer.status") boom();
           return () => {};
         },
         toast: { show: boom },
@@ -1351,7 +1352,7 @@ describe("v2 resilience", () => {
     } as never);
 
     // The one surface that must survive.
-    expect(claims.some((c) => c.prepend === "prompt.footer.status")).toBe(true);
+    expect(claims.some((c) => c.after === "prompt.footer.status")).toBe(true);
     expect(typeof cleanup).toBe("function");
     await (cleanup as () => void | Promise<void>)();
   });

@@ -431,13 +431,16 @@ export function setupTui(ctx: V2TuiContext): V2Cleanup | void {
   // guard, so a failure in an optional surface below can never cost us the meter itself.
   disposers.push(
     ctx.ui.slot({
-      // PREPEND, not append. The host's own child in this slot is a box with flexGrow:1,
-      // and while a turn is running it renders a second flexGrow:1 box holding the spinner
-      // and the "esc interrupt" hint. Appending puts the meter after that greedy box, so it
-      // is squeezed to zero width the moment anything runs — thinking, tool calls, or
-      // compaction — and only reappears when the session goes idle. Prepending lays the
-      // meter out first, and MeterView's flexShrink={0} keeps its width.
-      prepend: "prompt.footer.status",
+      // AFTER, not append. The host's own child inside prompt.footer.status is a box with
+      // flexGrow:1, and while a turn is running it renders a second flexGrow:1 box holding
+      // the spinner and the "esc interrupt" hint. Appending places the meter INSIDE that
+      // boundary, after the greedy child, so it collapses to zero width the moment anything
+      // runs — thinking, tool calls, or compaction — and only reappears once idle.
+      //
+      // `after` makes the meter a SIBLING of the status box rather than a child, so the
+      // greedy layout cannot reach it, while the box's flexGrow:1 still pushes the meter to
+      // the right of the spinner. MeterView's flexShrink={0} holds its width.
+      after: "prompt.footer.status",
       render: (input) => (
         <MeterView
           input={input}
