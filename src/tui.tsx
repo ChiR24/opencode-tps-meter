@@ -1,10 +1,13 @@
 import type { TuiPlugin, TuiPluginApi, TuiPluginModule } from "@opencode-ai/plugin/tui";
 import { createMemo, createSignal, Show } from "solid-js";
 import { createTracker } from "./tracker.js";
-import { createTokenizer } from "./tokenCounter.js";
+import { createTokenizer, createIncrementalCounter, type IncrementalCounter } from "./tokenCounter.js";
 import { defaultConfig, loadConfigSync } from "./config.js";
 import { COUNTABLE_PART_TYPES, INVALID_FINISH_REASONS, TOOL_CALL_FINISH_REASON } from "./constants.js";
+import { formatMeterText } from "./format.js";
 import type { Config } from "./types.js";
+import { setupTui as setupTuiV2 } from "./v2/tui.js";
+import type { V2Cleanup, V2TuiContext } from "./v2/types.js";
 
 type TrackerInstance = ReturnType<typeof createTracker>;
 type Role = "assistant" | "user";
@@ -30,37 +33,6 @@ function loadTuiConfig(): Config {
   } catch {
     return defaultConfig;
   }
-}
-
-function formatNumber(value: number): string {
-  return value.toLocaleString("en-US");
-}
-
-function formatElapsedTime(ms: number): string {
-  const totalSeconds = Math.floor(ms / 1000);
-  const minutes = Math.floor(totalSeconds / 60);
-  const seconds = totalSeconds % 60;
-  return `${minutes.toString().padStart(2, "0")}:${seconds.toString().padStart(2, "0")}`;
-}
-
-function formatSnapshot(snapshot: TuiSnapshot, config: Config): string {
-  const parts: string[] = [];
-  const displayTps = snapshot.active ? snapshot.instantTps : snapshot.avgTps;
-
-  if (config.showInstant) {
-    parts.push(`${displayTps.toFixed(1)} TPS`);
-  }
-  if (config.showAverage) {
-    parts.push(`avg ${snapshot.avgTps.toFixed(1)}`);
-  }
-  if (config.showTotalTokens) {
-    parts.push(`${formatNumber(snapshot.totalTokens)} tok`);
-  }
-  if (config.showElapsed) {
-    parts.push(formatElapsedTime(snapshot.elapsedMs));
-  }
-
-  return parts.length > 0 ? parts.join(" · ") : "TPS meter";
 }
 
 function colorForSnapshot(theme: TuiPluginApi["theme"]["current"], config: Config, snapshot: TuiSnapshot) {
@@ -92,7 +64,7 @@ function MeterView(props: {
       {(snapshot) => (
         <box flexDirection="row" flexShrink={0}>
           <text fg={colorForSnapshot(props.api.theme.current, props.config, snapshot())}>
-            {formatSnapshot(snapshot(), props.config)}
+            {formatMeterText(snapshot(), props.config)}
           </text>
         </box>
       )}
@@ -106,22 +78,26 @@ const tui: TuiPlugin = async (api) => {
     return;
   }
 
-  const tokenizer = createTokenizer(
+  const tokenizerAlgorithm =
     config.fallbackTokenHeuristic === "words_div_0_75"
       ? "word"
       : config.fallbackTokenHeuristic === "chars_div_3"
         ? "code"
-        : "heuristic"
-  );
+        : "heuristic";
+  const tokenizer = createTokenizer(tokenizerAlgorithm);
   const [snapshots, setSnapshots] = createSignal(new Map<string, TuiSnapshot>());
   const sessions = new Map<string, SessionState>();
-  const partTextCache = new Map<string, Map<string, string>>();
+  // Part-type keys hold accumulated TEXT (the full-part path diffs against it); the `:live`
+  // key holds an incremental counter, since it was only ever read to compute a token
+  // difference and re-counting the whole string per delta is O(total).
+  const partTextCache = new Map<string, Map<string, string | IncrementalCounter>>();
   const messageRoles = new Map<string, Map<string, Role>>();
   const publishTimers = new Map<string, ReturnType<typeof setTimeout>>();
   const disposers: Array<() => void> = [];
 
-  function getPartTextCache(sessionId: string): Map<string, string> {
-    const cache = partTextCache.get(sessionId) ?? new Map<string, string>();
+  function getPartTextCache(sessionId: string): Map<string, string | IncrementalCounter> {
+    const cache =
+      partTextCache.get(sessionId) ?? new Map<string, string | IncrementalCounter>();
     partTextCache.set(sessionId, cache);
     return cache;
   }
@@ -283,17 +259,20 @@ const tui: TuiPlugin = async (api) => {
 
   function rememberDeltaText(sessionId: string, messageId: string, partId: string, delta: string): number {
     const cache = getPartTextCache(sessionId);
-    const liveKey = `${messageId}:${partId}:live`;
-    const previousLiveText = cache.get(liveKey) ?? "";
-    const nextLiveText = `${previousLiveText}${delta}`;
-    cache.set(liveKey, nextLiveText);
 
     for (const partType of COUNTABLE_PART_TYPES) {
       const key = `${messageId}:${partId}:${partType}`;
-      cache.set(key, `${cache.get(key) ?? ""}${delta}`);
+      const existing = cache.get(key);
+      cache.set(key, `${typeof existing === "string" ? existing : ""}${delta}`);
     }
 
-    return countTokenDifference(previousLiveText, nextLiveText);
+    const liveKey = `${messageId}:${partId}:live`;
+    let counter = cache.get(liveKey);
+    if (typeof counter === "string" || counter === undefined) {
+      counter = createIncrementalCounter(tokenizerAlgorithm);
+      cache.set(liveKey, counter);
+    }
+    return counter.add(delta);
   }
 
   function shouldTrackText(sessionId: string, messageId: string, text: string): boolean {
@@ -398,7 +377,8 @@ const tui: TuiPlugin = async (api) => {
     const sessionCache = getPartTextCache(event.properties.sessionID);
 
     const cacheKey = `${part.messageID}:${part.id}:${part.type}`;
-    const previousText = sessionCache.get(cacheKey) ?? "";
+    const cached = sessionCache.get(cacheKey);
+    const previousText = typeof cached === "string" ? cached : "";
     if (shouldTrackText(event.properties.sessionID, part.messageID, text)) {
       const tokenCount = text.startsWith(previousText)
         ? countTokenDifference(previousText, text)
@@ -428,9 +408,21 @@ const tui: TuiPlugin = async (api) => {
   });
 };
 
-const plugin: TuiPluginModule = {
+/**
+ * Dual-host TUI entry.
+ *
+ * v1 reads `tui`; v2 reads `setup`. Both hosts ignore the key they do not know, so one
+ * module serves `opencode` and `opencode2`. v2 users can also point at the dedicated
+ * `opencode-tps-meter/v2/tui` entry, which carries no v1 baggage.
+ */
+type DualHostTuiModule = TuiPluginModule & {
+  setup: (ctx: V2TuiContext) => V2Cleanup | void;
+};
+
+const plugin: DualHostTuiModule = {
   id: "opencode-tps-meter",
   tui,
+  setup: setupTuiV2,
 };
 
 export default plugin;

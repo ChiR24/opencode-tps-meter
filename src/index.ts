@@ -18,8 +18,10 @@ import type {
 } from "./types.js";
 import { createTracker } from "./tracker.js";
 import { createUIManager } from "./ui.js";
-import { createTokenizer } from "./tokenCounter.js";
+import { createTokenizer, createIncrementalCounter, type IncrementalCounter } from "./tokenCounter.js";
 import { loadConfigSync, defaultConfig } from "./config.js";
+import { setupAuto as setupV2 } from "./v2/dispatch.js";
+import type { V2Cleanup, V2ServerContext, V2TuiContext } from "./v2/types.js";
 import {
   INVALID_FINISH_REASONS,
   COUNTABLE_PART_TYPES,
@@ -145,7 +147,7 @@ function extractPartText(part: Part): string {
  * @param {PluginContext} context - Plugin context from OpenCode framework
  * @returns {PluginHandlers | Record<string, never>} - Event handlers or empty object if disabled
  */
-export default function TpsMeterPlugin(
+function TpsMeterPlugin(
   context: PluginContext
 ): PluginHandlers | Record<string, never> {
   // Create safe logger fallback - handle missing context entirely
@@ -213,7 +215,18 @@ export default function TpsMeterPlugin(
   }
 
   const sessionTrackers = new Map<string, SessionTrackingState>();
-  const partTextCache = new Map<string, Map<string, string>>();
+  /**
+   * Per-part stream state.
+   *
+   * Part-type keys hold accumulated TEXT, because the `message.part.updated` path diffs a
+   * full part against what deltas already counted. The `:live` key instead holds an
+   * incremental counter: it was only ever read to compute a token difference, and doing that
+   * by re-counting the whole accumulated string is O(total) per delta — 1.6s of blocking work
+   * across a 62k-character response under the word heuristic.
+   *
+   * Both live in one map so the existing prefix-based cleanup collects them together.
+   */
+  const partTextCache = new Map<string, Map<string, string | IncrementalCounter>>();
   const messageTokenCache = new Map<string, Map<string, number>>();
   const messageRoleCache = new Map<
     string,
@@ -244,13 +257,13 @@ export default function TpsMeterPlugin(
   const ui = resolvedConfig.toastFallback
     ? createUIManager(safeContext.client || {}, resolvedConfig)
     : createNoopUIManager();
-  const tokenizer = createTokenizer(
+  const tokenizerAlgorithm =
     resolvedConfig.fallbackTokenHeuristic === "words_div_0_75"
       ? "word"
       : resolvedConfig.fallbackTokenHeuristic === "chars_div_3"
         ? "code"
-        : "heuristic"
-  );
+        : "heuristic";
+  const tokenizer = createTokenizer(tokenizerAlgorithm);
 
   logger.info("[TpsMeter] Plugin initialized and ready");
 
@@ -285,30 +298,6 @@ export default function TpsMeterPlugin(
     }
     if (stripped.length <= 6) return stripped;
     return `${stripped.slice(0, 6)}…`;
-  }
-
-  function buildAgentLabel(
-    messageId: string,
-    metadata?: TrackerMetadata
-  ): string {
-    // Priority for agent type: agent.type > agentType > agent.name > name
-    const typeLabel =
-      metadata?.agent?.type?.trim() ||
-      metadata?.agentType?.trim() ||
-      metadata?.agent?.name?.trim() ||
-      metadata?.name?.trim() ||
-      null;
-    
-    // Priority for ID: agentId > agent.id > messageId
-    const rawId =
-      metadata?.agentId?.trim() ||
-      metadata?.agent?.id?.trim() ||
-      messageId;
-    const identifier = abbreviateId(rawId);
-    
-    // Return full label if we have type, otherwise just identifier
-    // (getAllActiveAgentsGlobally will add agent name from cache if needed)
-    return typeLabel ? `${typeLabel}(${identifier})` : identifier;
   }
 
   /**
@@ -465,42 +454,6 @@ export default function TpsMeterPlugin(
     return false;
   }
 
-  function getActiveAgentDisplayStates(
-    sessionState: SessionTrackingState,
-    now: number
-  ): AgentDisplayState[] {
-    const activityWindow = Math.max(
-      resolvedConfig.rollingWindowMs,
-      resolvedConfig.initialDisplayDelayMs * 4
-    );
-    const entries: AgentDisplayState[] = [];
-
-    for (const trackerState of sessionState.messageTrackers.values()) {
-      if (!trackerState.firstTokenAt) {
-        continue;
-      }
-      if (now - trackerState.lastUpdated > activityWindow) {
-        continue;
-      }
-      // Only show subagents/background agents that have agent metadata
-      const hasAgentMetadata = Boolean(trackerState.agent || trackerState.agentId || trackerState.agentType);
-      if (!hasAgentMetadata) {
-        continue;
-      }
-      entries.push({
-        id: trackerState.messageId,
-        label: trackerState.label,
-        instantTps: trackerState.tracker.getSmoothedTPS(),
-        avgTps: trackerState.tracker.getAverageTPS(),
-        totalTokens: trackerState.tracker.getTotalTokens(),
-        elapsedMs: now - trackerState.firstTokenAt,
-      });
-    }
-
-    entries.sort((a, b) => b.instantTps - a.instantTps);
-    return entries;
-  }
-
   function removeMessageTrackerState(
     sessionId: string,
     messageId: string
@@ -607,8 +560,9 @@ export default function TpsMeterPlugin(
     ui.clear();
   }
 
-  function getPartTextCache(sessionId: string): Map<string, string> {
-    const sessionCache = partTextCache.get(sessionId) || new Map<string, string>();
+  function getPartTextCache(sessionId: string): Map<string, string | IncrementalCounter> {
+    const sessionCache =
+      partTextCache.get(sessionId) || new Map<string, string | IncrementalCounter>();
     partTextCache.set(sessionId, sessionCache);
     return sessionCache;
   }
@@ -619,17 +573,20 @@ export default function TpsMeterPlugin(
 
   function rememberDeltaText(sessionId: string, messageId: string, partId: string, delta: string): number {
     const sessionCache = getPartTextCache(sessionId);
-    const liveKey = `${messageId}:${partId}:live`;
-    const previousLiveText = sessionCache.get(liveKey) || "";
-    const nextLiveText = `${previousLiveText}${delta}`;
-    sessionCache.set(liveKey, nextLiveText);
 
     for (const partType of COUNTABLE_PART_TYPES) {
       const key = `${messageId}:${partId}:${partType}`;
-      sessionCache.set(key, `${sessionCache.get(key) || ""}${delta}`);
+      const existing = sessionCache.get(key);
+      sessionCache.set(key, `${typeof existing === "string" ? existing : ""}${delta}`);
     }
 
-    return countTokenDifference(previousLiveText, nextLiveText);
+    const liveKey = `${messageId}:${partId}:live`;
+    let counter = sessionCache.get(liveKey);
+    if (typeof counter === "string" || counter === undefined) {
+      counter = createIncrementalCounter(tokenizerAlgorithm);
+      sessionCache.set(liveKey, counter);
+    }
+    return counter.add(delta);
   }
 
 /**
@@ -691,7 +648,8 @@ function handleMessagePartUpdated(event: MessageEvent): void {
   if (part && !event.properties.delta && partText !== undefined) {
     const sessionCache = getPartTextCache(sessionId);
     const cacheKey = `${part.messageID}:${part.id}:${part.type}`;
-    const previousText = sessionCache.get(cacheKey) || "";
+    const cached = sessionCache.get(cacheKey);
+    const previousText = typeof cached === "string" ? cached : "";
     tokenCount = partText.startsWith(previousText)
       ? countTokenDifference(previousText, partText)
       : tokenizer.count(partText);
@@ -995,6 +953,33 @@ function handleMessagePartUpdated(event: MessageEvent): void {
     },
   };
 }
+
+/**
+ * Dual-host server entry.
+ *
+ * Exported as an OBJECT, not a bare function. v2 validates the default export against a
+ * schema that requires an object and rejects a callable with
+ * `SchemaError(Expected object at ["default"])`, so the older v1 bare-function style cannot
+ * load there. v1's own `PluginModule` is `{ id?, server }`, so one object satisfies both:
+ * v1 reads `server`, v2 reads `setup`, and each ignores the other's key.
+ *
+ * `setup` dispatches on the context it receives: v2's TUI process loads a package's ROOT
+ * export, so this same module is asked to be the TUI plugin there and the server plugin in
+ * the service. See src/v2/dispatch.ts.
+ */
+type DualHostServerModule = {
+  id: string;
+  server: typeof TpsMeterPlugin;
+  setup: (ctx: V2ServerContext | V2TuiContext) => Promise<V2Cleanup | void>;
+};
+
+const plugin: DualHostServerModule = {
+  id: "opencode-tps-meter",
+  server: TpsMeterPlugin,
+  setup: setupV2,
+};
+
+export default plugin;
 
 // Export types only - no helper functions to avoid OpenCode trying to load them as plugins
 export type {
