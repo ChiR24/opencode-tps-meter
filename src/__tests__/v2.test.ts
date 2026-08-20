@@ -1384,7 +1384,19 @@ describe("build invariants", () => {
     // plugin load outright. dist/index.mjs is loaded by both the service and (via the
     // dual-host shape) the TUI, so the TUI half must stay behind a runtime import.
     const fs = await import("node:fs/promises");
-    const bundle = await fs.readFile("dist/index.mjs", "utf8");
+    const BUNDLE = "dist/index.mjs";
+
+    // dist/ is gitignored and CI runs `bun test` BEFORE `bun run build`, so a fresh checkout
+    // has no bundle to inspect. Build it on demand rather than skipping — skipping would let
+    // this invariant silently never run in CI, which is the one place it matters most.
+    try {
+      await fs.access(BUNDLE);
+    } catch {
+      const built = Bun.spawn(["bun", "run", "build"], { stdout: "ignore", stderr: "ignore" });
+      expect(await built.exited).toBe(0);
+    }
+
+    const bundle = await fs.readFile(BUNDLE, "utf8");
 
     const staticImports = bundle
       .split("\n")
@@ -1394,7 +1406,7 @@ describe("build invariants", () => {
     expect(staticImports).toEqual([]);
     // ...and the lazy path must still be there.
     expect(bundle.includes("./tui.mjs")).toBe(true);
-  });
+  }, 120_000);
 
   it("ships only dist and docs", async () => {
     const pkg = await import("../../package.json");
