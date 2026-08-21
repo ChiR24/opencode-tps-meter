@@ -157,8 +157,17 @@ export function setupServer(ctx: V2ServerContext): V2Cleanup | void {
 }
 
 /** v2 server plugin definition. Structurally what `Plugin.define` from `@opencode-ai/plugin` returns. */
-export const v2ServerPlugin: V2PluginDefinition<V2ServerContext> = {
+export const v2ServerPlugin: V2PluginDefinition<V2ServerContext> & { tui: boolean } = {
   id: "opencode-tps-meter",
+  /**
+   * Declares that this package also has a TUI entrypoint.
+   *
+   * Without it the host loads only the server half and the meter never draws — the plugin
+   * API reports `"tui": false` for us. It cannot go on the root module, because v1 loads
+   * that and rejects a non-function `tui` with "has invalid tui export"; this module is
+   * reached through the `./server` export, which only v2 resolves.
+   */
+  tui: true,
   setup: setupServer,
 };
 
