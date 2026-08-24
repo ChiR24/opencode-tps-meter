@@ -90,6 +90,19 @@ export interface V2Snapshot {
   calibrationSamples: number;
   /** True when the turn was aborted; the reading is not trustworthy. */
   interrupted: boolean;
+  /**
+   * Host-clock time of this session's most recent token.
+   *
+   * Lets consumers age out readings themselves (the footer drops finished subagents after
+   * a few seconds) without re-deriving activity from event streams they never see.
+   */
+  lastActivityAt: number;
+  /**
+   * Host-clock time of this session's FIRST token, scoped to the whole session rather than
+   * the current turn. The footer renders children in this order, so the stamp must survive
+   * per-turn resets or columns would reshuffle after every tool call.
+   */
+  startedAt: number;
 }
 
 /** One settled step, emitted for durable rollups. Interrupted turns are never emitted. */
@@ -251,6 +264,12 @@ export function createMeter(config: Config, hooks?: V2MeterHooks): V2Meter {
   const lastActivityAt = new Map<string, number>();
   /** Usage accounting that survives per-turn resets. */
   const sessionUsage = new Map<string, SessionUsage>();
+  /**
+   * Session-scoped first-token time, also surviving per-turn resets. Feeds snapshot
+   * `startedAt`, which the footer sorts children by; per-turn `firstTokenAt` would move a
+   * subagent to the end of the line after every tool-call break.
+   */
+  const sessionSpawnAt = new Map<string, number>();
 
   function getSessionUsage(sessionID: string): SessionUsage {
     let usage = sessionUsage.get(sessionID);
@@ -366,6 +385,7 @@ export function createMeter(config: Config, hooks?: V2MeterHooks): V2Meter {
     const evict = oldestFirst.slice(0, snapshots.size - MAX_RETAINED_SNAPSHOTS);
     for (const sessionID of evict) {
       lastActivityAt.delete(sessionID);
+      sessionSpawnAt.delete(sessionID);
     }
     mutateSnapshots((draft) => {
       for (const sessionID of evict) {
@@ -426,6 +446,8 @@ export function createMeter(config: Config, hooks?: V2MeterHooks): V2Meter {
       const elapsedMs = elapsedFor(state);
       draft.set(sessionID, {
         sessionID,
+        lastActivityAt: state.lastTokenAt ?? now,
+        startedAt: sessionSpawnAt.get(sessionID) ?? state.firstTokenAt ?? now,
         instantTps: state.tracker.getSmoothedTPS(),
         avgTps: elapsedMs > 0 ? totalTokens / (elapsedMs / 1000) : state.tracker.getAverageTPS(),
         totalTokens,
@@ -462,7 +484,8 @@ export function createMeter(config: Config, hooks?: V2MeterHooks): V2Meter {
     totalTokens: number,
     avgTps: number,
     elapsedMs: number,
-    overheadTokens: number
+    overheadTokens: number,
+    at: number
   ): void {
     if (totalTokens === 0 || elapsedMs < config.initialDisplayDelayMs) {
       return;
@@ -470,6 +493,8 @@ export function createMeter(config: Config, hooks?: V2MeterHooks): V2Meter {
     mutateSnapshots((draft) => {
       draft.set(sessionID, {
         sessionID,
+        lastActivityAt: at,
+        startedAt: sessionSpawnAt.get(sessionID) ?? at,
         instantTps: 0,
         avgTps,
         totalTokens,
@@ -617,6 +642,9 @@ export function createMeter(config: Config, hooks?: V2MeterHooks): V2Meter {
       state.firstTokenAt = now;
       state.firstTokenWallAt = Date.now();
     }
+    if (!sessionSpawnAt.has(sessionID)) {
+      sessionSpawnAt.set(sessionID, now);
+    }
     state.lastTokenAt = now;
     state.tracker.recordTokens(tokenCount, now);
     maybePublishActive(sessionID, now);
@@ -704,7 +732,7 @@ export function createMeter(config: Config, hooks?: V2MeterHooks): V2Meter {
     const elapsedMs = state?.firstTokenAt ? Math.max(0, now - state.firstTokenAt) : 0;
     const avgTps = elapsedMs > 0 ? totalTokens / (elapsedMs / 1000) : 0;
 
-    publishFinal(sessionID, totalTokens, avgTps, elapsedMs, overheadFor(sessionID));
+    publishFinal(sessionID, totalTokens, avgTps, elapsedMs, overheadFor(sessionID), now);
 
     // Feed the durable rollup. An aborted turn is excluded: its elapsed window is truncated
     // at an arbitrary point, so folding it in would drag every average down.
@@ -792,6 +820,7 @@ export function createMeter(config: Config, hooks?: V2MeterHooks): V2Meter {
       streamText.clear();
       lastActivityAt.clear();
       sessionUsage.clear();
+      sessionSpawnAt.clear();
       metrics.dispose();
       listeners.clear();
       snapshots = new Map();

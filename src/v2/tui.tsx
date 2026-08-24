@@ -18,9 +18,11 @@
  */
 
 import { createMemo, createSignal, For, Show } from "solid-js";
+import { AGGREGATE_TICK_INTERVAL_MS } from "../constants.js";
 import { defaultConfig, loadConfigSync } from "../config.js";
 import { formatMeterText } from "../format.js";
 import type { Config } from "../types.js";
+import { collectMeterEntries, formatAggregateLine, hasSubagentEntries } from "./family.js";
 import { createMeter, type V2Snapshot } from "./meter.js";
 import { createLedger, type V2Ledger } from "./ledger.js";
 import type {
@@ -30,6 +32,7 @@ import type {
   V2PluginDefinition,
   V2ResolvedTheme,
   V2Rgba,
+  V2SessionData,
   V2SlotInput,
   V2TuiContext,
   V2UnknownEvent,
@@ -107,6 +110,10 @@ function MeterView(props: {
   config: Config;
   mode: () => DisplayMode;
   snapshots: () => ReadonlyMap<string, V2Snapshot>;
+  /** Session tree for subagent attribution. Absent hosts degrade to single-session display. */
+  session?: V2SessionData;
+  /** Slow heartbeat that re-runs the recency filter when no events are flowing. */
+  tick?: () => number;
 }) {
   // sessionID is optional in v2 — the footer also renders on surfaces with no session.
   const current = createMemo(() => {
@@ -117,10 +124,59 @@ function MeterView(props: {
     return sessionID ? props.snapshots().get(sessionID) : undefined;
   });
 
+  /**
+   * The selected session's whole family, filtered to entries worth showing.
+   *
+   * While anything streams this recomputes on every publish; once everything is quiet the
+   * tick signal keeps it alive so finished subagents still age out of the line.
+   */
+  const entries = createMemo(() => {
+    if (props.mode() === "hidden" || !current()) {
+      return [];
+    }
+    const sessionID = props.input.sessionID;
+    if (!sessionID) {
+      return [];
+    }
+    const snaps = props.snapshots();
+    const data = props.session;
+    let rootID = sessionID;
+    // Without a tree (or if the beta API drifts) this collapses to exactly the
+    // single-session meter that shipped before multi-agent support.
+    let memberIDs: readonly string[] = [sessionID];
+    if (data) {
+      try {
+        rootID = data.root(sessionID);
+        const family = data.family(rootID);
+        memberIDs = family.includes(rootID) ? family : [rootID, ...family];
+      } catch {
+        memberIDs = [sessionID];
+      }
+    }
+    props.tick?.();
+    return collectMeterEntries({
+      rootID,
+      memberIDs,
+      snapshots: snaps,
+      agentOf: (id) => data?.get(id)?.agent ?? snaps.get(id)?.agent,
+      now: Date.now(),
+    });
+  });
+
+  /** The aggregate line, or undefined while no subagent qualifies — then v1 layout applies. */
+  const aggregate = createMemo(() => {
+    const rows = entries();
+    return hasSubagentEntries(rows) ? formatAggregateLine(rows) : undefined;
+  });
+
   const line = createMemo(() => {
     const snapshot = current();
     if (!snapshot) {
       return "";
+    }
+    const rows = aggregate();
+    if (rows !== undefined) {
+      return rows;
     }
     const base = formatMeterText(snapshot, props.config);
     if (props.mode() !== "detailed") {
@@ -415,6 +471,16 @@ export function setupTui(ctx: V2TuiContext): V2Cleanup | void {
   });
   const [snapshots, setSnapshots] = createSignal<ReadonlyMap<string, V2Snapshot>>(new Map());
   const [mode, setMode] = createSignal<DisplayMode>("compact");
+  /**
+   * Heartbeat for the footer's recency filter.
+   *
+   * A finished subagent must disappear after ~4s, but nothing republishes once every
+   * stream is quiet — and a memo that depends on nothing changing never re-runs. This slow
+   * tick re-evaluates the filter at negligible cost; it is only read while subagent rows
+   * are being selected.
+   */
+  const [tick, setTick] = createSignal(0);
+  const heartbeat = setInterval(() => setTick((value) => value + 1), AGGREGATE_TICK_INTERVAL_MS);
   const disposers: Array<() => void> = [];
 
   disposers.push(meter.subscribe((next) => setSnapshots(() => next)));
@@ -448,6 +514,8 @@ export function setupTui(ctx: V2TuiContext): V2Cleanup | void {
           config={config}
           mode={mode}
           snapshots={snapshots}
+          session={ctx.data.session}
+          tick={tick}
         />
       ),
     })
@@ -513,6 +581,7 @@ export function setupTui(ctx: V2TuiContext): V2Cleanup | void {
   }
 
   return () => {
+    clearInterval(heartbeat);
     for (const dispose of disposers) {
       dispose();
     }

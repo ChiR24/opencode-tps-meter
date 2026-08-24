@@ -33,6 +33,7 @@ OpenCode plugin that tracks AI token throughput in real-time. Displays TPS stati
 │   │   ├── dispatch.ts   # routes v2 setup() to TUI or server by context shape
 │   │   ├── meter.ts      # v2 session tracking core - drives both v2 entries
 │   │   ├── metrics.ts    # calibration + turn decomposition (TTFT, tool time)
+│   │   ├── family.ts     # pure multi-session footer aggregation (select/label/format Σ line)
 │   │   ├── ledger.ts     # durable per-model rollup via ctx.storage.store
 │   │   ├── server.ts     # v2 server entry (no UI; wire-level TTFB hooks)
 │   │   └── tui.tsx       # v2 TUI entry: footer meter, sidebar panel, dashboard
@@ -124,6 +125,8 @@ Never import `src/ui.ts` or `src/types.ts` event types from v2 code — those ar
 |--------|------|----------|------|
 | `TpsMeterPlugin` | Function | `index.ts:150` | v1 handler factory, exported as the module's `.server` |
 | `createMeter` | Factory | `v2/meter.ts:82` | v2 session tracking core |
+| `collectMeterEntries` | Function | `v2/family.ts` | Selects/orders family sessions for the footer Σ line |
+| `formatAggregateLine` | Function | `v2/family.ts` | Renders `TPS Σ… | main … | agent … | +N` |
 | `setupTui` | Function | `v2/tui.tsx:103` | v2 TUI setup; returns cleanup |
 | `setupServer` | Function | `v2/server.ts:44` | v2 server setup; returns cleanup |
 | `createTracker` | Factory | `tracker.ts:20` | TPS tracker with ring buffer (shared) |
@@ -211,6 +214,31 @@ so v2 derives elapsed from `firstTokenAt`/`lastTokenAt` instead — never mix th
 compaction. Never substitute one for the other. Their residual is the hidden-overhead metric,
 and it is tracked at SESSION scope (`sessionUsage`) because per-turn state is destroyed on every
 step end and idle.
+
+**Multi-session footer.** The footer aggregates the selected session's whole family; selection,
+labeling and formatting live in the pure module `src/v2/family.ts` (unit-tested without a
+renderer, shared by BOTH hosts via the structural `FamilyReading` type). Root always renders as
+`main` — its frozen reading persists exactly as the single-agent meter always behaved. Children
+appear while `snapshot.active` or within `SUBAGENT_LINGER_MS` (4s) of `snapshot.lastActivityAt`,
+sorted root-first then in SPAWN order (session-scoped `snapshot.startedAt` = first-ever token
+time; recency ordering was tried and rejected because columns swap as activity trades, which
+reads as flicker). Same-millisecond spawns tie-break on session id. A session that finishes and
+is re-dispatched stamps a fresh `startedAt` and rejoins at the end. Capped at 4 entries with
+`+N` overflow. `Σ` sums `instantTps` of ACTIVE entries only; finished columns show their frozen
+average. Line format: `TPS Σ 318 | main 63 | explore 91 | …` (note the space after Σ).
+Reactivity caveat: Solid memos only re-run when a dependency changes, and nothing publishes once
+every stream goes quiet, so a 500ms heartbeat signal (`AGGREGATE_TICK_INTERVAL_MS`) keeps the
+recency filter honest on both hosts. Every host-API access is wrapped — drift degrades to the
+single-session meter, never to a broken plugin.
+
+Attribution per host:
+- **v2**: `ctx.data.session.root/family/get(id)?.agent` — exact, synced.
+- **v1**: no family API in events, but the real tree IS available: `session.created`/
+  `session.updated` carry `info.parentID`, and `api.state.session.get()` serves the same
+  `Session` shape synchronously (`src/tui.tsx: parentOf/walkToRoot/resolveRoot`). Agent names
+  ride on message payloads only — `agent` (string or AgentIdentity), assistant `mode`, legacy
+  `agentType`; parts never carry them. Unrelated sessions are excluded because their root chain
+  lands elsewhere; with no links at all the meter stays single-session.
 
 **Validate at the v2 event boundary.** Event payloads cross a process boundary from the host,
 so `asMeterEvent` rejects anything without a non-empty string `sessionID`, and `toTokenCount`

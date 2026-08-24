@@ -66,6 +66,15 @@ export const DEFAULT_UPDATE_INTERVAL_MS = 50;
  */
 export const V2_UPDATE_INTERVAL_MS = 8;
 
+/**
+ * Heartbeat for the v2 footer's multi-session aggregate (ms).
+ *
+ * Finished subagents must disappear after a few seconds, but once every stream is quiet
+ * nothing republishes — and a memo that depends on nothing changing never re-runs. This
+ * slow tick re-evaluates the footer's recency filter at negligible cost.
+ */
+export const AGGREGATE_TICK_INTERVAL_MS = 500;
+
 /** Minimum interval between toast updates (ms) - prevents UI flooding */
 export const MIN_TOAST_INTERVAL_MS = 80;
 
