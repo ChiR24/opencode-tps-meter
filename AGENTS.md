@@ -224,8 +224,10 @@ sorted root-first then in SPAWN order (session-scoped `snapshot.startedAt` = fir
 time; recency ordering was tried and rejected because columns swap as activity trades, which
 reads as flicker). Same-millisecond spawns tie-break on session id. A session that finishes and
 is re-dispatched stamps a fresh `startedAt` and rejoins at the end. Capped at 4 entries with
-`+N` overflow. `Σ` sums `instantTps` of ACTIVE entries only; finished columns show their frozen
-average. Line format: `TPS Σ 318 | main 63 | explore 91 | …` (note the space after Σ).
+`+N` overflow. `Σ` sums `instantTps` of ACTIVE SUBAGENT entries only — the root is excluded
+because while children run it is waiting on them, and on v1 its reading stays flagged active
+across that wait (counting it reported a frozen rate as live throughput); the root's own rate
+still shows in its column. Finished columns show their frozen average. Line format: `TPS Σ 318 | main 63 | explore 91 | …` (note the space after Σ).
 Reactivity caveat: Solid memos only re-run when a dependency changes, and nothing publishes once
 every stream goes quiet, so a 500ms heartbeat signal (`AGGREGATE_TICK_INTERVAL_MS`) keeps the
 recency filter honest on both hosts. Every host-API access is wrapped — drift degrades to the

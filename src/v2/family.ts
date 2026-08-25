@@ -126,13 +126,16 @@ export function hasSubagentEntries(entries: readonly AgentMeterEntry[]): boolean
  *
  *   TPS Σ 318 | main 63 | explore 91 | general 86 | reviewer 78 | +2
  *
- * Σ covers only currently generating sessions; a finished entry still shows its own
- * frozen average but contributes nothing to Σ.
+ * Σ covers only currently generating SUBAGENT sessions. The root is excluded on purpose:
+ * while children run, the root is by definition waiting on them — and on v1 its reading
+ * stays flagged active across that wait, so counting it would report a frozen rate as
+ * live throughput. The root's own rate still shows in its column. Finished entries
+ * contribute nothing to Σ.
  */
 export function formatAggregateLine(entries: readonly AgentMeterEntry[]): string {
   let sum = 0;
   for (const entry of entries) {
-    if (entry.active) {
+    if (entry.active && !entry.isRoot) {
       sum += entry.instantTps;
     }
   }

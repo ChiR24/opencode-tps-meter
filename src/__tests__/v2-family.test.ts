@@ -228,7 +228,7 @@ describe("formatAggregateLine", () => {
     };
   }
 
-  it("sums instantaneous TPS across currently generating sessions", () => {
+  it("sums the generating subagents and excludes the waiting root", () => {
     const line = formatAggregateLine([
       entry({ sessionID: "r", label: "main", isRoot: true, tps: 63.4, instantTps: 63.4 }),
       entry({ sessionID: "a", label: "explore", tps: 91.2, instantTps: 91.2 }),
@@ -236,8 +236,9 @@ describe("formatAggregateLine", () => {
       entry({ sessionID: "c", label: "reviewer", tps: 77.6, instantTps: 77.6 }),
     ]);
 
-    // 63.4 + 91.2 + 85.9 + 77.6 = 318.1 -> 318
-    expect(line).toBe("TPS \u03A3 318 | main 63 | explore 91 | general 86 | reviewer 78");
+    // 91.2 + 85.9 + 77.6 = 254.7 -> 255. main is dispatching and waiting, so its
+    // frozen rate must not be counted as live throughput.
+    expect(line).toBe("TPS \u03A3 255 | main 63 | explore 91 | general 86 | reviewer 78");
   });
 
   it("excludes finished sessions from the sum while still showing their average", () => {
@@ -246,7 +247,7 @@ describe("formatAggregateLine", () => {
       entry({ sessionID: "a", label: "explore", tps: 40, instantTps: 12.4, active: false }),
     ]);
 
-    expect(line).toBe("TPS \u03A3 50 | main 50 | explore 40");
+    expect(line).toBe("TPS \u03A3 0 | main 50 | explore 40");
   });
 
   it("caps displayed entries and appends +N for the overflow", () => {
@@ -261,8 +262,8 @@ describe("formatAggregateLine", () => {
     const line = formatAggregateLine(rows);
     expect(line).toContain(`| +${rows.length - MAX_METER_ENTRIES}`);
     expect(line).not.toContain("extra ");
-    // All six are generating: 10 + 20*4 + 30 = 120.
-    expect(line.startsWith("TPS \u03A3 120 |")).toBe(true);
+    // Generating subagents only: 20*4 + 30 = 110. The root's 10 is excluded.
+    expect(line.startsWith("TPS \u03A3 110 |")).toBe(true);
   });
 
   it("rounds every displayed figure to an integer", () => {
@@ -319,8 +320,9 @@ describe("multi-session footer integration", () => {
       expect(hasSubagentEntries(entries)).toBe(true);
       const line = formatAggregateLine(entries);
 
+      // Σ counts generating subagents only; the dispatching root is waiting on them.
       const expectedSum = Math.round(
-        [...snapshots.values()].reduce((acc, s) => acc + s.instantTps, 0)
+        entries.filter((e) => !e.isRoot).reduce((acc, e) => acc + e.instantTps, 0)
       );
       expect(line).toBe(`TPS \u03A3 ${expectedSum} | main ${Math.round(entries[0]!.tps)} | explore ${Math.round(entries[1]!.tps)} | general ${Math.round(entries[2]!.tps)}`);
       // Every streamed session stamped its latest host time and its first-token spawn time.
