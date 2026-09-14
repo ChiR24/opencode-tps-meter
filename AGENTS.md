@@ -67,6 +67,29 @@ OpenCode plugin that tracks AI token throughput in real-time. Displays TPS stati
    process dies with `Environment variable "OPENTUI_FORCE_WCWIDTH" is already registered`, which
    fails the plugin load. `src/v2/dispatch.ts` therefore lazy-loads the TUI module behind a
    runtime import and dispatches on context shape.
+6. NEVER put a `tui: true` boolean on the server plugin definition. Commit `53ad497` did that to
+   declare the TUI entrypoint and it broke the plugin outright. The v1-style loader validates a
+   module's default export with `readV1Plugin` (`packages/opencode/src/plugin/shared.ts`), which
+   treats any `tui` key as a legacy handler and, on a non-function, throws
+   `Plugin <spec> has invalid tui export` — aborting the whole load with only an ERROR line in
+   `~/.local/share/opencode/log/opencode.log` (`message="failed to load plugin"`) and no meter.
+   For registry (npm) packages, TUI discovery is driven by `exports["./tui"]` in `package.json`;
+   the boolean is never read. (For local `file://` directories, see 7 below — the loader ignores
+   `exports` entirely and resolves by file path.)
+   Same reason `./server` must resolve to the dual-host `dist/index.mjs` (`{ id, server, setup }`)
+   and NOT the v2-only `dist/v2/server.mjs` (`{ id, setup }`): the loader calls `readV1Plugin(...,
+   "server")`, which requires a `server()` function on whatever `./server` points at. The `/v2`
+   exports are for programmatic `import` only. Locked in by the "resolves ./server and ./tui to
+   modules valid on both plugin loaders" test in `src/__tests__/v2.test.ts`.
+7. **Register local builds at `<repo>/dist`, not the repo root.** The installed v2.0.2 resolves a
+   LOCAL plugin directory by file path — it tries `<dir>/server` then `<dir>/index` for the server
+   and `<dir>/tui` for the TUI (adding `.ts/.tsx/.js/.jsx/.mts/.mjs/.cts/.cjs`). It only consults
+   `package.json#exports` when the target is an npm package (`target.name` set), so the repo root
+   (which has no root `index.*`, only `exports`) is **silently skipped** — no error, no meter.
+   `dist/` is the correct target because it contains `index.mjs` (server) and `tui.mjs` (TUI).
+   Verified: `opencode.json` `plugin` → `file:///<repo>/opencode-tps-meter/dist` yields
+   `"features":{"server":true,"tui":true},"state":{"status":"active"}` from `/api/plugin`.
+   `cli.json` `plugins` and `tui.json` `plugin` should use the same `dist` path.
 
 **Dual-host rule:** v1 files must keep working unchanged against `opencode`. v2 lives under `src/v2/`
 and shares only runtime-agnostic modules (tracker, tokenCounter, config, constants, format).

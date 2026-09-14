@@ -1414,4 +1414,71 @@ describe("build invariants", () => {
     // Runtime deps would be bundled into the host; the renderer must come from the host.
     expect(pkg.default.dependencies).toBeUndefined();
   });
+
+  it("resolves ./server and ./tui to modules valid on both plugin loaders", async () => {
+    // Two loaders validate a module's DEFAULT export, and they disagree:
+    //
+    //   v1-style (readV1Plugin, packages/opencode/src/plugin/shared.ts):
+    //     ./server must expose `server()`, ./tui must expose `tui()`, and a `tui`
+    //     key that is not a function throws `has invalid tui export`.
+    //   v2 (Plugin.Definition / isPlugin): default must be `{ id: string, setup: fn }`.
+    //
+    // The package satisfies both by resolving ./server to the dual-host
+    // { id, server, setup } module and ./tui to the dual-host { id, tui, setup }
+    // module. Pointing ./server at the v2-only `dist/v2/server.mjs` (a change made
+    // to carry a `tui: true` flag) broke this: v1 imports that entrypoint, sees a
+    // boolean `tui`, and aborts the whole plugin load.
+    const fs = await import("node:fs/promises");
+    const pkg = await import("../../package.json");
+    const exports = pkg.default.exports as Record<string, { import?: string } | string>;
+
+    try {
+      await fs.access("dist/index.mjs");
+    } catch {
+      const built = Bun.spawn(["bun", "run", "build"], { stdout: "ignore", stderr: "ignore" });
+      expect(await built.exited).toBe(0);
+    }
+
+    const entryPath = (subpath: string) => {
+      const value = exports[subpath];
+      const raw = typeof value === "string" ? value : value?.import;
+      expect(raw).toBeString();
+      return raw as string;
+    };
+
+    const server = ((await import("../../" + entryPath("./server").replace("./", ""))) as {
+      default: Record<string, unknown>;
+    }).default;
+    expect(server.id).toBe("opencode-tps-meter");
+    expect(typeof server.server).toBe("function"); // v1 loader
+    expect(typeof server.setup).toBe("function"); // v2 loader
+
+    const tui = ((await import("../../" + entryPath("./tui").replace("./", ""))) as {
+      default: Record<string, unknown>;
+    }).default;
+    expect(tui.id).toBe("opencode-tps-meter");
+    expect(typeof tui.tui).toBe("function"); // v1 loader
+    expect(typeof tui.setup).toBe("function"); // v2 loader
+
+    // A `tui` key, when present anywhere a server loader can reach, must be a function.
+    if ("tui" in server) expect(typeof server.tui).toBe("function");
+    // Pins the entrypoint, which also pins its sibling `types` condition: consumers of
+    // `opencode-tps-meter/server` types get `dist/index.d.ts` (dual-host module), not
+    // `dist/v2/server.d.ts`. That is the intended revert — flag it here so a future
+    // types-only "fix" that re-points at the v2-only bundle breaks loudly.
+    expect(entryPath("./server")).toBe("./dist/index.mjs");
+
+    // The file that actually carried the regressed boolean. `./server` no longer
+    // points at it, but the guard belongs on the source of the bug, not just the
+    // current exports map: re-adding `tui: true` to `src/v2/server.ts` without
+    // touching `package.json` must still fail loudly here.
+    const v2Server = (
+      (await import("../../dist/v2/server.mjs")) as {
+        default: Record<string, unknown>;
+      }
+    ).default;
+    expect(v2Server.id).toBe("opencode-tps-meter");
+    expect(typeof v2Server.setup).toBe("function");
+    if ("tui" in v2Server) expect(typeof v2Server.tui).toBe("function");
+  }, 120_000);
 });

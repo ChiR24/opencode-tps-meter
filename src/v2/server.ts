@@ -156,18 +156,20 @@ export function setupServer(ctx: V2ServerContext): V2Cleanup | void {
   };
 }
 
-/** v2 server plugin definition. Structurally what `Plugin.define` from `@opencode-ai/plugin` returns. */
-export const v2ServerPlugin: V2PluginDefinition<V2ServerContext> & { tui: boolean } = {
+/**
+ * v2 server plugin definition. Structurally what `Plugin.define` from `@opencode-ai/plugin` returns.
+ *
+ * NOTE: do NOT add a `tui: true` field here. The v1-style loader validates plugin modules with
+ * v1-era shape rules (`readV1Plugin` in packages/opencode/src/plugin/shared.ts): a `tui`
+ * key, when present, must be a FUNCTION, and anything else throws
+ * `Plugin <spec> has invalid tui export` — which silently kills the whole plugin load.
+ * For registry (npm) packages the host discovers the TUI half through `package.json`
+ * `exports["./tui"]`, never through a boolean flag on the server module. (For local `file://`
+ * directories the loader ignores `exports` entirely and resolves `<dir>/tui.*` by file path —
+ * see AGENTS.md constraint 7 — so the flag would be dead weight there too.)
+ */
+export const v2ServerPlugin: V2PluginDefinition<V2ServerContext> = {
   id: "opencode-tps-meter",
-  /**
-   * Declares that this package also has a TUI entrypoint.
-   *
-   * Without it the host loads only the server half and the meter never draws — the plugin
-   * API reports `"tui": false` for us. It cannot go on the root module, because v1 loads
-   * that and rejects a non-function `tui` with "has invalid tui export"; this module is
-   * reached through the `./server` export, which only v2 resolves.
-   */
-  tui: true,
   setup: setupServer,
 };
 

@@ -18,8 +18,8 @@
       }
     },
     "./server": {
-      "types": "./dist/v2/server.d.ts",
-      "import": "./dist/v2/server.mjs"
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.mjs"
     },
     "./tui": {
       "types": "./dist/tui.d.ts",
