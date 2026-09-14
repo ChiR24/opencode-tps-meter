@@ -28,7 +28,7 @@ A live tokens-per-second meter plugin for OpenCode. Track AI token throughput in
 
 ## Features
 
-- **Runs on both OpenCode generations** — one package, v1 (`opencode`) and v2 beta (`opencode2`)
+- **Runs on both OpenCode generations** — one package, v1 (`opencode`) and v2 (`opencode2`)
 - **Exact final totals on v2** — provider-reported token counts replace the heuristic estimate when the turn ends
 - **Real-time Monitoring** — Live TPS calculation with configurable rolling window
 - **Smart Filtering** — Tracks only assistant text/reasoning, excludes user prompts, tools, patches, snapshots, and files
@@ -49,7 +49,7 @@ A live tokens-per-second meter plugin for OpenCode. Track AI token throughput in
 
 One package supports both OpenCode generations. They install as separate binaries (`opencode` and `opencode2`) and can run side by side.
 
-| | OpenCode v1 (`opencode`) | OpenCode v2 beta (`opencode2`) |
+| | OpenCode v1 (`opencode`) | OpenCode v2 (`opencode2`) |
 |---|---|---|
 | Config key | `"plugin"` | `"plugins"` |
 | Meter renders in | TUI session prompt | TUI prompt footer status |
@@ -57,7 +57,7 @@ One package supports both OpenCode generations. They install as separate binarie
 | Default export shape | function *or* `{ id, server }` | `{ id, setup }` (object required) |
 | Toast fallback | Available (opt-in) | Not available — v2 server plugins have no UI surface |
 
-> **v2 is beta.** Its plugin API is documented as subject to change before 2.0 is stable. Verified against `opencode2` beta `0.0.0-beta-17639`, whose shipped binary implements the v2 TUI plugin API this package targets — its own built-in TUI plugins (`opencode.notifications`, `diff-viewer`) use `Plugin.define({ id, setup })` with `ctx.ui.slot({ append, render })` and `ctx.data.on(...)`.
+> Verified against OpenCode **2.0.2** (server reports `features: server+tui, status: active`), whose shipped binary implements the v2 TUI plugin API this package targets — its own built-in TUI plugins (`opencode.notifications`, `diff-viewer`) use `Plugin.define({ id, setup })` with `ctx.ui.slot({ append, render })` and `ctx.data.on(...)`. Also verified against `opencode2` beta `0.0.0-beta-17639`.
 
 ---
 
@@ -81,11 +81,8 @@ For manual installation, add the package to your TUI config (`~/.config/opencode
 
 ### OpenCode v2 (`opencode2`)
 
-v2 support ships as a **prerelease**, because `opencode2` is beta and its plugin API may still
-change. Install it explicitly:
-
 ```bash
-npm install opencode-tps-meter@beta
+npm install opencode-tps-meter
 ```
 
 v2 replaced layered `tui.json(c)` files with a single global `cli.json`, and renamed the plugin config key to `plugins`. Register in `opencode.json`:

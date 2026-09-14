@@ -1,3 +1,39 @@
+## v0.4.0 — OpenCode v2 support (stable)
+
+Promotes `v0.4.0-beta.1` to stable with loader fixes verified end to end against
+OpenCode **2.0.2**: the server reports
+`"features":{"server":true,"tui":true},"state":{"status":"active"}` for the
+plugin, and the meter renders in the TUI prompt footer. Install with
+`opencode-tps-meter@latest`. Everything in the beta.1 notes below carries over.
+
+### 🐞 Fixed since beta.1
+
+- **Removed the `tui: true` flag from the server plugin definition.** The loader
+  treats any `tui` key as a legacy handler and throws
+  `Plugin <spec> has invalid tui export` on a non-function, aborting the whole
+  plugin load with no meter.
+- **`./server` resolves to the dual-host `dist/index.mjs` again** (`{ id, server,
+  setup }`), the only shape valid on both loaders. The v2-only
+  `dist/v2/server.mjs` (`{ id, setup }`) fails the v1 `server()` requirement.
+  The `/v2` exports remain for programmatic `import` only.
+- **Local `file://` installs must target `<package>/dist`, not the repo root.**
+  The 2.0.2 resolver handles local directories by file path (`<dir>/server`,
+  `<dir>/index`, `<dir>/tui`) and ignores `package.json#exports` there, so the
+  repo root (no root `index.*`) is silently skipped. `dist/` contains both
+  `index.mjs` (server) and `tui.mjs` (TUI).
+- A build-invariants regression test now locks both entrypoints against both
+  loaders, including a direct guard on `dist/v2/server.mjs`.
+
+### 📝 Notes
+
+- OpenCode 2.x ships its own per-message `tok/s` readout next to each assistant
+  reply. To show only this plugin's meter, set `"tps": false` under `session` in
+  `cli.json`. To keep the built-in readout instead, run `/tps hidden`.
+- Local installs should register `file:///<path>/opencode-tps-meter/dist` in
+  `opencode.json` (`plugin`), `cli.json` (`plugins`), and `tui.json` (`plugin`).
+
+---
+
 ## v0.4.0-beta.1 — OpenCode v2 support (beta)
 
 > Released as a **prerelease** on purpose. It targets `opencode2`, which is itself beta and
