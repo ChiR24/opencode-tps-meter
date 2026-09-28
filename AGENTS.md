@@ -27,6 +27,7 @@ OpenCode plugin that tracks AI token throughput in real-time. Displays TPS stati
 │   ├── config.ts         # Config loading (env + JSON + v2 inline options) - shared
 │   ├── constants.ts      # Shared constants
 │   ├── format.ts         # Shared meter text formatting (v1 + v2 render identically)
+│   ├── agentName.ts      # v1 message-payload agent name extraction (server + TUI share it)
 │   ├── ui.ts             # v1 toast/throttling manager (no v2 equivalent)
 │   ├── v2/
 │   │   ├── types.ts      # Structural v2 API types (events, contexts, slots, storage)
@@ -127,6 +128,8 @@ Never import `src/ui.ts` or `src/types.ts` event types from v2 code — those ar
 | `createMeter` | Factory | `v2/meter.ts:82` | v2 session tracking core |
 | `collectMeterEntries` | Function | `v2/family.ts` | Selects/orders family sessions for the footer Σ line |
 | `formatAggregateLine` | Function | `v2/family.ts` | Renders `TPS Σ… | main … | agent … | +N` |
+| `isGenerating` | Function | `v2/family.ts` | `active` + token within the rolling window; decides Σ membership |
+| `agentNameFromMessage` | Function | `agentName.ts` | v1 payload agent name; shared by server plugin and TUI |
 | `setupTui` | Function | `v2/tui.tsx:103` | v2 TUI setup; returns cleanup |
 | `setupServer` | Function | `v2/server.ts:44` | v2 server setup; returns cleanup |
 | `createTracker` | Factory | `tracker.ts:20` | TPS tracker with ring buffer (shared) |
@@ -208,6 +211,9 @@ No role filtering is needed on v2 — text/reasoning deltas are assistant output
 is FLUSH time and every event in a batch shares it. Use each event's host-stamped `created`
 (`eventTime()` in meter.ts). Note `src/tracker.ts` measures elapsed with its own `Date.now()`,
 so v2 derives elapsed from `firstTokenAt`/`lastTokenAt` instead — never mix the two clocks.
+The one deliberate exception is snapshot `lastActivityAt`: consumers age it against their OWN
+`Date.now()`, so it is stamped on the local wall clock (`lastTokenWallAt`) on both hosts — never
+from event `created` or v1's `info.time.completed`, which a remote service can skew by seconds.
 
 **Cumulative vs per-step.** `session.step.ended.tokens` is a PER-STEP DELTA;
 `session.usage.updated.tokens` is a CUMULATIVE SESSION TOTAL that also includes auto-title and
@@ -218,29 +224,49 @@ step end and idle.
 **Multi-session footer.** The footer aggregates the selected session's whole family; selection,
 labeling and formatting live in the pure module `src/v2/family.ts` (unit-tested without a
 renderer, shared by BOTH hosts via the structural `FamilyReading` type). Root always renders as
-`main` — its frozen reading persists exactly as the single-agent meter always behaved. Children
-appear while `snapshot.active` or within `SUBAGENT_LINGER_MS` (4s) of `snapshot.lastActivityAt`,
-sorted root-first then in SPAWN order (session-scoped `snapshot.startedAt` = first-ever token
-time; recency ordering was tried and rejected because columns swap as activity trades, which
-reads as flicker). Same-millisecond spawns tie-break on session id. A session that finishes and
-is re-dispatched stamps a fresh `startedAt` and rejoins at the end. Capped at 4 entries with
-`+N` overflow. `Σ` sums `instantTps` of ACTIVE SUBAGENT entries only — the root is excluded
-because while children run it is waiting on them, and on v1 its reading stays flagged active
-across that wait (counting it reported a frozen rate as live throughput); the root's own rate
-still shows in its column. Finished columns show their frozen average. Line format: `TPS Σ 318 | main 63 | explore 91 | …` (note the space after Σ).
-Reactivity caveat: Solid memos only re-run when a dependency changes, and nothing publishes once
-every stream goes quiet, so a 500ms heartbeat signal (`AGGREGATE_TICK_INTERVAL_MS`) keeps the
-recency filter honest on both hosts. Every host-API access is wrapped — drift degrades to the
-single-session meter, never to a broken plugin.
+`main` when it has a reading — its frozen reading persists exactly as the single-agent meter
+always behaved; a root with no reading yet (first step was a pure tool call) simply has no
+column, and its streaming children still render.
+
+*Generating* is decided by `isGenerating()`: `active` AND a token within the rolling window
+(`config.rollingWindowMs`). Never trust `active` alone — v1 keeps a session active straight
+through its own tool calls and the root's wait on its children, a crashed/cancelled session
+never leaves it, and `instantTps` is frozen at the last publish. `Σ` sums `instantTps` of every
+generating entry, root included: a waiting root drops out on its own, and a root summarising
+its children's results counts. Non-generating columns show their frozen average.
+
+Children appear while generating, within `SUBAGENT_LINGER_MS` (4s) of `lastActivityAt`, or
+while the host reports them running (v2 `data.session.status(id) === "running"`, v1
+`api.state.session.status(id)` busy/retry) — so a subagent inside a long tool call keeps its
+column on both hosts. Order: root first, then SPAWN order (`snapshot.startedAt` = first token of
+the current RUN; recency ordering was tried and rejected because columns swap as activity
+trades, which reads as flicker). The spawn stamp survives tool-call breaks and is cleared on
+`session.idle` (and by v2's stale sweep), so a re-dispatched session rejoins at the end.
+Same-millisecond spawns tie-break on session id. Capped at 4 entries with `+N` overflow. The
+line is coloured by `aggregateReading()` — live while anything generates, at the MEAN per-stream
+rate, because the slow/fast thresholds are per-stream figures. Line format:
+`TPS Σ 318 | main 63 | explore 91 | …` (note the space after Σ).
+
+Reactivity: family resolution is memoised on the set of sessions that have a reading
+(`sameIDs`) — never inside the snapshot-dependent memo, which re-runs up to ~125/s. Nothing
+publishes once every stream goes quiet, so a 500ms heartbeat (`AGGREGATE_TICK_INTERVAL_MS`)
+re-runs the recency filter; it is owned by the footer component (`createEffect`/`onCleanup`)
+and runs only while the aggregate line is on screen. Every host-API access is wrapped, and a
+family is committed only once fully resolved — drift degrades to the single-session meter,
+never to a broken plugin or a half-resolved line.
 
 Attribution per host:
 - **v2**: `ctx.data.session.root/family/get(id)?.agent` — exact, synced.
 - **v1**: no family API in events, but the real tree IS available: `session.created`/
   `session.updated` carry `info.parentID`, and `api.state.session.get()` serves the same
-  `Session` shape synchronously (`src/tui.tsx: parentOf/walkToRoot/resolveRoot`). Agent names
-  ride on message payloads only — `agent` (string or AgentIdentity), assistant `mode`, legacy
-  `agentType`; parts never carry them. Unrelated sessions are excluded because their root chain
-  lands elsewhere; with no links at all the meter stays single-session.
+  `Session` shape synchronously (`src/tui.tsx: parentOf/walkToRoot/resolveFamily`; one
+  resolution memoises roots so shared ancestors are walked once). Agent names ride on message
+  payloads only; `src/agentName.ts` extracts them for BOTH the v1 server plugin and the v1 TUI
+  so one session never gets two labels — precedence `agent` string, AgentIdentity
+  `type`/`name`/`id`, legacy `agentType`, assistant `mode`; parts never carry them. Parent links,
+  agent names and spawn stamps are bounded LRUs (`MAX_REMEMBERED_SESSIONS`), since
+  `session.updated` fires for every session in the project. Unrelated sessions are excluded
+  because their root chain lands elsewhere; with no links at all the meter stays single-session.
 
 **Validate at the v2 event boundary.** Event payloads cross a process boundary from the host,
 so `asMeterEvent` rejects anything without a non-empty string `sessionID`, and `toTokenCount`

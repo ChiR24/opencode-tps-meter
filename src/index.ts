@@ -16,6 +16,7 @@ import type {
   AgentIdentity,
   AgentDisplayState,
 } from "./types.js";
+import { agentNameFromMessage } from "./agentName.js";
 import { createTracker } from "./tracker.js";
 import { createUIManager } from "./ui.js";
 import { createTokenizer, createIncrementalCounter, type IncrementalCounter } from "./tokenCounter.js";
@@ -745,22 +746,10 @@ function handleMessagePartUpdated(event: MessageEvent): void {
     messageRoleCache.set(info.sessionID, roleCache);
     roleCache.set(info.id, info.role);
 
-    // Cache agent name for this MESSAGE (primary source for agent identification)
-    // info.agent can be either:
-    // - A STRING directly (agent name like "explore", "librarian", "build")
-    // - An AgentIdentity object with .name, .type, .id properties
-    let agentName: string | undefined;
-    if (typeof info.agent === "string") {
-      // Direct string - this is the agent name
-      agentName = info.agent;
-    } else if (info.agent) {
-      // AgentIdentity object - prefer type (lowercase identifier) over name (display name)
-      agentName = info.agent.type || info.agent.name || info.agent.id;
-    } else if (info.agentType) {
-      // Fallback to agentType string
-      agentName = info.agentType;
-    }
-    
+    // Cache agent name for this MESSAGE (primary source for agent identification).
+    // Shared with the v1 TUI footer so both label a session identically.
+    const agentName = agentNameFromMessage(info);
+
     if (agentName) {
       // Cache by MESSAGE ID (primary) - this is how we identify agents from parts
       messageAgentCache.set(info.id, agentName);

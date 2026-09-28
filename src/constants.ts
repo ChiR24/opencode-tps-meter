@@ -67,11 +67,12 @@ export const DEFAULT_UPDATE_INTERVAL_MS = 50;
 export const V2_UPDATE_INTERVAL_MS = 8;
 
 /**
- * Heartbeat for the v2 footer's multi-session aggregate (ms).
+ * Heartbeat for the footer's multi-session aggregate (ms), on both hosts.
  *
  * Finished subagents must disappear after a few seconds, but once every stream is quiet
  * nothing republishes — and a memo that depends on nothing changing never re-runs. This
- * slow tick re-evaluates the footer's recency filter at negligible cost.
+ * slow tick re-evaluates the footer's recency filter. It runs only while the aggregate
+ * line is on screen: the single-session meter does not depend on time.
  */
 export const AGGREGATE_TICK_INTERVAL_MS = 500;
 
@@ -99,6 +100,15 @@ export const MAX_MESSAGE_AGE_MS = 5 * 60 * 1000;
  * numbers, so retaining many is cheap; this only bounds pathological session churn.
  */
 export const MAX_RETAINED_SNAPSHOTS = 64;
+
+/**
+ * Maximum sessions the v1 TUI remembers parent links, agent names and spawn times for.
+ *
+ * session.created/session.updated arrive for every session in the project, not just the
+ * metered ones, so these caches would otherwise grow for the life of the TUI. Evicting a
+ * parent link is harmless while `api.state.session` still serves it.
+ */
+export const MAX_REMEMBERED_SESSIONS = 256;
 
 /** Interval between stale message cleanup runs (30 seconds in ms) */
 export const CLEANUP_INTERVAL_MS = 30000;
