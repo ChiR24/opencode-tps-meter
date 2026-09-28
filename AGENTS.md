@@ -127,7 +127,7 @@ Never import `src/ui.ts` or `src/types.ts` event types from v2 code — those ar
 | `TpsMeterPlugin` | Function | `index.ts:150` | v1 handler factory, exported as the module's `.server` |
 | `createMeter` | Factory | `v2/meter.ts:82` | v2 session tracking core |
 | `collectMeterEntries` | Function | `v2/family.ts` | Selects/orders family sessions for the footer Σ line |
-| `formatAggregateLine` | Function | `v2/family.ts` | Renders `TPS Σ… | main … | agent … | +N` |
+| `formatAggregateLine` | Function | `v2/family.ts` | Renders `TPS Σ… \| main … \| agent … \| +N` |
 | `isGenerating` | Function | `v2/family.ts` | `active` + token within the rolling window; decides Σ membership |
 | `agentNameFromMessage` | Function | `agentName.ts` | v1 payload agent name; shared by server plugin and TUI |
 | `setupTui` | Function | `v2/tui.tsx:103` | v2 TUI setup; returns cleanup |
