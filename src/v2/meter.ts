@@ -90,6 +90,18 @@ export interface V2Snapshot {
   calibrationSamples: number;
   /** True when the turn was aborted; the reading is not trustworthy. */
   interrupted: boolean;
+  /** Prompt tokens served from the cache this step (provider-reported). */
+  cacheReadTokens: number;
+  /** Prompt tokens written to the cache this step (provider-reported). */
+  cacheWriteTokens: number;
+  /** Uncached prompt input tokens this step (provider-reported). */
+  inputTokens: number;
+  /** Cached prompt tokens summed over every reported step this session. */
+  sessionCacheReadTokens: number;
+  /** Prompt tokens written to the cache over every reported step this session. */
+  sessionCacheWriteTokens: number;
+  /** Uncached prompt input tokens over every reported step this session. */
+  sessionInputTokens: number;
 }
 
 /** One settled step, emitted for durable rollups. Interrupted turns are never emitted. */
@@ -143,6 +155,14 @@ interface SessionState {
    */
   lastTokenAt: number | null;
   lastPublishedAt: number;
+  /** Prompt cache accounting from the latest step, for display.
+   *
+   * `input` here is OpenCode's `tokens.input`, which EXCLUDES cache reads and writes, so
+   * the prompt-side total is `input + read + write`.
+   */
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  inputTokens: number;
 }
 
 /**
@@ -161,6 +181,10 @@ interface SessionUsage {
   cumulativeTokens: number;
   /** Sum of every per-step delta observed this session. */
   observedStepTokens: number;
+  /** Prompt cache accounting summed over every reported step this session. */
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  inputTokens: number;
 }
 
 /**
@@ -255,10 +279,26 @@ export function createMeter(config: Config, hooks?: V2MeterHooks): V2Meter {
   function getSessionUsage(sessionID: string): SessionUsage {
     let usage = sessionUsage.get(sessionID);
     if (!usage) {
-      usage = { cumulativeTokens: 0, observedStepTokens: 0 };
+      usage = {
+        cumulativeTokens: 0,
+        observedStepTokens: 0,
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+        inputTokens: 0,
+      };
       sessionUsage.set(sessionID, usage);
     }
     return usage;
+  }
+
+  /** Session-aggregated cache accounting, safe to read before any step has reported. */
+  function sessionCacheFields(sessionID: string) {
+    const usage = sessionUsage.get(sessionID);
+    return {
+      sessionCacheReadTokens: usage?.cacheReadTokens ?? 0,
+      sessionCacheWriteTokens: usage?.cacheWriteTokens ?? 0,
+      sessionInputTokens: usage?.inputTokens ?? 0,
+    };
   }
 
   let snapshots: ReadonlyMap<string, V2Snapshot> = new Map();
@@ -300,6 +340,9 @@ export function createMeter(config: Config, hooks?: V2MeterHooks): V2Meter {
       lastPublishedWallAt: 0,
       firstTokenWallAt: null,
       dirty: false,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 0,
+      inputTokens: 0,
     };
     sessions.set(sessionID, state);
     return state;
@@ -432,6 +475,10 @@ export function createMeter(config: Config, hooks?: V2MeterHooks): V2Meter {
         elapsedMs,
         active,
         overheadTokens: overheadFor(sessionID),
+        cacheReadTokens: state.cacheReadTokens,
+        cacheWriteTokens: state.cacheWriteTokens,
+        inputTokens: state.inputTokens,
+        ...sessionCacheFields(sessionID),
         ...derivedFields(sessionID, totalTokens, elapsedMs),
       });
     });
@@ -467,6 +514,7 @@ export function createMeter(config: Config, hooks?: V2MeterHooks): V2Meter {
     if (totalTokens === 0 || elapsedMs < config.initialDisplayDelayMs) {
       return;
     }
+    const state = sessions.get(sessionID);
     mutateSnapshots((draft) => {
       draft.set(sessionID, {
         sessionID,
@@ -476,6 +524,10 @@ export function createMeter(config: Config, hooks?: V2MeterHooks): V2Meter {
         elapsedMs,
         active: false,
         overheadTokens,
+        cacheReadTokens: state?.cacheReadTokens ?? 0,
+        cacheWriteTokens: state?.cacheWriteTokens ?? 0,
+        inputTokens: state?.inputTokens ?? 0,
+        ...sessionCacheFields(sessionID),
         ...derivedFields(sessionID, totalTokens, elapsedMs),
       });
     });
@@ -672,11 +724,28 @@ export function createMeter(config: Config, hooks?: V2MeterHooks): V2Meter {
     const { sessionID, finish, tokens } = event.data;
     const now = eventTime(event, Date.now());
 
+    // Capture prompt cache accounting before any early return so a tool-calls step still
+    // freezes its cache numbers alongside its TPS.
+    const stepState = sessions.get(sessionID);
+    if (stepState) {
+      stepState.cacheReadTokens = toTokenCount(tokens?.cache?.read);
+      stepState.cacheWriteTokens = toTokenCount(tokens?.cache?.write);
+      stepState.inputTokens = toTokenCount(tokens?.input);
+    }
+
+    // Fold this step's cache accounting into the session rollup. Done before any early
+    // return so a tool-calls step contributes too, and so the session rate stays on screen
+    // while the next step streams (this state outlives resetSession).
+    const sessionUsageForStep = getSessionUsage(sessionID);
+    sessionUsageForStep.cacheReadTokens += toTokenCount(tokens?.cache?.read);
+    sessionUsageForStep.cacheWriteTokens += toTokenCount(tokens?.cache?.write);
+    sessionUsageForStep.inputTokens += toTokenCount(tokens?.input);
+
     // Every settled step consumed tokens, including one that ends to run tools — record it
     // before any early return or the overhead residual overcounts.
     const settledTokens = toTokenCount(tokens?.output) + toTokenCount(tokens?.reasoning);
     if (settledTokens > 0) {
-      getSessionUsage(sessionID).observedStepTokens += settledTokens;
+      sessionUsageForStep.observedStepTokens += settledTokens;
     }
     // One closed calibration loop per step: heuristic tokens streamed vs provider truth.
     metrics.calibrate(sessionID, settledTokens);

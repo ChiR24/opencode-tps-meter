@@ -226,6 +226,7 @@ TPS_METER_SHOW_AVERAGE=true
 TPS_METER_SHOW_INSTANT=true
 TPS_METER_SHOW_TOTAL_TOKENS=true
 TPS_METER_SHOW_ELAPSED=false
+TPS_METER_SHOW_CACHE_HIT=true
 
 # Token counting heuristic
 TPS_METER_FALLBACK_HEURISTIC=chars_div_4  # chars_div_4 | chars_div_3 | words_div_0_75
@@ -251,6 +252,7 @@ Create `.opencode/tps-meter.json` in your project root:
   "showInstant": true,
   "showTotalTokens": true,
   "showElapsed": false,
+  "showCacheHit": true,
   "format": "compact",
   "minVisibleTPS": 0,
   "fallbackTokenHeuristic": "chars_div_4",
@@ -286,6 +288,7 @@ Output: `TPS: 92.4 (avg 78.1) | tokens: 1,842 | 00:23`
 | `showInstant` | `boolean` | `true` | Show instantaneous TPS in display |
 | `showTotalTokens` | `boolean` | `true` | Show total token count |
 | `showElapsed` | `boolean` | `false` | Show elapsed time |
+| `showCacheHit` | `boolean` | `true` | Show the prompt cache hit rate (provider-reported) |
 | `format` | `string` | `"compact"` | Display format: `compact`, `verbose`, `minimal` |
 | `minVisibleTPS` | `number` | `0` | Minimum TPS value to trigger display |
 | `fallbackTokenHeuristic` | `string` | `"chars_div_4"` | Token counting method |
@@ -317,6 +320,20 @@ Enable visual feedback with color-coded TUI text based on token throughput speed
 **Note:** Persistent TUI display supports color coding directly. Legacy toast color coding is available only when `toastFallback` is enabled and OpenCode exposes TUI toast methods (`client.tui.showToast` or `client.tui.publish`); the fallback `client.toast` methods only support info/success variants.
 
 ---
+
+## Cache Hit Rate
+
+OpenCode reports provider token usage as `{ input, output, reasoning, cache: { read, write } }`,
+where `input` EXCLUDES cache reads and writes. The meter therefore computes the prompt-side
+total as `input + cache.read + cache.write` and shows the cached share:
+
+```
+cache hit rate = cache.read / (input + cache.read + cache.write)
+```
+
+The meter appends `cache 91%` to the footer once a provider-reported step has settled. During
+streaming no cache accounting is available yet, so the segment is omitted rather than shown as
+`0%`. Toggle with `showCacheHit` / `TPS_METER_SHOW_CACHE_HIT`.
 
 ## Display Formats
 

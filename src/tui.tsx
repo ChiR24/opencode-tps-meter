@@ -16,6 +16,10 @@ interface SessionState {
   tracker: TrackerInstance;
   firstTokenAt: number | null;
   lastPublishedAt: number;
+  /** Prompt cache accounting for the current turn, from the latest message.updated. */
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  inputTokens: number;
 }
 
 interface TuiSnapshot {
@@ -25,6 +29,19 @@ interface TuiSnapshot {
   totalTokens: number;
   elapsedMs: number;
   active: boolean;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  inputTokens: number;
+  sessionCacheReadTokens: number;
+  sessionCacheWriteTokens: number;
+  sessionInputTokens: number;
+}
+
+/** Prompt cache accounting summed over every reported step, kept for the whole session. */
+interface SessionCacheUsage {
+  read: number;
+  write: number;
+  input: number;
 }
 
 function loadTuiConfig(): Config {
@@ -87,6 +104,8 @@ const tui: TuiPlugin = async (api) => {
   const tokenizer = createTokenizer(tokenizerAlgorithm);
   const [snapshots, setSnapshots] = createSignal(new Map<string, TuiSnapshot>());
   const sessions = new Map<string, SessionState>();
+  // Session-scoped, so it survives resetSession and the reading stays on screen across steps.
+  const sessionCacheUsage = new Map<string, SessionCacheUsage>();
   // Part-type keys hold accumulated TEXT (the full-part path diffs against it); the `:live`
   // key holds an incremental counter, since it was only ever read to compute a token
   // difference and re-counting the whole string per delta is O(total).
@@ -111,9 +130,31 @@ const tui: TuiPlugin = async (api) => {
       tracker: createTracker({ sessionId, rollingWindowMs: config.rollingWindowMs }),
       firstTokenAt: null,
       lastPublishedAt: 0,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 0,
+      inputTokens: 0,
     };
     sessions.set(sessionId, state);
     return state;
+  }
+
+  function getSessionCacheUsage(sessionId: string): SessionCacheUsage {
+    let usage = sessionCacheUsage.get(sessionId);
+    if (!usage) {
+      usage = { read: 0, write: 0, input: 0 };
+      sessionCacheUsage.set(sessionId, usage);
+    }
+    return usage;
+  }
+
+  /** Session-aggregated cache accounting, safe to read before any step has reported. */
+  function sessionCacheFields(sessionId: string) {
+    const usage = sessionCacheUsage.get(sessionId);
+    return {
+      sessionCacheReadTokens: usage?.read ?? 0,
+      sessionCacheWriteTokens: usage?.write ?? 0,
+      sessionInputTokens: usage?.input ?? 0,
+    };
   }
 
   function publish(sessionId: string, active: boolean, now: number = Date.now()): void {
@@ -136,6 +177,10 @@ const tui: TuiPlugin = async (api) => {
       totalTokens,
       elapsedMs: state.tracker.getElapsedMs(),
       active,
+      cacheReadTokens: state.cacheReadTokens,
+      cacheWriteTokens: state.cacheWriteTokens,
+      inputTokens: state.inputTokens,
+      ...sessionCacheFields(sessionId),
     };
     setSnapshots((current) => new Map(current).set(sessionId, nextSnapshot));
   }
@@ -201,6 +246,7 @@ const tui: TuiPlugin = async (api) => {
       return;
     }
 
+    const state = sessions.get(sessionId);
     const nextSnapshot = {
       sessionId,
       instantTps: 0,
@@ -208,6 +254,10 @@ const tui: TuiPlugin = async (api) => {
       totalTokens,
       elapsedMs,
       active: false,
+      cacheReadTokens: state?.cacheReadTokens ?? 0,
+      cacheWriteTokens: state?.cacheWriteTokens ?? 0,
+      inputTokens: state?.inputTokens ?? 0,
+      ...sessionCacheFields(sessionId),
     };
     setSnapshots((current) => new Map(current).set(sessionId, nextSnapshot));
   }
@@ -318,6 +368,23 @@ const tui: TuiPlugin = async (api) => {
       return;
     }
 
+    // Provider-reported prompt cache accounting for this step. Captured before any finish
+    // handling so a tool-calls step still freezes its cache numbers along with its TPS.
+    const cacheReadTokens = info.tokens.cache?.read ?? 0;
+    const cacheWriteTokens = info.tokens.cache?.write ?? 0;
+    const inputTokens = info.tokens.input ?? 0;
+    const cachedSession = getSessionState(sessionId);
+    cachedSession.cacheReadTokens = cacheReadTokens;
+    cachedSession.cacheWriteTokens = cacheWriteTokens;
+    cachedSession.inputTokens = inputTokens;
+
+    // Fold this step into the session rollup before any early return, so a tool-calls step
+    // contributes too and the session rate stays visible while the next step streams.
+    const sessionCacheForStep = getSessionCacheUsage(sessionId);
+    sessionCacheForStep.read += cacheReadTokens;
+    sessionCacheForStep.write += cacheWriteTokens;
+    sessionCacheForStep.input += inputTokens;
+
     if (info.finish === TOOL_CALL_FINISH_REASON) {
       persistIdleSnapshot(sessionId, info.time.completed);
       resetSession(sessionId);
@@ -400,6 +467,7 @@ const tui: TuiPlugin = async (api) => {
     sessions.clear();
     partTextCache.clear();
     messageRoles.clear();
+    sessionCacheUsage.clear();
     for (const timer of publishTimers.values()) {
       clearTimeout(timer);
     }
