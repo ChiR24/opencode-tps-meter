@@ -276,15 +276,22 @@ export function createMeter(config: Config, hooks?: V2MeterHooks): V2Meter {
   /** Usage accounting that survives per-turn resets. */
   const sessionUsage = new Map<string, SessionUsage>();
 
+  let snapshots: ReadonlyMap<string, V2Snapshot> = new Map();
+  let lastSweepAt = 0;
+
   function getSessionUsage(sessionID: string): SessionUsage {
     let usage = sessionUsage.get(sessionID);
     if (!usage) {
+      // A swept session can resume while its reading is still on screen: the stale sweep
+      // frees usage but keeps the snapshot. Seed the cache totals from that retained reading
+      // so the session rate continues instead of restarting from zero.
+      const retained = snapshots.get(sessionID);
       usage = {
         cumulativeTokens: 0,
         observedStepTokens: 0,
-        cacheReadTokens: 0,
-        cacheWriteTokens: 0,
-        inputTokens: 0,
+        cacheReadTokens: retained?.sessionCacheReadTokens ?? 0,
+        cacheWriteTokens: retained?.sessionCacheWriteTokens ?? 0,
+        inputTokens: retained?.sessionInputTokens ?? 0,
       };
       sessionUsage.set(sessionID, usage);
     }
@@ -300,9 +307,6 @@ export function createMeter(config: Config, hooks?: V2MeterHooks): V2Meter {
       sessionInputTokens: usage?.inputTokens ?? 0,
     };
   }
-
-  let snapshots: ReadonlyMap<string, V2Snapshot> = new Map();
-  let lastSweepAt = 0;
 
   function setSnapshots(next: ReadonlyMap<string, V2Snapshot>): void {
     snapshots = next;

@@ -289,6 +289,67 @@ describe("TUI plugin", () => {
     expect(frame).not.toContain("2 tok");
   });
 
+  it("does not double count a repeated completed message's cache usage", async () => {
+    const { handlers, slotPlugin, testRender, theme } = await createHarness();
+
+    const messageUpdated = handlers.get("message.updated");
+    if (!messageUpdated) {
+      throw new Error("message.updated handler was not registered");
+    }
+
+    const completedAt = Date.now();
+    const emitCompleted = (id: string, input: number, read: number) =>
+      messageUpdated({
+        type: "message.updated",
+        properties: {
+          sessionID: "session-cache",
+          info: {
+            id,
+            sessionID: "session-cache",
+            role: "assistant",
+            time: { created: completedAt - 1000, completed: completedAt },
+            parentID: "parent-1",
+            modelID: "model",
+            providerID: "provider",
+            mode: "chat",
+            agent: "build",
+            path: { cwd: ".", root: "." },
+            cost: 0,
+            tokens: {
+              input,
+              output: 10,
+              reasoning: 0,
+              cache: { read, write: 0 },
+            },
+            finish: "stop",
+          },
+        },
+      });
+
+    // Step one is 0% cached. The same completed message is updated again when structured
+    // output is attached; that second update must not be folded into the session twice.
+    emitCompleted("message-1", 100, 0);
+    emitCompleted("message-1", 100, 0);
+    // Step two is 100% cached, so the session total is 100 read / 200 prompt = 50%.
+    // Double counting the first message would instead report 33%.
+    emitCompleted("message-2", 0, 100);
+
+    const slot = slotPlugin?.slots.session_prompt_right;
+    if (!slot) {
+      throw new Error("session_prompt_right slot was not registered");
+    }
+
+    const setup = await testRender(() => slot({ theme }, { session_id: "session-cache" }), {
+      width: 200,
+      height: 5,
+    });
+    await setup.flush();
+    const frame = setup.captureCharFrame();
+
+    expect(frame).toContain("session cache 50%");
+    expect(frame).not.toContain("session cache 33%");
+  });
+
   it("caches zero-token deltas before full part updates", async () => {
     process.env.TPS_METER_FALLBACK_HEURISTIC = "words_div_0_75";
 

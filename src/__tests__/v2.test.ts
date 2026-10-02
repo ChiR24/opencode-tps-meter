@@ -75,6 +75,38 @@ function stepEnded(
   };
 }
 
+function stepEndedWithCache(
+  sessionID: string,
+  finish: string,
+  tokens: {
+    input?: number;
+    output?: number;
+    reasoning?: number;
+    cacheRead?: number;
+    cacheWrite?: number;
+  },
+  messageID = "msg_1"
+): V2UnknownEvent {
+  eventId += 1;
+  return {
+    id: `evt_${eventId}`,
+    created: Date.now(),
+    type: "session.step.ended",
+    data: {
+      sessionID,
+      assistantMessageID: messageID,
+      finish,
+      cost: 0,
+      tokens: {
+        input: tokens.input ?? 0,
+        output: tokens.output ?? 0,
+        reasoning: tokens.reasoning ?? 0,
+        cache: { read: tokens.cacheRead ?? 0, write: tokens.cacheWrite ?? 0 },
+      },
+    },
+  };
+}
+
 function sessionIdle(sessionID: string): V2UnknownEvent {
   eventId += 1;
   return {
@@ -331,6 +363,64 @@ describe("v2 meter", () => {
     expect(snapshot("ses_1")?.overheadTokens).toBe(0);
 
     meter.dispose();
+  });
+
+  it("exposes per-step and session prompt cache token totals", async () => {
+    const { meter, snapshot } = createHarness();
+
+    meter.handleEvent(textDelta("ses_1", "streaming tokens here"));
+    await delay(40);
+
+    // Prompt side = input 100 + read 300 + write 0 = 400, so 75% was served from cache.
+    meter.handleEvent(
+      stepEndedWithCache("ses_1", "stop", { input: 100, output: 50, cacheRead: 300 })
+    );
+
+    const final = snapshot("ses_1");
+    expect(final?.cacheReadTokens).toBe(300);
+    expect(final?.inputTokens).toBe(100);
+    expect(final?.sessionCacheReadTokens).toBe(300);
+    expect(final?.sessionInputTokens).toBe(100);
+
+    meter.dispose();
+  });
+
+  it("preserves session cache totals when a swept session resumes", async () => {
+    const { meter, snapshot } = createHarness();
+    const { CLEANUP_INTERVAL_MS, MAX_MESSAGE_AGE_MS } = await import("../constants.js");
+
+    const realNow = Date.now;
+    let clock = realNow.call(Date);
+    Date.now = () => clock;
+
+    try {
+      meter.handleEvent(textDelta("ses_1", "streaming tokens here"));
+      clock += 40;
+      meter.handleEvent(
+        stepEndedWithCache("ses_1", "tool-calls", { input: 100, output: 10, cacheRead: 300 })
+      );
+      expect(snapshot("ses_1")?.sessionCacheReadTokens).toBe(300);
+
+      // Go quiet past the stale threshold: the sweep frees sessionUsage but keeps the reading.
+      clock += MAX_MESSAGE_AGE_MS + CLEANUP_INTERVAL_MS + 1;
+      meter.handleEvent(textDelta("ses_other", "trigger the sweep", "msg_other"));
+      expect(snapshot("ses_1")?.sessionCacheReadTokens).toBe(300);
+
+      // Resume the same session; the new step must add to the retained totals, not restart.
+      clock += 40;
+      meter.handleEvent(textDelta("ses_1", "resuming the same session", "msg_2"));
+      clock += 40;
+      meter.handleEvent(
+        stepEndedWithCache("ses_1", "stop", { input: 30, output: 5, cacheRead: 0 }, "msg_2")
+      );
+
+      const resumed = snapshot("ses_1");
+      expect(resumed?.sessionCacheReadTokens).toBe(300);
+      expect(resumed?.sessionInputTokens).toBe(130);
+    } finally {
+      Date.now = realNow;
+      meter.dispose();
+    }
   });
 
   it("ignores non-numeric provider token counts instead of concatenating them", async () => {

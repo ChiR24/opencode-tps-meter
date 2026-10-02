@@ -106,6 +106,10 @@ const tui: TuiPlugin = async (api) => {
   const sessions = new Map<string, SessionState>();
   // Session-scoped, so it survives resetSession and the reading stays on screen across steps.
   const sessionCacheUsage = new Map<string, SessionCacheUsage>();
+  // Cache usage already folded into the session rollup, keyed by session then message id. A
+  // completed message can be updated more than once (structured-output attach), so only the
+  // increment since the previous update for that message may be added.
+  const accountedCacheUsage = new Map<string, Map<string, SessionCacheUsage>>();
   // Part-type keys hold accumulated TEXT (the full-part path diffs against it); the `:live`
   // key holds an incremental counter, since it was only ever read to compute a token
   // difference and re-counting the whole string per delta is O(total).
@@ -145,6 +149,33 @@ const tui: TuiPlugin = async (api) => {
       sessionCacheUsage.set(sessionId, usage);
     }
     return usage;
+  }
+
+  /**
+   * Returns the cache usage to add for a message, given its current provider-reported totals.
+   *
+   * OpenCode can mark a message completed and then update the same completed message again
+   * (structured-output attach), and both updates pass the completion guard. Accumulating the
+   * raw totals would count that message twice and skew the session rate, so each message is
+   * accounted once and only the increment is returned.
+   */
+  function accountMessageCache(
+    sessionId: string,
+    messageId: string,
+    usage: SessionCacheUsage
+  ): SessionCacheUsage {
+    let byMessage = accountedCacheUsage.get(sessionId);
+    if (!byMessage) {
+      byMessage = new Map<string, SessionCacheUsage>();
+      accountedCacheUsage.set(sessionId, byMessage);
+    }
+    const previous = byMessage.get(messageId) ?? { read: 0, write: 0, input: 0 };
+    byMessage.set(messageId, { ...usage });
+    return {
+      read: Math.max(0, usage.read - previous.read),
+      write: Math.max(0, usage.write - previous.write),
+      input: Math.max(0, usage.input - previous.input),
+    };
   }
 
   /** Session-aggregated cache accounting, safe to read before any step has reported. */
@@ -379,11 +410,18 @@ const tui: TuiPlugin = async (api) => {
     cachedSession.inputTokens = inputTokens;
 
     // Fold this step into the session rollup before any early return, so a tool-calls step
-    // contributes too and the session rate stays visible while the next step streams.
+    // contributes too and the session rate stays visible while the next step streams. Only
+    // the increment since this message's previous update is added, because a completed
+    // message can be updated again when structured output is attached.
+    const stepCache = accountMessageCache(sessionId, info.id, {
+      read: cacheReadTokens,
+      write: cacheWriteTokens,
+      input: inputTokens,
+    });
     const sessionCacheForStep = getSessionCacheUsage(sessionId);
-    sessionCacheForStep.read += cacheReadTokens;
-    sessionCacheForStep.write += cacheWriteTokens;
-    sessionCacheForStep.input += inputTokens;
+    sessionCacheForStep.read += stepCache.read;
+    sessionCacheForStep.write += stepCache.write;
+    sessionCacheForStep.input += stepCache.input;
 
     if (info.finish === TOOL_CALL_FINISH_REASON) {
       persistIdleSnapshot(sessionId, info.time.completed);
@@ -458,6 +496,8 @@ const tui: TuiPlugin = async (api) => {
   disposers.push(api.event.on("session.idle", (event) => {
     persistIdleSnapshot(event.properties.sessionID);
     resetSession(event.properties.sessionID);
+    // The session is finished, so its per-message accounting is no longer needed.
+    accountedCacheUsage.delete(event.properties.sessionID);
   }));
 
   api.lifecycle.onDispose(() => {
@@ -468,6 +508,7 @@ const tui: TuiPlugin = async (api) => {
     partTextCache.clear();
     messageRoles.clear();
     sessionCacheUsage.clear();
+    accountedCacheUsage.clear();
     for (const timer of publishTimers.values()) {
       clearTimeout(timer);
     }
