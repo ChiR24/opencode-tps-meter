@@ -8,7 +8,8 @@
  *   v1 slot `session_prompt_right`         -> v2 `prompt.footer.status`
  *   v1 `props.session_id` (required)       -> v2 `input.sessionID` (optional)
  *   v1 `api.event.on`                      -> v2 `ctx.data.on`
- *   v1 `api.theme.current.<token>`         -> v2 `ctx.theme.text.<token>`
+ *   v1 `api.theme.current.<token>`         -> v2 `ctx.theme`, normalized by
+ *                                                `normalizeTheme` into `text.<token>`
  *   v1 `api.lifecycle.onDispose(fn)`       -> v2 return cleanup from `setup`
  *
  * Surfaces beyond v1's single status string: a sidebar panel breaking throughput down per
@@ -77,11 +78,51 @@ function ms(value: number): string {
 }
 
 /**
+ * Normalizes the host theme into the shape the rest of this file renders with.
+ *
+ * The v2 theme leaf names drifted between releases: early v2 builds exposed
+ * `theme.text.default` / `theme.text.subdued` /
+ * `theme.text.feedback.<kind>.default`, while current hosts (per
+ * `@opencode/theme`'s `ResolvedTheme` type) expose `theme.text.base` /
+ * `theme.text.muted` / `theme.text.feedback.<kind>.base`. Resolve the current
+ * names first and fall back to the older ones, so the meter is colored on
+ * either host. Anything still unresolvable degrades to `undefined` (host
+ * default color), never a throw.
+ */
+export function normalizeTheme(theme: V2ResolvedTheme): V2ResolvedTheme {
+  interface TextShape {
+    base?: V2Rgba; muted?: V2Rgba; default?: V2Rgba; subdued?: V2Rgba;
+    feedback?: Partial<
+      Record<"error" | "warning" | "success" | "info", { base?: V2Rgba; default?: V2Rgba }>
+    >;
+  }
+  const text: TextShape = (theme as { text?: TextShape }).text ?? {};
+  const pick = (...candidates: Array<V2Rgba | undefined>): V2Rgba =>
+    candidates.find((c) => c !== undefined) as V2Rgba;
+  const feedback = (kind: "error" | "warning" | "success" | "info"): V2Rgba =>
+    pick(text.feedback?.[kind]?.base, text.feedback?.[kind]?.default);
+
+  return {
+    ...theme,
+    text: {
+      default: pick(text.base, text.default),
+      subdued: pick(text.muted, text.subdued),
+      feedback: {
+        error: { default: feedback("error") },
+        warning: { default: feedback("warning") },
+        success: { default: feedback("success") },
+        info: { default: feedback("info") },
+      },
+    },
+  };
+}
+
+/**
  * Maps a reading onto v2's nested theme tokens.
  * v1's flat `error`/`warning`/`success` moved under `text.feedback.<kind>.default`,
  * and `textMuted` became `text.subdued`.
  */
-function colorForSnapshot(
+export function colorForSnapshot(
   theme: V2ResolvedTheme,
   config: Config,
   snapshot: V2Snapshot
@@ -403,6 +444,7 @@ export function setupTui(ctx: V2TuiContext): V2Cleanup | void {
     return;
   }
 
+  const theme = normalizeTheme(ctx.theme);
   const ledger = createLedger(ctx.storage);
   const meter = createMeter(config, {
     onStepSettled: (measurement) => {
@@ -444,7 +486,7 @@ export function setupTui(ctx: V2TuiContext): V2Cleanup | void {
       render: (input) => (
         <MeterView
           input={input}
-          theme={ctx.theme}
+          theme={theme}
           config={config}
           mode={mode}
           snapshots={snapshots}
@@ -479,7 +521,7 @@ export function setupTui(ctx: V2TuiContext): V2Cleanup | void {
       ctx.ui.slot({
         append: "sidebar.content",
         render: (input) => (
-          <SidebarPanel input={input} ctx={ctx} theme={ctx.theme} snapshots={snapshots} />
+          <SidebarPanel input={input} ctx={ctx} theme={theme} snapshots={snapshots} />
         ),
       })
     );
@@ -489,7 +531,7 @@ export function setupTui(ctx: V2TuiContext): V2Cleanup | void {
     optional("dashboard", () =>
       ctx.ui.router?.register({
         name: DASHBOARD_ROUTE,
-        render: () => <DashboardPage ledger={ledger} theme={ctx.theme} snapshots={snapshots} />,
+        render: () => <DashboardPage ledger={ledger} theme={theme} snapshots={snapshots} />,
       })
     );
   }

@@ -711,6 +711,200 @@ const textAt = (s: string, delta: string, created: number, msg = "msg_1") =>
     delta,
   });
 
+describe("v2 theme normalization", () => {
+  beforeEach(() => {
+    for (const key of Object.keys(stableEnv) as Array<keyof typeof stableEnv>) {
+      originalEnv.set(key, process.env[key]);
+      process.env[key] = stableEnv[key];
+    }
+  });
+
+  afterEach(() => {
+    for (const key of Object.keys(stableEnv) as Array<keyof typeof stableEnv>) {
+      const previous = originalEnv.get(key);
+      if (previous === undefined) {
+        delete process.env[key];
+      } else {
+        process.env[key] = previous;
+      }
+    }
+    originalEnv.clear();
+  });
+
+  async function setupWithTheme(theme: unknown) {
+    const { ensureSolidTransformPlugin } = await import("@opentui/solid/bun-plugin");
+    ensureSolidTransformPlugin();
+
+    const { setupTui } = await import("../v2/tui.js");
+
+    const handlers = new Map<string, (event: unknown) => void>();
+    const claims: Array<{ render: (input: unknown) => unknown; after?: string }> = [];
+
+    const cleanup = setupTui({
+      options: { enableColorCoding: true },
+      theme,
+      data: {
+        on: (type: string, handler: (event: never) => void) => {
+          handlers.set(type, handler as (event: unknown) => void);
+          return () => {
+            handlers.delete(type);
+          };
+        },
+      },
+      ui: {
+        slot: (claim: Record<string, unknown>) => {
+          claims.push(claim as { render: (input: unknown) => unknown; after?: string });
+          return () => {};
+        },
+      },
+    } as never);
+
+    return { handlers, claims, cleanup };
+  }
+
+  it("maps the current host theme (text.base/text.muted) onto the internal shape", async () => {
+    const { ensureSolidTransformPlugin } = await import("@opentui/solid/bun-plugin");
+    ensureSolidTransformPlugin();
+
+    const { normalizeTheme } = await import("../v2/tui.js");
+    const { RGBA } = await import("@opentui/core");
+
+    const base = RGBA.fromInts(255, 255, 255, 255);
+    const muted = RGBA.fromInts(128, 128, 128, 255);
+    const error = RGBA.fromInts(255, 0, 0, 255);
+    const warning = RGBA.fromInts(255, 255, 0, 255);
+    const success = RGBA.fromInts(0, 255, 0, 255);
+
+    // Shape of `@opencode/theme`'s `ResolvedTheme` on current v2 hosts.
+    const normalized = normalizeTheme({
+      text: {
+        base,
+        muted,
+        feedback: {
+          error: { base: error },
+          warning: { base: warning },
+          success: { base: success },
+          info: { base },
+        },
+      },
+    } as never);
+
+    expect(normalized.text.default).toBe(base);
+    expect(normalized.text.subdued).toBe(muted);
+    expect(normalized.text.feedback.error.default).toBe(error);
+    expect(normalized.text.feedback.warning.default).toBe(warning);
+    expect(normalized.text.feedback.success.default).toBe(success);
+  });
+
+  it("falls back to the older leaf names (text.default/text.subdued)", async () => {
+    const { ensureSolidTransformPlugin } = await import("@opentui/solid/bun-plugin");
+    ensureSolidTransformPlugin();
+
+    const { normalizeTheme } = await import("../v2/tui.js");
+    const { RGBA } = await import("@opentui/core");
+
+    const color = RGBA.fromInts(1, 2, 3, 255);
+    // Leaf names early v2 builds exposed.
+    const normalized = normalizeTheme({
+      text: {
+        default: color,
+        subdued: color,
+        feedback: {
+          error: { default: color },
+          warning: { default: color },
+          success: { default: color },
+          info: { default: color },
+        },
+      },
+    } as never);
+
+    expect(normalized.text.default).toBe(color);
+    expect(normalized.text.subdued).toBe(color);
+    expect(normalized.text.feedback.warning.default).toBe(color);
+  });
+
+  it("colors a live reading from the normalized current-host theme", async () => {
+    const { ensureSolidTransformPlugin } = await import("@opentui/solid/bun-plugin");
+    ensureSolidTransformPlugin();
+
+    const { normalizeTheme, colorForSnapshot } = await import("../v2/tui.js");
+    const { RGBA } = await import("@opentui/core");
+
+    const base = RGBA.fromInts(255, 255, 255, 255);
+    const warning = RGBA.fromInts(255, 255, 0, 255);
+    const theme = normalizeTheme({
+      text: {
+        base,
+        muted: base,
+        feedback: {
+          error: { base },
+          warning: { base: warning },
+          success: { base },
+          info: { base },
+        },
+      },
+    } as never);
+
+    const config = loadConfigSync({ enableColorCoding: true });
+    // 20 TPS sits between the 10/50 thresholds, so the meter must pick warning.
+    const snapshot: V2Snapshot = {
+      sessionID: "ses-color",
+      instantTps: 20,
+      avgTps: 20,
+      totalTokens: 100,
+      elapsedMs: 5000,
+      active: true,
+      overheadTokens: 0,
+      ttftMs: 0,
+      toolMs: 0,
+      generationTps: 20,
+      modelKey: "default",
+      calibrationSamples: 0,
+      interrupted: false,
+    };
+
+    expect(colorForSnapshot(theme, config, snapshot)).toBe(warning);
+  });
+
+  it("renders the meter with the current host theme without throwing", async () => {
+    const { testRender } = await import("@opentui/solid");
+    const { RGBA } = await import("@opentui/core");
+
+    const base = RGBA.fromInts(255, 255, 255, 255);
+    const muted = RGBA.fromInts(128, 128, 128, 255);
+    const { handlers, claims, cleanup } = await setupWithTheme({
+      text: {
+        base,
+        muted,
+        feedback: {
+          error: { base },
+          warning: { base },
+          success: { base },
+          info: { base },
+        },
+      },
+    });
+
+    const onTextDelta = handlers.get("session.text.delta");
+    expect(onTextDelta).toBeDefined();
+
+    onTextDelta!(textDelta("ses-flat", "hello there, streaming tokens at a decent clip"));
+    await delay(120);
+
+    const render = claims[0]?.render;
+    expect(typeof render).toBe("function");
+
+    const setup = await testRender(
+      () => (render as (input: unknown) => unknown)({ sessionID: "ses-flat" }),
+      { width: 80, height: 5 },
+    );
+    await setup.flush();
+    expect(setup.captureCharFrame()).toContain("TPS");
+
+    await (cleanup as unknown as () => void | Promise<void>)?.();
+  });
+});
+
 describe("v2 metrics", () => {
   beforeEach(() => {
     for (const key of Object.keys(stableEnv) as Array<keyof typeof stableEnv>) {
