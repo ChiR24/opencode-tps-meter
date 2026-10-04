@@ -958,7 +958,9 @@ describe("TUI plugin", () => {
   it("removes event handlers on lifecycle dispose", async () => {
     const { disposeCallbacks, handlers } = await createHarness();
 
-    expect(handlers.size).toBe(4);
+    // message.updated, message.part.delta, message.part.updated, session.idle,
+    // plus the session.created/updated pair feeding multi-session attribution.
+    expect(handlers.size).toBe(6);
     for (const callback of disposeCallbacks) {
       await callback();
     }

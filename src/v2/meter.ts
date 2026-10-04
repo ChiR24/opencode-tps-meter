@@ -90,6 +90,23 @@ export interface V2Snapshot {
   calibrationSamples: number;
   /** True when the turn was aborted; the reading is not trustworthy. */
   interrupted: boolean;
+  /**
+   * LOCAL wall-clock time of this session's most recent token (or of its settling step end).
+   *
+   * Lets consumers age out readings themselves (the footer drops finished subagents after
+   * a few seconds) without re-deriving activity from event streams they never see. It is
+   * deliberately NOT the host event clock that token maths uses: consumers compare it
+   * against their own Date.now(), and a remote or containerised service can be seconds off.
+   */
+  lastActivityAt: number;
+  /**
+   * Host-clock time of this session's first token in its current RUN — surviving the
+   * per-step resets between tool calls, cleared when the session goes idle. The footer
+   * renders children in this order, so columns hold still through tool calls, while a
+   * finished session that is re-dispatched rejoins at the end. Only ever compared against
+   * sibling stamps, which share the host clock.
+   */
+  startedAt: number;
 }
 
 /** One settled step, emitted for durable rollups. Interrupted turns are never emitted. */
@@ -142,6 +159,8 @@ interface SessionState {
    * from these two host timestamps instead so both ends of the window share one clock.
    */
   lastTokenAt: number | null;
+  /** Wall-clock time of the most recent token; feeds snapshot `lastActivityAt`. */
+  lastTokenWallAt: number | null;
   lastPublishedAt: number;
 }
 
@@ -251,6 +270,13 @@ export function createMeter(config: Config, hooks?: V2MeterHooks): V2Meter {
   const lastActivityAt = new Map<string, number>();
   /** Usage accounting that survives per-turn resets. */
   const sessionUsage = new Map<string, SessionUsage>();
+  /**
+   * Run-scoped first-token time. Feeds snapshot `startedAt`, which the footer sorts children
+   * by; per-step `firstTokenAt` would move a subagent to the end of the line after every
+   * tool-call break. Cleared on session.idle and by the stale sweep, so a re-dispatched
+   * session counts as a new spawn and entries never outlive the session.
+   */
+  const sessionSpawnAt = new Map<string, number>();
 
   function getSessionUsage(sessionID: string): SessionUsage {
     let usage = sessionUsage.get(sessionID);
@@ -296,6 +322,7 @@ export function createMeter(config: Config, hooks?: V2MeterHooks): V2Meter {
       }),
       firstTokenAt: null,
       lastTokenAt: null,
+      lastTokenWallAt: null,
       lastPublishedAt: 0,
       lastPublishedWallAt: 0,
       firstTokenWallAt: null,
@@ -328,8 +355,11 @@ export function createMeter(config: Config, hooks?: V2MeterHooks): V2Meter {
    *
    * The last READING is deliberately kept: v1's TUI had no sweep and left the final numbers
    * on screen indefinitely, so dropping them here made the meter appear to forget after five
-   * quiet minutes. Only the heavy state (tracker, stream counters, metrics, usage) is freed;
-   * retained readings are capped separately so churn cannot grow them without bound.
+   * quiet minutes. Only the heavy state (tracker, stream counters, metrics, usage, spawn
+   * stamp) is freed; retained readings are capped separately so churn cannot grow them
+   * without bound. The reading stays untouched, `active` included — the footer judges
+   * liveness by token recency (family.ts isGenerating), so a stranded flag cannot pass a
+   * dead stream off as live throughput.
    */
   function sweepStaleSessions(now: number): void {
     if (now - lastSweepAt < CLEANUP_INTERVAL_MS) {
@@ -351,6 +381,7 @@ export function createMeter(config: Config, hooks?: V2MeterHooks): V2Meter {
       resetSession(sessionID);
       sessionUsage.delete(sessionID);
       metrics.forget(sessionID);
+      sessionSpawnAt.delete(sessionID);
       // Keep the activity stamp only while a reading survives, so it can be aged out later.
       if (!snapshots.has(sessionID)) {
         lastActivityAt.delete(sessionID);
@@ -366,6 +397,7 @@ export function createMeter(config: Config, hooks?: V2MeterHooks): V2Meter {
     const evict = oldestFirst.slice(0, snapshots.size - MAX_RETAINED_SNAPSHOTS);
     for (const sessionID of evict) {
       lastActivityAt.delete(sessionID);
+      sessionSpawnAt.delete(sessionID);
     }
     mutateSnapshots((draft) => {
       for (const sessionID of evict) {
@@ -426,6 +458,8 @@ export function createMeter(config: Config, hooks?: V2MeterHooks): V2Meter {
       const elapsedMs = elapsedFor(state);
       draft.set(sessionID, {
         sessionID,
+        lastActivityAt: state.lastTokenWallAt ?? Date.now(),
+        startedAt: sessionSpawnAt.get(sessionID) ?? state.firstTokenAt ?? now,
         instantTps: state.tracker.getSmoothedTPS(),
         avgTps: elapsedMs > 0 ? totalTokens / (elapsedMs / 1000) : state.tracker.getAverageTPS(),
         totalTokens,
@@ -462,7 +496,8 @@ export function createMeter(config: Config, hooks?: V2MeterHooks): V2Meter {
     totalTokens: number,
     avgTps: number,
     elapsedMs: number,
-    overheadTokens: number
+    overheadTokens: number,
+    at: number
   ): void {
     if (totalTokens === 0 || elapsedMs < config.initialDisplayDelayMs) {
       return;
@@ -470,6 +505,8 @@ export function createMeter(config: Config, hooks?: V2MeterHooks): V2Meter {
     mutateSnapshots((draft) => {
       draft.set(sessionID, {
         sessionID,
+        lastActivityAt: Date.now(),
+        startedAt: sessionSpawnAt.get(sessionID) ?? at,
         instantTps: 0,
         avgTps,
         totalTokens,
@@ -617,7 +654,11 @@ export function createMeter(config: Config, hooks?: V2MeterHooks): V2Meter {
       state.firstTokenAt = now;
       state.firstTokenWallAt = Date.now();
     }
+    if (!sessionSpawnAt.has(sessionID)) {
+      sessionSpawnAt.set(sessionID, now);
+    }
     state.lastTokenAt = now;
+    state.lastTokenWallAt = Date.now();
     state.tracker.recordTokens(tokenCount, now);
     maybePublishActive(sessionID, now);
   }
@@ -704,7 +745,7 @@ export function createMeter(config: Config, hooks?: V2MeterHooks): V2Meter {
     const elapsedMs = state?.firstTokenAt ? Math.max(0, now - state.firstTokenAt) : 0;
     const avgTps = elapsedMs > 0 ? totalTokens / (elapsedMs / 1000) : 0;
 
-    publishFinal(sessionID, totalTokens, avgTps, elapsedMs, overheadFor(sessionID));
+    publishFinal(sessionID, totalTokens, avgTps, elapsedMs, overheadFor(sessionID), now);
 
     // Feed the durable rollup. An aborted turn is excluded: its elapsed window is truncated
     // at an arbitrary point, so folding it in would drag every average down.
@@ -768,6 +809,8 @@ export function createMeter(config: Config, hooks?: V2MeterHooks): V2Meter {
         case "session.idle":
           persistIdleSnapshot(event.data.sessionID, eventTime(event, Date.now()));
           resetSession(event.data.sessionID);
+          // The run is over: a re-dispatch is a new spawn and rejoins the footer at the end.
+          sessionSpawnAt.delete(event.data.sessionID);
           break;
       }
     },
@@ -792,6 +835,7 @@ export function createMeter(config: Config, hooks?: V2MeterHooks): V2Meter {
       streamText.clear();
       lastActivityAt.clear();
       sessionUsage.clear();
+      sessionSpawnAt.clear();
       metrics.dispose();
       listeners.clear();
       snapshots = new Map();
