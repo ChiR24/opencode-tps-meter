@@ -776,7 +776,7 @@ describe("v2 theme normalization", () => {
     const success = RGBA.fromInts(0, 255, 0, 255);
 
     // Shape of `@opencode/theme`'s `ResolvedTheme` on current v2 hosts.
-    const normalized = normalizeTheme({
+    const normalized = normalizeTheme(() => ({
       text: {
         base,
         muted,
@@ -787,7 +787,7 @@ describe("v2 theme normalization", () => {
           info: { base },
         },
       },
-    } as never);
+    }) as never);
 
     expect(normalized.text.default).toBe(base);
     expect(normalized.text.subdued).toBe(muted);
@@ -805,7 +805,7 @@ describe("v2 theme normalization", () => {
 
     const color = RGBA.fromInts(1, 2, 3, 255);
     // Leaf names early v2 builds exposed.
-    const normalized = normalizeTheme({
+    const normalized = normalizeTheme(() => ({
       text: {
         default: color,
         subdued: color,
@@ -816,7 +816,7 @@ describe("v2 theme normalization", () => {
           info: { default: color },
         },
       },
-    } as never);
+    }) as never);
 
     expect(normalized.text.default).toBe(color);
     expect(normalized.text.subdued).toBe(color);
@@ -832,7 +832,7 @@ describe("v2 theme normalization", () => {
 
     const base = RGBA.fromInts(255, 255, 255, 255);
     const warning = RGBA.fromInts(255, 255, 0, 255);
-    const theme = normalizeTheme({
+    const theme = normalizeTheme(() => ({
       text: {
         base,
         muted: base,
@@ -843,7 +843,7 @@ describe("v2 theme normalization", () => {
           info: { base },
         },
       },
-    } as never);
+    }) as never);
 
     const config = loadConfigSync({ enableColorCoding: true });
     // 20 TPS sits between the 10/50 thresholds, so the meter must pick warning.
@@ -864,6 +864,69 @@ describe("v2 theme normalization", () => {
     };
 
     expect(colorForSnapshot(theme, config, snapshot)).toBe(warning);
+  });
+
+  it("re-reads the theme through the getter, so a theme switch recolors the meter", async () => {
+    const { ensureSolidTransformPlugin } = await import("@opentui/solid/bun-plugin");
+    ensureSolidTransformPlugin();
+
+    const { normalizeTheme, colorForSnapshot } = await import("../v2/tui.js");
+    const { RGBA } = await import("@opentui/core");
+
+    const darkWarning = RGBA.fromInts(255, 255, 0, 255);
+    const lightWarning = RGBA.fromInts(0, 0, 255, 255);
+
+    // Shape of `@opencode/theme`'s `ResolvedTheme` on current v2 hosts.
+    const dark = {
+      text: {
+        base: RGBA.fromInts(255, 255, 255, 255),
+        muted: RGBA.fromInts(128, 128, 128, 255),
+        feedback: {
+          error: { base: darkWarning },
+          warning: { base: darkWarning },
+          success: { base: darkWarning },
+          info: { base: darkWarning },
+        },
+      },
+    };
+    const light = {
+      text: {
+        base: RGBA.fromInts(20, 20, 20, 255),
+        muted: RGBA.fromInts(190, 190, 190, 255),
+        feedback: {
+          error: { base: lightWarning },
+          warning: { base: lightWarning },
+          success: { base: lightWarning },
+          info: { base: lightWarning },
+        },
+      },
+    };
+
+    let current: unknown = dark;
+    const theme = normalizeTheme(() => current as never);
+
+    const config = loadConfigSync({ enableColorCoding: true });
+    // 20 TPS sits between the 10/50 thresholds, so the meter must pick warning.
+    const mid: V2Snapshot = {
+      sessionID: "ses-theme",
+      instantTps: 20,
+      avgTps: 20,
+      totalTokens: 10,
+      elapsedMs: 1000,
+      active: true,
+      overheadTokens: 0,
+      ttftMs: 0,
+      toolMs: 0,
+      generationTps: 20,
+      modelKey: "default",
+      calibrationSamples: 0,
+      interrupted: false,
+    };
+
+    expect(colorForSnapshot(theme, config, mid)).toBe(darkWarning);
+    // The host swaps theme mid-session; the meter must follow without a TUI restart.
+    current = light;
+    expect(colorForSnapshot(theme, config, mid)).toBe(lightWarning);
   });
 
   it("renders the meter with the current host theme without throwing", async () => {

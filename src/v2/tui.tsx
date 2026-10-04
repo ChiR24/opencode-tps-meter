@@ -88,23 +88,29 @@ function ms(value: number): string {
  * names first and fall back to the older ones, so the meter is colored on
  * either host. Anything still unresolvable degrades to `undefined` (host
  * default color), never a throw.
+ *
+ * The theme is read LAZILY through the supplied getter. On the host `ctx.theme` is a live
+ * getter over the current token set, so resolving it once at setup time would freeze the
+ * meter at whatever theme was active then — a theme switch would not recolor it until the
+ * TUI restarted. Reading through the getter keeps every property access reactive, the same
+ * way the host's own plugins read `ctx.theme` at render time.
  */
-export function normalizeTheme(theme: V2ResolvedTheme): V2ResolvedTheme {
+export function normalizeTheme(getTheme: () => V2ResolvedTheme): V2ResolvedTheme {
   interface TextShape {
     base?: V2Rgba; muted?: V2Rgba; default?: V2Rgba; subdued?: V2Rgba;
     feedback?: Partial<
       Record<"error" | "warning" | "success" | "info", { base?: V2Rgba; default?: V2Rgba }>
     >;
   }
-  const text: TextShape = (theme as { text?: TextShape }).text ?? {};
   const pick = (...candidates: Array<V2Rgba | undefined>): V2Rgba =>
     candidates.find((c) => c !== undefined) as V2Rgba;
-  const feedback = (kind: "error" | "warning" | "success" | "info"): V2Rgba =>
-    pick(text.feedback?.[kind]?.base, text.feedback?.[kind]?.default);
 
-  return {
-    ...theme,
-    text: {
+  // Resolved on every access so a host theme change reaches the meter without a TUI restart.
+  const resolve = (): V2ResolvedTheme["text"] => {
+    const text: TextShape = (getTheme() as { text?: TextShape }).text ?? {};
+    const feedback = (kind: "error" | "warning" | "success" | "info"): V2Rgba =>
+      pick(text.feedback?.[kind]?.base, text.feedback?.[kind]?.default);
+    return {
       default: pick(text.base, text.default),
       subdued: pick(text.muted, text.subdued),
       feedback: {
@@ -113,6 +119,12 @@ export function normalizeTheme(theme: V2ResolvedTheme): V2ResolvedTheme {
         success: { default: feedback("success") },
         info: { default: feedback("info") },
       },
+    };
+  };
+
+  return {
+    get text() {
+      return resolve();
     },
   };
 }
@@ -444,7 +456,7 @@ export function setupTui(ctx: V2TuiContext): V2Cleanup | void {
     return;
   }
 
-  const theme = normalizeTheme(ctx.theme);
+  const theme = normalizeTheme(() => ctx.theme);
   const ledger = createLedger(ctx.storage);
   const meter = createMeter(config, {
     onStepSettled: (measurement) => {
