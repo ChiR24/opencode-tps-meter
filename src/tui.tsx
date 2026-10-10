@@ -1,17 +1,27 @@
 import type { TuiPlugin, TuiPluginApi, TuiPluginModule } from "@opencode-ai/plugin/tui";
-import { createMemo, createSignal, Show } from "solid-js";
+import { createEffect, createMemo, createSignal, onCleanup, Show } from "solid-js";
+import { agentNameFromMessage } from "./agentName.js";
 import { createTracker } from "./tracker.js";
 import { createTokenizer, createIncrementalCounter, type IncrementalCounter } from "./tokenCounter.js";
 import { defaultConfig, loadConfigSync } from "./config.js";
 import {
+  AGGREGATE_TICK_INTERVAL_MS,
   CLEANUP_INTERVAL_MS,
   COUNTABLE_PART_TYPES,
   INVALID_FINISH_REASONS,
   MAX_MESSAGE_AGE_MS,
+  MAX_REMEMBERED_SESSIONS,
   TOOL_CALL_FINISH_REASON,
 } from "./constants.js";
 import { formatMeterText } from "./format.js";
 import type { Config } from "./types.js";
+import {
+  aggregateReading,
+  collectMeterEntries,
+  formatAggregateLine,
+  hasSubagentEntries,
+  sameIDs,
+} from "./v2/family.js";
 import { setupTui as setupTuiV2 } from "./v2/tui.js";
 import type { V2Cleanup, V2TuiContext } from "./v2/types.js";
 
@@ -21,6 +31,8 @@ type Role = "assistant" | "user";
 interface SessionState {
   tracker: TrackerInstance;
   firstTokenAt: number | null;
+  /** Local time of the most recent token; feeds snapshot `lastActivityAt`. */
+  lastTokenAt: number | null;
   lastPublishedAt: number;
   /** Prompt cache accounting for the current turn, from the latest message.updated. */
   cacheReadTokens: number;
@@ -41,6 +53,19 @@ interface TuiSnapshot {
   sessionCacheReadTokens: number;
   sessionCacheWriteTokens: number;
   sessionInputTokens: number;
+  /**
+   * Local-clock time of the last token (or of the completed message), so finished subagents
+   * can be aged out of the aggregate. Never the server's `info.time.completed`: the footer
+   * compares this against the local Date.now().
+   */
+  lastActivityAt: number;
+  /**
+   * Local-clock time of this session's first token in its current RUN — surviving the
+   * per-message resets between tool calls, cleared on session.idle. The footer renders
+   * children in this order: columns hold still through tool calls, and a finished session
+   * that is re-dispatched rejoins at the end.
+   */
+  startedAt: number;
 }
 
 /** Prompt cache accounting summed over every reported step, kept for the whole session. */
@@ -50,6 +75,11 @@ interface SessionCacheUsage {
   input: number;
 }
 
+/** Longest parent chain walked; cycles and missing links end the walk sooner. */
+const MAX_TREE_DEPTH = 16;
+
+const IDLE_READING = { active: false, instantTps: 0 } as const;
+
 function loadTuiConfig(): Config {
   try {
     return loadConfigSync();
@@ -58,17 +88,34 @@ function loadTuiConfig(): Config {
   }
 }
 
-function colorForSnapshot(theme: TuiPluginApi["theme"]["current"], config: Config, snapshot: TuiSnapshot) {
-  if (!snapshot.active) {
+/** Sets a key in an insertion-ordered map used as an LRU, evicting the oldest beyond the cap. */
+function rememberBounded<K, V>(map: Map<K, V>, key: K, value: V): void {
+  map.delete(key);
+  map.set(key, value);
+  while (map.size > MAX_REMEMBERED_SESSIONS) {
+    const oldest = map.keys().next();
+    if (oldest.done) {
+      break;
+    }
+    map.delete(oldest.value);
+  }
+}
+
+function colorForSnapshot(
+  theme: TuiPluginApi["theme"]["current"],
+  config: Config,
+  reading: { readonly active: boolean; readonly instantTps: number }
+) {
+  if (!reading.active) {
     return theme.textMuted;
   }
   if (!config.enableColorCoding) {
     return theme.text;
   }
-  if (snapshot.instantTps < config.slowTpsThreshold) {
+  if (reading.instantTps < config.slowTpsThreshold) {
     return theme.error;
   }
-  if (snapshot.instantTps > config.fastTpsThreshold) {
+  if (reading.instantTps > config.fastTpsThreshold) {
     return theme.success;
   }
   return theme.warning;
@@ -79,18 +126,87 @@ function MeterView(props: {
   config: Config;
   sessionId: string;
   snapshots: () => ReadonlyMap<string, TuiSnapshot>;
+  /**
+   * Resolves the selected session's family among the sessions that have a reading.
+   * Absent or throwing host APIs degrade to single-session.
+   */
+  familyOf: (
+    sessionId: string,
+    candidateIDs: readonly string[]
+  ) => { rootID: string; memberIDs: readonly string[] };
+  /** Bumped whenever a parent link is learned, so family resolution re-runs. */
+  treeVersion: () => number;
+  agentOf: (sessionId: string) => string | undefined;
+  isRunning: (sessionId: string) => boolean | undefined;
 }) {
   const current = createMemo(() => props.snapshots().get(props.sessionId));
 
+  /** Which sessions have a reading. Notifies only when that set changes, not per publish. */
+  const readingIDs = createMemo(() => [...props.snapshots().keys()], [], { equals: sameIDs });
+
+  /**
+   * The selected session's family. Mirrors the v2 footer's split: walking every session's
+   * parent chain on each publish grew with every session the TUI had ever metered, so the
+   * tree is resolved only when the set of readings or the known links change.
+   */
+  const family = createMemo(() => {
+    props.treeVersion();
+    return props.familyOf(props.sessionId, readingIDs());
+  });
+
+  /** Heartbeat for the recency filter; runs only while the aggregate line is on screen. */
+  const [tick, setTick] = createSignal(0);
+
+  /** Not gated on the selected session's own reading, exactly like the v2 footer. */
+  const entries = createMemo(() => {
+    const { rootID, memberIDs } = family();
+    tick();
+    return collectMeterEntries({
+      rootID,
+      memberIDs,
+      snapshots: props.snapshots(),
+      agentOf: props.agentOf,
+      isRunning: props.isRunning,
+      now: Date.now(),
+      generatingWindowMs: props.config.rollingWindowMs,
+    });
+  });
+
+  const aggregate = createMemo(() => {
+    const rows = entries();
+    return hasSubagentEntries(rows)
+      ? { text: formatAggregateLine(rows), reading: aggregateReading(rows) }
+      : undefined;
+  });
+
+  const showingAggregate = createMemo(() => aggregate() !== undefined);
+  createEffect(() => {
+    if (!showingAggregate()) {
+      return;
+    }
+    const heartbeat = setInterval(() => setTick((value) => value + 1), AGGREGATE_TICK_INTERVAL_MS);
+    onCleanup(() => clearInterval(heartbeat));
+  });
+
+  const line = createMemo(() => {
+    const rows = aggregate();
+    if (rows !== undefined) {
+      return rows.text;
+    }
+    const snapshot = current();
+    return snapshot ? formatMeterText(snapshot, props.config) : "";
+  });
+
+  // Coloured by what the line shows: the aggregate's own state, or the selected session.
+  const reading = () => aggregate()?.reading ?? current() ?? IDLE_READING;
+
   return (
-    <Show when={current()} fallback={<box flexShrink={0} />}>
-      {(snapshot) => (
-        <box flexDirection="row" flexShrink={0}>
-          <text fg={colorForSnapshot(props.api.theme.current, props.config, snapshot())}>
-            {formatMeterText(snapshot(), props.config)}
-          </text>
-        </box>
-      )}
+    <Show when={line()} fallback={<box flexShrink={0} />}>
+      <box flexDirection="row" flexShrink={0}>
+        <text fg={colorForSnapshot(props.api.theme.current, props.config, reading())}>
+          {line()}
+        </text>
+      </box>
     </Show>
   );
 }
@@ -127,6 +243,108 @@ const tui: TuiPlugin = async (api) => {
   const messageRoles = new Map<string, Map<string, Role>>();
   const publishTimers = new Map<string, ReturnType<typeof setTimeout>>();
   const disposers: Array<() => void> = [];
+  /**
+   * Parent links and agent names per session, for multi-session attribution.
+   *
+   * v1 has no synced family API like v2's `ctx.data.session`, but it does carry the real
+   * tree: `session.created`/`session.updated` events expose `info.parentID`, and
+   * `api.state.session.get()` serves the same `Session` shape synchronously. Agent names
+   * ride on message payloads (`agent`, `mode`, or the legacy identity fields) — they are
+   * cached here because parts never carry them.
+   *
+   * session.updated fires for every session in the project, so both maps are bounded LRUs;
+   * `api.state.session` stays the primary source for parent links.
+   */
+  const sessionParents = new Map<string, string | null>();
+  const sessionAgents = new Map<string, string>();
+  const [treeVersion, setTreeVersion] = createSignal(0);
+  /**
+   * Run-scoped first-token time; feeds snapshot `startedAt` for stable child ordering.
+   * Cleared on session.idle, and bounded because a crashed session never goes idle.
+   */
+  const sessionSpawnAt = new Map<string, number>();
+
+  function parentOf(sessionId: string): string | undefined {
+    try {
+      const fromState = api.state?.session?.get?.(sessionId)?.parentID;
+      if (typeof fromState === "string" && fromState.length > 0) {
+        return fromState;
+      }
+    } catch {
+      // State store unavailable; fall through to event-derived knowledge only.
+    }
+    return sessionParents.get(sessionId) ?? undefined;
+  }
+
+  function rememberParent(info: unknown): void {
+    if (!info || typeof info !== "object") {
+      return;
+    }
+    const record = info as Record<string, unknown>;
+    if (typeof record.id !== "string" || record.id.length === 0) {
+      return;
+    }
+    const parentID =
+      typeof record.parentID === "string" && record.parentID.length > 0 ? record.parentID : null;
+    if (sessionParents.has(record.id) && sessionParents.get(record.id) === parentID) {
+      return;
+    }
+    rememberBounded(sessionParents, record.id, parentID);
+    setTreeVersion((version) => version + 1);
+  }
+
+  /**
+   * Walks parent links as far as they go; cycles and missing links terminate the walk.
+   *
+   * `resolved` memoises roots across the walks of one family resolution: siblings share
+   * their ancestors, so each chain is walked once rather than once per descendant.
+   */
+  function walkToRoot(sessionId: string, resolved: Map<string, string>): string {
+    const path: string[] = [];
+    const seen = new Set<string>();
+    let current = sessionId;
+    let root = resolved.get(current);
+    while (root === undefined) {
+      path.push(current);
+      seen.add(current);
+      const parent = path.length <= MAX_TREE_DEPTH ? parentOf(current) : undefined;
+      if (!parent || seen.has(parent)) {
+        root = current;
+        break;
+      }
+      current = parent;
+      root = resolved.get(current);
+    }
+    for (const id of path) {
+      resolved.set(id, root);
+    }
+    return root;
+  }
+
+  /**
+   * Resolves the selected session's family: every candidate whose own root chain lands on
+   * the same topmost ancestor — including that ancestor itself, so "main" always renders.
+   */
+  function resolveFamily(
+    sessionId: string,
+    candidateIDs: readonly string[]
+  ): { rootID: string; memberIDs: readonly string[] } {
+    const resolved = new Map<string, string>();
+    const rootID = walkToRoot(sessionId, resolved);
+    const memberIDs: string[] = [];
+    for (const id of new Set([sessionId, ...candidateIDs])) {
+      if (walkToRoot(id, resolved) === rootID) {
+        memberIDs.push(id);
+      }
+    }
+    return { rootID, memberIDs };
+  }
+
+  /** Host run status: busy or retrying counts as running. Unknown when the store is absent. */
+  function isRunning(sessionId: string): boolean | undefined {
+    const status = api.state?.session?.status?.(sessionId);
+    return status ? status.type !== "idle" : undefined;
+  }
 
   function getPartTextCache(sessionId: string): Map<string, string | IncrementalCounter> {
     const cache =
@@ -143,6 +361,7 @@ const tui: TuiPlugin = async (api) => {
     state = {
       tracker: createTracker({ sessionId, rollingWindowMs: config.rollingWindowMs }),
       firstTokenAt: null,
+      lastTokenAt: null,
       lastPublishedAt: 0,
       cacheReadTokens: 0,
       cacheWriteTokens: 0,
@@ -251,6 +470,9 @@ const tui: TuiPlugin = async (api) => {
       cacheWriteTokens: state.cacheWriteTokens,
       inputTokens: state.inputTokens,
       ...sessionCacheFields(sessionId),
+      // `now` may be the server's completion time (persistIdleSnapshot); this must be local.
+      lastActivityAt: state.lastTokenAt ?? Date.now(),
+      startedAt: sessionSpawnAt.get(sessionId) ?? state.firstTokenAt ?? Date.now(),
     };
     setSnapshots((current) => new Map(current).set(sessionId, nextSnapshot));
   }
@@ -317,6 +539,9 @@ const tui: TuiPlugin = async (api) => {
     }
 
     const state = sessions.get(sessionId);
+    // Local time, not the server's `info.time.completed`: the footer ages this against
+    // the local Date.now().
+    const now = Date.now();
     const nextSnapshot = {
       sessionId,
       instantTps: 0,
@@ -328,6 +553,8 @@ const tui: TuiPlugin = async (api) => {
       cacheWriteTokens: state?.cacheWriteTokens ?? 0,
       inputTokens: state?.inputTokens ?? 0,
       ...sessionCacheFields(sessionId),
+      lastActivityAt: now,
+      startedAt: sessionSpawnAt.get(sessionId) ?? now,
     };
     setSnapshots((current) => new Map(current).set(sessionId, nextSnapshot));
   }
@@ -412,6 +639,10 @@ const tui: TuiPlugin = async (api) => {
     if (state.firstTokenAt === null) {
       state.firstTokenAt = now;
     }
+    state.lastTokenAt = now;
+    if (!sessionSpawnAt.has(sessionId)) {
+      rememberBounded(sessionSpawnAt, sessionId, now);
+    }
 
     state.tracker.recordTokens(tokenCount, now);
     maybePublishActive(sessionId, now);
@@ -422,10 +653,29 @@ const tui: TuiPlugin = async (api) => {
     order: 20,
     slots: {
       session_prompt_right(_ctx, props) {
-        return <MeterView api={api} config={config} sessionId={props.session_id} snapshots={snapshots} />;
+        return (
+          <MeterView
+            api={api}
+            config={config}
+            sessionId={props.session_id}
+            snapshots={snapshots}
+            familyOf={resolveFamily}
+            treeVersion={treeVersion}
+            agentOf={(id) => sessionAgents.get(id)}
+            isRunning={isRunning}
+          />
+        );
       },
     },
   });
+
+  disposers.push(api.event.on("session.created", (event) => {
+    rememberParent(event.properties.info);
+  }));
+
+  disposers.push(api.event.on("session.updated", (event) => {
+    rememberParent(event.properties.info);
+  }));
 
   disposers.push(api.event.on("message.updated", (event) => {
     const info = event.properties.info;
@@ -434,6 +684,14 @@ const tui: TuiPlugin = async (api) => {
     const roleCache = messageRoles.get(sessionId) ?? new Map<string, Role>();
     messageRoles.set(sessionId, roleCache);
     roleCache.set(info.id, info.role);
+
+    // Subagent sessions announce their agent through message payloads; parts never carry
+    // it. User messages name the agent that owns the session, assistant messages carry
+    // the same via `agent`/`mode` depending on SDK vintage.
+    const agentName = agentNameFromMessage(info);
+    if (agentName && !sessionAgents.has(sessionId)) {
+      rememberBounded(sessionAgents, sessionId, agentName);
+    }
 
     if (info.role !== "assistant" || !info.time.completed) {
       return;
@@ -538,6 +796,8 @@ const tui: TuiPlugin = async (api) => {
     resetSession(event.properties.sessionID);
     // The session is finished, so its per-message accounting is no longer needed.
     accountedCacheUsage.delete(event.properties.sessionID);
+    // The run is over: a re-dispatch is a new spawn and rejoins the footer at the end.
+    sessionSpawnAt.delete(event.properties.sessionID);
   }));
 
   api.lifecycle.onDispose(() => {
@@ -550,6 +810,9 @@ const tui: TuiPlugin = async (api) => {
     sessionCacheUsage.clear();
     accountedCacheUsage.clear();
     cacheAccountingSeenAt.clear();
+    sessionParents.clear();
+    sessionAgents.clear();
+    sessionSpawnAt.clear();
     for (const timer of publishTimers.values()) {
       clearTimeout(timer);
     }

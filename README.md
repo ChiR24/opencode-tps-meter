@@ -162,7 +162,7 @@ These need APIs that do not exist on v1, so they are inert on `opencode`.
 | Generation vs end-to-end TPS | Tool execution subtracted, so a turn that waited on a shell command still reports the model's real rate | `session.tool.called` / `.success` / `.failed` |
 | Time to first token | Measured from turn start on the host clock | `session.execution.started` + event `created` |
 | Hidden overhead | Tokens spent on auto-title and compaction that no step reports | `session.usage.updated` residual |
-| Per-subagent breakdown | Sidebar panel with exact parent/child attribution | `ctx.data.session.root` / `.family` |
+| Per-subagent breakdown | Live footer aggregate — `TPS Σ 318 \| main 63 \| explore 91 \| …` — while subagents generate, on **both** hosts (v1 via `session.created`/`.updated` parentID + `api.state.session`; v2 via `ctx.data.session.root` / `.family`). Σ sums every session streaming tokens right now — a root waiting on its subagents drops out on its own, and counts again once it resumes. Children keep their spawn position (no column swapping), stay visible through long tool calls while the host reports them running, and drop off ~4s after they finish. The v2-only sidebar adds the full family breakdown panel | `api.state.session` (v1) / `ctx.data.session` (v2) |
 | Durable ledger + dashboard | Per-model mean/best throughput and TTFT, persisted and shared across windows | `ctx.storage.store`, `ctx.ui.router` |
 | Wire-level TTFB | Provider dispatch to response headers, below the streaming pipeline | `ctx.session.hook("http.request"/"http.response")` |
 

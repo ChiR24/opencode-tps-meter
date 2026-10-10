@@ -17,10 +17,18 @@
  * @module v2/tui
  */
 
-import { createMemo, createSignal, For, Show } from "solid-js";
+import { createEffect, createMemo, createSignal, For, onCleanup, Show } from "solid-js";
+import { AGGREGATE_TICK_INTERVAL_MS } from "../constants.js";
 import { defaultConfig, loadConfigSync } from "../config.js";
 import { formatCacheHit, formatMeterText, formatSessionCacheHit } from "../format.js";
 import type { Config } from "../types.js";
+import {
+  aggregateReading,
+  collectMeterEntries,
+  formatAggregateLine,
+  hasSubagentEntries,
+  sameIDs,
+} from "./family.js";
 import { createMeter, type V2Snapshot } from "./meter.js";
 import { createLedger, type V2Ledger } from "./ledger.js";
 import type {
@@ -30,6 +38,7 @@ import type {
   V2PluginDefinition,
   V2ResolvedTheme,
   V2Rgba,
+  V2SessionData,
   V2SlotInput,
   V2TuiContext,
   V2UnknownEvent,
@@ -84,21 +93,77 @@ function ms(value: number): string {
 function colorForSnapshot(
   theme: V2ResolvedTheme,
   config: Config,
-  snapshot: V2Snapshot
+  reading: { readonly active: boolean; readonly instantTps: number }
 ): V2Rgba {
-  if (!snapshot.active) {
+  if (!reading.active) {
     return theme.text.subdued;
   }
   if (!config.enableColorCoding) {
     return theme.text.default;
   }
-  if (snapshot.instantTps < config.slowTpsThreshold) {
+  if (reading.instantTps < config.slowTpsThreshold) {
     return theme.text.feedback.error.default;
   }
-  if (snapshot.instantTps > config.fastTpsThreshold) {
+  if (reading.instantTps > config.fastTpsThreshold) {
     return theme.text.feedback.success.default;
   }
   return theme.text.feedback.warning.default;
+}
+
+const IDLE_READING = { active: false, instantTps: 0 } as const;
+
+interface FamilyMembers {
+  readonly rootID: string;
+  readonly memberIDs: readonly string[];
+  /** Host-reported agent names; members without a usable name are absent. */
+  readonly names: ReadonlyMap<string, string>;
+}
+
+/**
+ * Resolves the selected session's family from the host's session tree.
+ *
+ * Every host call is guarded and the result is committed only once it is complete, so a
+ * drifting beta API degrades to exactly the single-session meter — never to a half-resolved
+ * family (a stale root with no members renders a line with no `main`).
+ */
+function resolveFamily(data: V2SessionData | undefined, sessionID: string): FamilyMembers {
+  const solo: FamilyMembers = { rootID: sessionID, memberIDs: [sessionID], names: new Map() };
+  if (!data) {
+    return solo;
+  }
+  let rootID: unknown;
+  let family: unknown;
+  try {
+    rootID = data.root(sessionID);
+    if (typeof rootID !== "string" || rootID.length === 0) {
+      return solo;
+    }
+    family = data.family(rootID);
+  } catch {
+    return solo;
+  }
+  if (!Array.isArray(family)) {
+    return solo;
+  }
+  const memberIDs = [
+    ...new Set([
+      rootID,
+      sessionID,
+      ...family.filter((id): id is string => typeof id === "string" && id.length > 0),
+    ]),
+  ];
+  const names = new Map<string, string>();
+  for (const id of memberIDs) {
+    try {
+      const agent = data.get(id)?.agent;
+      if (typeof agent === "string" && agent.trim().length > 0) {
+        names.set(id, agent);
+      }
+    } catch {
+      // No name for this member; the footer falls back to the snapshot or a short id.
+    }
+  }
+  return { rootID, memberIDs, names };
 }
 
 function MeterView(props: {
@@ -107,6 +172,8 @@ function MeterView(props: {
   config: Config;
   mode: () => DisplayMode;
   snapshots: () => ReadonlyMap<string, V2Snapshot>;
+  /** Session tree for subagent attribution. Absent hosts degrade to single-session display. */
+  session?: V2SessionData;
 }) {
   // sessionID is optional in v2 — the footer also renders on surfaces with no session.
   const current = createMemo(() => {
@@ -117,7 +184,80 @@ function MeterView(props: {
     return sessionID ? props.snapshots().get(sessionID) : undefined;
   });
 
+  /** Which sessions have a reading. Notifies only when that set changes, not per publish. */
+  const readingIDs = createMemo(() => [...props.snapshots().keys()], [], { equals: sameIDs });
+
+  /**
+   * The selected session's family and agent names.
+   *
+   * Split from the snapshot-dependent memo below for the same reason as SidebarPanel: the
+   * tree and names change rarely, while snapshots change on every publish (up to ~125/s).
+   * Re-resolves when a session gains its first reading — a new subagent — or when the
+   * host's own session store changes underneath it.
+   */
+  const family = createMemo<FamilyMembers | undefined>(() => {
+    const sessionID = props.input.sessionID;
+    if (props.mode() === "hidden" || !sessionID) {
+      return undefined;
+    }
+    readingIDs();
+    return resolveFamily(props.session, sessionID);
+  });
+
+  /**
+   * Heartbeat for the recency filter. A finished subagent must disappear after ~4s, but
+   * nothing republishes once every stream is quiet — and a memo whose inputs never change
+   * never re-runs. Only the aggregate line depends on time, so the interval runs only while
+   * it is on screen, and belongs to this component so unmounting always stops it.
+   */
+  const [tick, setTick] = createSignal(0);
+
+  /**
+   * The family filtered to entries worth showing. Not gated on the selected session having
+   * a reading of its own: a root whose first step was a pure tool call has none, and its
+   * subagents must still show while they stream.
+   */
+  const entries = createMemo(() => {
+    const members = family();
+    if (!members) {
+      return [];
+    }
+    const snaps = props.snapshots();
+    const data = props.session;
+    tick();
+    return collectMeterEntries({
+      rootID: members.rootID,
+      memberIDs: members.memberIDs,
+      snapshots: snaps,
+      agentOf: (id) => members.names.get(id) ?? snaps.get(id)?.agent,
+      isRunning: data ? (id) => data.status(id) === "running" : undefined,
+      now: Date.now(),
+      generatingWindowMs: props.config.rollingWindowMs,
+    });
+  });
+
+  /** The aggregate line, or undefined while no subagent qualifies — then v1 layout applies. */
+  const aggregate = createMemo(() => {
+    const rows = entries();
+    return hasSubagentEntries(rows)
+      ? { text: formatAggregateLine(rows), reading: aggregateReading(rows) }
+      : undefined;
+  });
+
+  const showingAggregate = createMemo(() => aggregate() !== undefined);
+  createEffect(() => {
+    if (!showingAggregate()) {
+      return;
+    }
+    const heartbeat = setInterval(() => setTick((value) => value + 1), AGGREGATE_TICK_INTERVAL_MS);
+    onCleanup(() => clearInterval(heartbeat));
+  });
+
   const line = createMemo(() => {
+    const rows = aggregate();
+    if (rows !== undefined) {
+      return rows.text;
+    }
     const snapshot = current();
     if (!snapshot) {
       return "";
@@ -143,13 +283,14 @@ function MeterView(props: {
     return extra.length > 0 ? `${base} · ${extra.join(" · ")}` : base;
   });
 
+  // Coloured by what the line shows: the aggregate's own state, or the selected session.
+  const reading = () => aggregate()?.reading ?? current() ?? IDLE_READING;
+
   return (
-    <Show when={current()} fallback={<box flexShrink={0} />}>
-      {(snapshot) => (
-        <box flexDirection="row" flexShrink={0}>
-          <text fg={colorForSnapshot(props.theme, props.config, snapshot())}>{line()}</text>
-        </box>
-      )}
+    <Show when={line()} fallback={<box flexShrink={0} />}>
+      <box flexDirection="row" flexShrink={0}>
+        <text fg={colorForSnapshot(props.theme, props.config, reading())}>{line()}</text>
+      </box>
     </Show>
   );
 }
@@ -425,41 +566,58 @@ export function setupTui(ctx: V2TuiContext): V2Cleanup | void {
   const [mode, setMode] = createSignal<DisplayMode>("compact");
   const disposers: Array<() => void> = [];
 
-  disposers.push(meter.subscribe((next) => setSnapshots(() => next)));
+  const cleanup = (): void => {
+    for (const dispose of disposers) {
+      dispose();
+    }
+    disposers.length = 0;
+    meter.dispose();
+    setSnapshots(() => new Map<string, V2Snapshot>());
+  };
 
-  for (const type of SUBSCRIBED_EVENTS) {
+  // The footer meter is the ONE surface that must exist. It is claimed before any optional
+  // surface and outside their guard, so a failure below can never cost us the meter itself.
+  // If a required registration throws, the plugin load fails either way; release what was
+  // already registered first, or those subscriptions outlive the failed plugin.
+  try {
+    disposers.push(meter.subscribe((next) => setSnapshots(() => next)));
+
+    for (const type of SUBSCRIBED_EVENTS) {
+      disposers.push(
+        ctx.data.on(type, (event) => {
+          meter.handleEvent(event as unknown as V2UnknownEvent);
+        })
+      );
+    }
+
     disposers.push(
-      ctx.data.on(type, (event) => {
-        meter.handleEvent(event as unknown as V2UnknownEvent);
+      ctx.ui.slot({
+        // AFTER, not append. The host's own child inside prompt.footer.status is a box with
+        // flexGrow:1, and while a turn is running it renders a second flexGrow:1 box holding
+        // the spinner and the "esc interrupt" hint. Appending places the meter INSIDE that
+        // boundary, after the greedy child, so it collapses to zero width the moment anything
+        // runs — thinking, tool calls, or compaction — and only reappears once idle.
+        //
+        // `after` makes the meter a SIBLING of the status box rather than a child, so the
+        // greedy layout cannot reach it, while the box's flexGrow:1 still pushes the meter to
+        // the right of the spinner. MeterView's flexShrink={0} holds its width.
+        after: "prompt.footer.status",
+        render: (input) => (
+          <MeterView
+            input={input}
+            theme={ctx.theme}
+            config={config}
+            mode={mode}
+            snapshots={snapshots}
+            session={ctx.data.session}
+          />
+        ),
       })
     );
+  } catch (error) {
+    cleanup();
+    throw error;
   }
-
-  // The footer meter is the ONE surface that must exist. It is claimed first and outside any
-  // guard, so a failure in an optional surface below can never cost us the meter itself.
-  disposers.push(
-    ctx.ui.slot({
-      // AFTER, not append. The host's own child inside prompt.footer.status is a box with
-      // flexGrow:1, and while a turn is running it renders a second flexGrow:1 box holding
-      // the spinner and the "esc interrupt" hint. Appending places the meter INSIDE that
-      // boundary, after the greedy child, so it collapses to zero width the moment anything
-      // runs — thinking, tool calls, or compaction — and only reappears once idle.
-      //
-      // `after` makes the meter a SIBLING of the status box rather than a child, so the
-      // greedy layout cannot reach it, while the box's flexGrow:1 still pushes the meter to
-      // the right of the spinner. MeterView's flexShrink={0} holds its width.
-      after: "prompt.footer.status",
-      render: (input) => (
-        <MeterView
-          input={input}
-          theme={ctx.theme}
-          config={config}
-          mode={mode}
-          snapshots={snapshots}
-        />
-      ),
-    })
-  );
 
   /**
    * Registers an optional surface.
@@ -520,14 +678,7 @@ export function setupTui(ctx: V2TuiContext): V2Cleanup | void {
     );
   }
 
-  return () => {
-    for (const dispose of disposers) {
-      dispose();
-    }
-    disposers.length = 0;
-    meter.dispose();
-    setSnapshots(() => new Map<string, V2Snapshot>());
-  };
+  return cleanup;
 }
 
 /** v2 TUI plugin definition. Structurally what `Plugin.define` from `@opencode-ai/plugin/tui` returns. */
