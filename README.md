@@ -333,7 +333,8 @@ cache hit rate = cache.read / (input + cache.read + cache.write)
 
 The meter appends `cache 91%` to the footer once a provider-reported step has settled. During
 streaming no cache accounting is available yet, so the segment is omitted rather than shown as
-`0%`. Toggle with `showCacheHit` / `TPS_METER_SHOW_CACHE_HIT`.
+`0%` — nothing appears until the first step of a session has finished, which is expected and not
+a fault. Toggle with `showCacheHit` / `TPS_METER_SHOW_CACHE_HIT`.
 
 ## Display Formats
 

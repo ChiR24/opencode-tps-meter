@@ -423,6 +423,57 @@ describe("v2 meter", () => {
     }
   });
 
+  it("sends a tool-call-only step's cache accounting to the footer", async () => {
+    const { meter, snapshot } = createHarness();
+
+    // Step 1 streams text and reports a 10% hit rate.
+    meter.handleEvent(textDelta("ses_1", "some streamed output here"));
+    await delay(40);
+    meter.handleEvent(
+      stepEndedWithCache("ses_1", "tool-calls", { input: 900, output: 5, cacheRead: 100 })
+    );
+    const first = snapshot("ses_1");
+    expect(first?.cacheReadTokens).toBe(100);
+    expect(first?.sessionCacheReadTokens).toBe(100);
+
+    // Step 2 ends in a tool call without streaming text or reasoning, so no session state is
+    // created. Its 90% step must still reach the footer, and the session total must advance.
+    meter.handleEvent(
+      stepEndedWithCache("ses_1", "tool-calls", { input: 100, output: 5, cacheRead: 900 }, "msg_2")
+    );
+
+    const second = snapshot("ses_1");
+    expect(second?.cacheReadTokens).toBe(900);
+    expect(second?.inputTokens).toBe(100);
+    expect(second?.sessionCacheReadTokens).toBe(1000);
+    expect(second?.sessionInputTokens).toBe(1000);
+    expect(second?.active).toBe(false);
+
+    meter.dispose();
+  });
+
+  it("sends a no-delta step's cache accounting to the footer when the turn ends", async () => {
+    const { meter, snapshot } = createHarness();
+
+    meter.handleEvent(textDelta("ses_1", "some streamed output here"));
+    await delay(40);
+    meter.handleEvent(
+      stepEndedWithCache("ses_1", "tool-calls", { input: 900, output: 5, cacheRead: 100 })
+    );
+
+    // The final step reports tokens but streams nothing, so there is no tracker to publish.
+    meter.handleEvent(
+      stepEndedWithCache("ses_1", "stop", { input: 100, output: 5, cacheRead: 900 }, "msg_2")
+    );
+
+    const final = snapshot("ses_1");
+    expect(final?.cacheReadTokens).toBe(900);
+    expect(final?.sessionCacheReadTokens).toBe(1000);
+    expect(final?.sessionInputTokens).toBe(1000);
+
+    meter.dispose();
+  });
+
   it("ignores non-numeric provider token counts instead of concatenating them", async () => {
     const { meter, snapshot } = createHarness();
     meter.handleEvent(textDelta("ses_1", "abcdefghijkl"));

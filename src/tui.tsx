@@ -3,7 +3,13 @@ import { createMemo, createSignal, Show } from "solid-js";
 import { createTracker } from "./tracker.js";
 import { createTokenizer, createIncrementalCounter, type IncrementalCounter } from "./tokenCounter.js";
 import { defaultConfig, loadConfigSync } from "./config.js";
-import { COUNTABLE_PART_TYPES, INVALID_FINISH_REASONS, TOOL_CALL_FINISH_REASON } from "./constants.js";
+import {
+  CLEANUP_INTERVAL_MS,
+  COUNTABLE_PART_TYPES,
+  INVALID_FINISH_REASONS,
+  MAX_MESSAGE_AGE_MS,
+  TOOL_CALL_FINISH_REASON,
+} from "./constants.js";
 import { formatMeterText } from "./format.js";
 import type { Config } from "./types.js";
 import { setupTui as setupTuiV2 } from "./v2/tui.js";
@@ -110,6 +116,10 @@ const tui: TuiPlugin = async (api) => {
   // completed message can be updated more than once (structured-output attach), so only the
   // increment since the previous update for that message may be added.
   const accountedCacheUsage = new Map<string, Map<string, SessionCacheUsage>>();
+  // When each session last reported cache accounting, so a long-running TUI can prune the
+  // maps above once a session goes quiet.
+  const cacheAccountingSeenAt = new Map<string, number>();
+  let lastCacheSweepAt = 0;
   // Part-type keys hold accumulated TEXT (the full-part path diffs against it); the `:live`
   // key holds an incremental counter, since it was only ever read to compute a token
   // difference and re-counting the whole string per delta is O(total).
@@ -145,10 +155,39 @@ const tui: TuiPlugin = async (api) => {
   function getSessionCacheUsage(sessionId: string): SessionCacheUsage {
     let usage = sessionCacheUsage.get(sessionId);
     if (!usage) {
-      usage = { read: 0, write: 0, input: 0 };
+      // A pruned session can resume while its reading is still on screen. Seed the totals
+      // from that snapshot so the session rate continues instead of restarting at zero.
+      const retained = snapshots().get(sessionId);
+      usage = {
+        read: retained?.sessionCacheReadTokens ?? 0,
+        write: retained?.sessionCacheWriteTokens ?? 0,
+        input: retained?.sessionInputTokens ?? 0,
+      };
       sessionCacheUsage.set(sessionId, usage);
     }
+    cacheAccountingSeenAt.set(sessionId, Date.now());
     return usage;
+  }
+
+  /**
+   * Drops cache accounting for sessions that have gone quiet, so a long-running TUI cannot
+   * grow the accounting maps without bound. The reading is kept; a resumed session seeds a
+   * fresh entry from its snapshot, mirroring the v2 stale sweep.
+   */
+  function sweepCacheAccounting(now: number): void {
+    if (now - lastCacheSweepAt < CLEANUP_INTERVAL_MS) {
+      return;
+    }
+    lastCacheSweepAt = now;
+
+    for (const [sessionId, seenAt] of cacheAccountingSeenAt) {
+      if (now - seenAt <= MAX_MESSAGE_AGE_MS) {
+        continue;
+      }
+      sessionCacheUsage.delete(sessionId);
+      accountedCacheUsage.delete(sessionId);
+      cacheAccountingSeenAt.delete(sessionId);
+    }
   }
 
   /**
@@ -391,6 +430,7 @@ const tui: TuiPlugin = async (api) => {
   disposers.push(api.event.on("message.updated", (event) => {
     const info = event.properties.info;
     const sessionId = event.properties.sessionID || info.sessionID;
+    sweepCacheAccounting(Date.now());
     const roleCache = messageRoles.get(sessionId) ?? new Map<string, Role>();
     messageRoles.set(sessionId, roleCache);
     roleCache.set(info.id, info.role);
@@ -509,6 +549,7 @@ const tui: TuiPlugin = async (api) => {
     messageRoles.clear();
     sessionCacheUsage.clear();
     accountedCacheUsage.clear();
+    cacheAccountingSeenAt.clear();
     for (const timer of publishTimers.values()) {
       clearTimeout(timer);
     }

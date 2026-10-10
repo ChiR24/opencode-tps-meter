@@ -104,6 +104,12 @@ export interface V2Snapshot {
   sessionInputTokens: number;
 }
 
+/** Provider cache accounting for a single settled step. */
+type StepCacheFields = Pick<
+  V2Snapshot,
+  "cacheReadTokens" | "cacheWriteTokens" | "inputTokens"
+>;
+
 /** One settled step, emitted for durable rollups. Interrupted turns are never emitted. */
 export interface V2StepMeasurement {
   sessionID: string;
@@ -513,12 +519,20 @@ export function createMeter(config: Config, hooks?: V2MeterHooks): V2Meter {
     totalTokens: number,
     avgTps: number,
     elapsedMs: number,
-    overheadTokens: number
-  ): void {
+    overheadTokens: number,
+    stepCache?: StepCacheFields
+  ): boolean {
     if (totalTokens === 0 || elapsedMs < config.initialDisplayDelayMs) {
-      return;
+      return false;
     }
     const state = sessions.get(sessionID);
+    // Prefer the settled step's own accounting: a step with no deltas never created state,
+    // and reading from it would drop that step's cache figures from the footer.
+    const cacheFields = stepCache ?? {
+      cacheReadTokens: state?.cacheReadTokens ?? 0,
+      cacheWriteTokens: state?.cacheWriteTokens ?? 0,
+      inputTokens: state?.inputTokens ?? 0,
+    };
     mutateSnapshots((draft) => {
       draft.set(sessionID, {
         sessionID,
@@ -528,13 +542,29 @@ export function createMeter(config: Config, hooks?: V2MeterHooks): V2Meter {
         elapsedMs,
         active: false,
         overheadTokens,
-        cacheReadTokens: state?.cacheReadTokens ?? 0,
-        cacheWriteTokens: state?.cacheWriteTokens ?? 0,
-        inputTokens: state?.inputTokens ?? 0,
+        ...cacheFields,
         ...sessionCacheFields(sessionID),
         ...derivedFields(sessionID, totalTokens, elapsedMs),
       });
     });
+    return true;
+  }
+
+  /**
+   * Merges cache accounting into an existing reading without touching TPS fields.
+   *
+   * Used when a settled step has no publishing path of its own — no deltas means no tracker
+   * and no elapsed window — so its cache figures still reach the footer.
+   */
+  function mergeSnapshotCache(sessionID: string, stepCache: StepCacheFields): boolean {
+    const current = snapshots.get(sessionID);
+    if (!current) {
+      return false;
+    }
+    mutateSnapshots((draft) => {
+      draft.set(sessionID, { ...current, ...stepCache, ...sessionCacheFields(sessionID) });
+    });
+    return true;
   }
 
   function clearActiveSnapshot(sessionID: string): void {
@@ -549,22 +579,41 @@ export function createMeter(config: Config, hooks?: V2MeterHooks): V2Meter {
   /**
    * Freezes the meter at its last value instead of clearing it, so the reading stays
    * on screen between tool calls and after the turn ends.
+   *
+   * `stepCache` carries a settled step's provider cache accounting, so a step that produced
+   * no deltas (and therefore never created session state) still updates the footer. Returns
+   * whether a reading was written.
    */
-  function persistIdleSnapshot(sessionID: string, now: number): void {
+  function persistIdleSnapshot(
+    sessionID: string,
+    now: number,
+    stepCache?: StepCacheFields
+  ): boolean {
     const state = sessions.get(sessionID);
     if (state && state.tracker.getTotalTokens() > 0) {
       if (state.firstTokenAt !== null && now - state.firstTokenAt >= config.initialDisplayDelayMs) {
         publish(sessionID, false, now);
-        return;
+        return true;
       }
     }
 
     const current = snapshots.get(sessionID);
-    if (current?.active) {
-      mutateSnapshots((draft) => {
-        draft.set(sessionID, { ...current, active: false });
-      });
+    if (!current) {
+      return false;
     }
+    // Without step accounting there is nothing new to show unless the reading was active.
+    if (!current.active && !stepCache) {
+      return false;
+    }
+    mutateSnapshots((draft) => {
+      draft.set(sessionID, {
+        ...current,
+        active: false,
+        ...(stepCache ?? {}),
+        ...sessionCacheFields(sessionID),
+      });
+    });
+    return true;
   }
 
   /**
@@ -728,22 +777,30 @@ export function createMeter(config: Config, hooks?: V2MeterHooks): V2Meter {
     const { sessionID, finish, tokens } = event.data;
     const now = eventTime(event, Date.now());
 
-    // Capture prompt cache accounting before any early return so a tool-calls step still
-    // freezes its cache numbers alongside its TPS.
+    // Capture the step's prompt cache accounting before any early return, so a tool-calls
+    // step still freezes its cache numbers alongside its TPS. Kept in locals rather than
+    // only on session state, because a step with no text/reasoning deltas never creates
+    // state and must still reach the footer.
+    const stepCache: StepCacheFields = {
+      cacheReadTokens: toTokenCount(tokens?.cache?.read),
+      cacheWriteTokens: toTokenCount(tokens?.cache?.write),
+      inputTokens: toTokenCount(tokens?.input),
+    };
+
     const stepState = sessions.get(sessionID);
     if (stepState) {
-      stepState.cacheReadTokens = toTokenCount(tokens?.cache?.read);
-      stepState.cacheWriteTokens = toTokenCount(tokens?.cache?.write);
-      stepState.inputTokens = toTokenCount(tokens?.input);
+      stepState.cacheReadTokens = stepCache.cacheReadTokens;
+      stepState.cacheWriteTokens = stepCache.cacheWriteTokens;
+      stepState.inputTokens = stepCache.inputTokens;
     }
 
     // Fold this step's cache accounting into the session rollup. Done before any early
     // return so a tool-calls step contributes too, and so the session rate stays on screen
     // while the next step streams (this state outlives resetSession).
     const sessionUsageForStep = getSessionUsage(sessionID);
-    sessionUsageForStep.cacheReadTokens += toTokenCount(tokens?.cache?.read);
-    sessionUsageForStep.cacheWriteTokens += toTokenCount(tokens?.cache?.write);
-    sessionUsageForStep.inputTokens += toTokenCount(tokens?.input);
+    sessionUsageForStep.cacheReadTokens += stepCache.cacheReadTokens;
+    sessionUsageForStep.cacheWriteTokens += stepCache.cacheWriteTokens;
+    sessionUsageForStep.inputTokens += stepCache.inputTokens;
 
     // Every settled step consumed tokens, including one that ends to run tools — record it
     // before any early return or the overhead residual overcounts.
@@ -757,7 +814,7 @@ export function createMeter(config: Config, hooks?: V2MeterHooks): V2Meter {
     // A step that ends to run tools is not the end of the turn — hold the last reading
     // on screen so the meter does not blink out between tool calls.
     if (finish === TOOL_CALL_FINISH_REASON) {
-      persistIdleSnapshot(sessionID, now);
+      persistIdleSnapshot(sessionID, now, stepCache);
       resetSession(sessionID);
       return;
     }
@@ -777,7 +834,19 @@ export function createMeter(config: Config, hooks?: V2MeterHooks): V2Meter {
     const elapsedMs = state?.firstTokenAt ? Math.max(0, now - state.firstTokenAt) : 0;
     const avgTps = elapsedMs > 0 ? totalTokens / (elapsedMs / 1000) : 0;
 
-    publishFinal(sessionID, totalTokens, avgTps, elapsedMs, overheadFor(sessionID));
+    const published = publishFinal(
+      sessionID,
+      totalTokens,
+      avgTps,
+      elapsedMs,
+      overheadFor(sessionID),
+      stepCache
+    );
+    if (!published) {
+      // No deltas means no tracker and no elapsed window to publish, but the step's cache
+      // accounting should still reach the retained reading.
+      mergeSnapshotCache(sessionID, stepCache);
+    }
 
     // Feed the durable rollup. An aborted turn is excluded: its elapsed window is truncated
     // at an arbitrary point, so folding it in would drag every average down.

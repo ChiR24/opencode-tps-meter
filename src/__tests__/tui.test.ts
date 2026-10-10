@@ -350,6 +350,76 @@ describe("TUI plugin", () => {
     expect(frame).not.toContain("session cache 33%");
   });
 
+  it("keeps session cache totals continuous across a stale-accounting prune", async () => {
+    const { handlers, slotPlugin, testRender, theme } = await createHarness();
+    const { CLEANUP_INTERVAL_MS, MAX_MESSAGE_AGE_MS } = await import("../constants.js");
+
+    const messageUpdated = handlers.get("message.updated");
+    if (!messageUpdated) {
+      throw new Error("message.updated handler was not registered");
+    }
+
+    const realNow = Date.now;
+    let clock = realNow.call(Date);
+    Date.now = () => clock;
+
+    try {
+      const emit = (id: string, input: number, read: number) =>
+        messageUpdated({
+          type: "message.updated",
+          properties: {
+            sessionID: "session-cont",
+            info: {
+              id,
+              sessionID: "session-cont",
+              role: "assistant",
+              time: { created: clock - 1000, completed: clock },
+              parentID: "parent-1",
+              modelID: "model",
+              providerID: "provider",
+              mode: "chat",
+              agent: "build",
+              path: { cwd: ".", root: "." },
+              cost: 0,
+              tokens: {
+                input,
+                output: 10,
+                reasoning: 0,
+                cache: { read, write: 0 },
+              },
+              finish: "stop",
+            },
+          },
+        });
+
+      // Step one: 0% cached (100 input, 0 read).
+      emit("message-1", 100, 0);
+
+      // Go quiet past the stale threshold; the next message prunes the session's accounting.
+      clock += MAX_MESSAGE_AGE_MS + CLEANUP_INTERVAL_MS + 1;
+      // Step two: 100% cached (0 input, 100 read). The session must continue at 100/200 = 50%,
+      // not restart at 100%.
+      emit("message-2", 0, 100);
+
+      const slot = slotPlugin?.slots.session_prompt_right;
+      if (!slot) {
+        throw new Error("session_prompt_right slot was not registered");
+      }
+
+      const setup = await testRender(() => slot({ theme }, { session_id: "session-cont" }), {
+        width: 200,
+        height: 5,
+      });
+      await setup.flush();
+      const frame = setup.captureCharFrame();
+
+      expect(frame).toContain("session cache 50%");
+      expect(frame).not.toContain("session cache 100%");
+    } finally {
+      Date.now = realNow;
+    }
+  });
+
   it("caches zero-token deltas before full part updates", async () => {
     process.env.TPS_METER_FALLBACK_HEURISTIC = "words_div_0_75";
 
