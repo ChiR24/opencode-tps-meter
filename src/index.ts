@@ -795,7 +795,11 @@ function handleMessagePartUpdated(event: MessageEvent): void {
 
         if (shouldShowFinalStats) {
           // Display final stats
-          ui.showFinalStats(totalTokens, avgTps, elapsedMs);
+          ui.showFinalStats(totalTokens, avgTps, elapsedMs, {
+            read: info.tokens?.cache?.read ?? 0,
+            write: info.tokens?.cache?.write ?? 0,
+            input: info.tokens?.input ?? 0,
+          });
 
           logger.info(
             `[TpsMeter] Session ${sessionId} complete: ${totalTokens} tokens in ${(elapsedMs / 1000).toFixed(1)}s (avg ${avgTps.toFixed(1)} TPS)`

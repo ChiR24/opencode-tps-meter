@@ -3,8 +3,20 @@
  * Handles display of token processing statistics with throttling and dual-mode support
  */
 
-import type { Config, OpenCodeClient, DisplayState, AgentDisplayState, UIManager as IUIManager } from "./types.js";
+import type { Config, OpenCodeClient, DisplayState, AgentDisplayState, TokenCacheInfo, UIManager as IUIManager } from "./types.js";
 import { MIN_TOAST_INTERVAL_MS, DEFAULT_TOAST_DURATION_MS, FINAL_STATS_DURATION_MS } from "./constants.js";
+
+/** Prompt cache hit rate as a whole-percent string, or null when unknown. */
+function formatCacheHit(cache?: TokenCacheInfo): string | null {
+  if (!cache) {
+    return null;
+  }
+  const promptTokens = cache.read + cache.write + cache.input;
+  if (promptTokens <= 0) {
+    return null;
+  }
+  return `${Math.round((cache.read / promptTokens) * 100)}%`;
+}
 
 /**
  * Creates a UIManager instance
@@ -23,7 +35,7 @@ export function createUIManager(
   // Private state - with safe defaults
   const uiConfig: Pick<
     Config,
-    "updateIntervalMs" | "format" | "showAverage" | "showInstant" | "showTotalTokens" | "showElapsed" | "enableColorCoding" | "slowTpsThreshold" | "fastTpsThreshold"
+    "updateIntervalMs" | "format" | "showAverage" | "showInstant" | "showTotalTokens" | "showElapsed" | "showCacheHit" | "enableColorCoding" | "slowTpsThreshold" | "fastTpsThreshold"
   > = {
     updateIntervalMs: config?.updateIntervalMs ?? 50,
     format: config?.format ?? "compact",
@@ -31,6 +43,7 @@ export function createUIManager(
     showInstant: config?.showInstant ?? true,
     showTotalTokens: config?.showTotalTokens ?? true,
     showElapsed: config?.showElapsed ?? false,
+    showCacheHit: config?.showCacheHit ?? true,
     enableColorCoding: config?.enableColorCoding ?? false,
     slowTpsThreshold: config?.slowTpsThreshold ?? 10,
     fastTpsThreshold: config?.fastTpsThreshold ?? 50,
@@ -87,6 +100,13 @@ export function createUIManager(
 
     if (uiConfig.showElapsed) {
       parts.push(formatElapsedTime(state.elapsedMs));
+    }
+
+    if (uiConfig.showCacheHit) {
+      const cache = formatCacheHit(state.cache);
+      if (cache !== null) {
+        parts.push(`cache: ${cache}`);
+      }
     }
 
     return parts.length > 0 ? parts.join(" | ") : "TPS meter";
@@ -304,13 +324,15 @@ export function createUIManager(
       avgTps: number,
       totalTokens: number,
       elapsedMs: number,
-      agents?: AgentDisplayState[]
+      agents?: AgentDisplayState[],
+      cache?: TokenCacheInfo
     ): void {
       pendingState = {
         instantTps,
         avgTps,
         totalTokens,
         elapsedMs,
+        cache,
         agents: agents && agents.length > 0 ? agents : undefined,
       };
       scheduleFlush();
@@ -322,7 +344,12 @@ export function createUIManager(
      * @param avgTps - Average TPS value
      * @param elapsedMs - Elapsed time in milliseconds
      */
-    showFinalStats(totalTokens: number, avgTps: number, elapsedMs: number): void {
+    showFinalStats(
+      totalTokens: number,
+      avgTps: number,
+      elapsedMs: number,
+      cache?: TokenCacheInfo
+    ): void {
       // Flush any pending updates first to ensure latest state is captured
       flushPendingUpdate();
 
@@ -335,6 +362,7 @@ export function createUIManager(
         avgTps,
         totalTokens,
         elapsedMs,
+        cache,
       };
 
       const formatted = formatDisplay(state);

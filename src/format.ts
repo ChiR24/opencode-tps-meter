@@ -16,6 +16,60 @@ export interface MeterReading {
   elapsedMs: number;
   /** True while tokens are actively streaming. */
   active: boolean;
+  /** Prompt tokens served from the cache (provider-reported). */
+  cacheReadTokens?: number;
+  /** Prompt tokens written to the cache (provider-reported). */
+  cacheWriteTokens?: number;
+  /** Uncached prompt input tokens (provider-reported). */
+  inputTokens?: number;
+  /** Cached prompt tokens summed over the whole session (provider-reported). */
+  sessionCacheReadTokens?: number;
+  /** Prompt tokens written to the cache over the whole session (provider-reported). */
+  sessionCacheWriteTokens?: number;
+  /** Uncached prompt input tokens over the whole session (provider-reported). */
+  sessionInputTokens?: number;
+}
+
+/**
+ * Prompt cache hit rate in the range 0..1, or null when no prompt accounting is known.
+ *
+ * OpenCode's `tokens.input` excludes cache reads and writes (verified against the session
+ * store: `total === input + output + reasoning + cache.read + cache.write`), so the whole
+ * prompt side is `input + read + write` and the hit rate is the cached share of it.
+ */
+export function cacheHitRatio(
+  reading: Pick<MeterReading, "cacheReadTokens" | "cacheWriteTokens" | "inputTokens">
+): number | null {
+  const read = reading.cacheReadTokens ?? 0;
+  const write = reading.cacheWriteTokens ?? 0;
+  const input = reading.inputTokens ?? 0;
+  const promptTokens = read + write + input;
+  if (promptTokens <= 0) {
+    return null;
+  }
+  return read / promptTokens;
+}
+
+/** Formats a 0..1 ratio as a whole-percent string, e.g. "91%". */
+export function formatCacheHit(reading: MeterReading): string | null {
+  const ratio = cacheHitRatio(reading);
+  return ratio === null ? null : `${Math.round(ratio * 100)}%`;
+}
+
+/**
+ * Session-wide cache hit rate, aggregated over every reported step.
+ *
+ * Unlike `formatCacheHit` (which reflects only the latest step), this survives across
+ * steps, so it stays on screen while the next step streams and answers "how much of all
+ * prompt tokens this session were cache reads".
+ */
+export function formatSessionCacheHit(reading: MeterReading): string | null {
+  const ratio = cacheHitRatio({
+    cacheReadTokens: reading.sessionCacheReadTokens,
+    cacheWriteTokens: reading.sessionCacheWriteTokens,
+    inputTokens: reading.sessionInputTokens,
+  });
+  return ratio === null ? null : `${Math.round(ratio * 100)}%`;
 }
 
 /** Formats a token count with thousands separators. */
@@ -53,6 +107,16 @@ export function formatMeterText(reading: MeterReading, config: Config): string {
   }
   if (config.showElapsed) {
     parts.push(formatElapsedTime(reading.elapsedMs));
+  }
+  if (config.showCacheHit) {
+    const cache = formatCacheHit(reading);
+    if (cache !== null) {
+      parts.push(`cache ${cache}`);
+    }
+    const sessionCache = formatSessionCacheHit(reading);
+    if (sessionCache !== null) {
+      parts.push(`session cache ${sessionCache}`);
+    }
   }
 
   return parts.length > 0 ? parts.join(" · ") : "TPS meter";
