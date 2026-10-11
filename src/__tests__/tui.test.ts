@@ -350,6 +350,66 @@ describe("TUI plugin", () => {
     expect(frame).not.toContain("session cache 33%");
   });
 
+  it("shows a tool-call-only step's cache accounting in the footer", async () => {
+    const { handlers, slotPlugin, testRender, theme } = await createHarness();
+
+    const messageUpdated = handlers.get("message.updated");
+    if (!messageUpdated) {
+      throw new Error("message.updated handler was not registered");
+    }
+
+    const completedAt = Date.now();
+    const emitCompleted = (id: string, input: number, read: number, finish: string) =>
+      messageUpdated({
+        type: "message.updated",
+        properties: {
+          sessionID: "session-tool",
+          info: {
+            id,
+            sessionID: "session-tool",
+            role: "assistant",
+            time: { created: completedAt - 1000, completed: completedAt },
+            parentID: "parent-1",
+            modelID: "model",
+            providerID: "provider",
+            mode: "chat",
+            agent: "build",
+            path: { cwd: ".", root: "." },
+            cost: 0,
+            tokens: {
+              input,
+              output: 10,
+              reasoning: 0,
+              cache: { read, write: 0 },
+            },
+            finish,
+          },
+        },
+      });
+
+    // Step one publishes a reading at 10% cached.
+    emitCompleted("message-1", 900, 100, "stop");
+    // Step two ends in a tool call without streaming any text, so it has no reading of its
+    // own. Its 90% must still replace the stale 10%, and the session moves to 1000/2000.
+    emitCompleted("message-2", 100, 900, "tool-calls");
+
+    const slot = slotPlugin?.slots.session_prompt_right;
+    if (!slot) {
+      throw new Error("session_prompt_right slot was not registered");
+    }
+
+    const setup = await testRender(() => slot({ theme }, { session_id: "session-tool" }), {
+      width: 200,
+      height: 5,
+    });
+    await setup.flush();
+    const frame = setup.captureCharFrame();
+
+    expect(frame).toContain("cache 90%");
+    expect(frame).toContain("session cache 50%");
+    expect(frame).not.toContain("cache 10%");
+  });
+
   it("keeps session cache totals continuous across a stale-accounting prune", async () => {
     const { handlers, slotPlugin, testRender, theme } = await createHarness();
     const { CLEANUP_INTERVAL_MS, MAX_MESSAGE_AGE_MS } = await import("../constants.js");

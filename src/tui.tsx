@@ -577,27 +577,37 @@ const tui: TuiPlugin = async (api) => {
     }
   }
 
-  function persistIdleSnapshot(sessionId: string, now: number = Date.now()): void {
+  /**
+   * `stepCache` carries a settled step's provider cache accounting. A step that streamed no
+   * tokens (a tool call alone) never publishes a reading of its own, so without it the footer
+   * would keep showing the previous step's cache figures.
+   */
+  function persistIdleSnapshot(
+    sessionId: string,
+    now: number = Date.now(),
+    stepCache?: Pick<TuiSnapshot, "cacheReadTokens" | "cacheWriteTokens" | "inputTokens">
+  ): void {
     const state = sessions.get(sessionId);
-    if (state?.tracker.getTotalTokens()) {
-      if (state.firstTokenAt !== null && now - state.firstTokenAt >= config.initialDisplayDelayMs) {
-        publish(sessionId, false, now);
-        return;
-      }
-
-      const current = snapshots().get(sessionId);
-      if (!current?.active) {
-        return;
-      }
-
-      setSnapshots((existing) => new Map(existing).set(sessionId, { ...current, active: false }));
+    if (
+      state?.tracker.getTotalTokens() &&
+      state.firstTokenAt !== null &&
+      now - state.firstTokenAt >= config.initialDisplayDelayMs
+    ) {
+      publish(sessionId, false, now);
       return;
     }
 
     const current = snapshots().get(sessionId);
-    if (current?.active) {
-      setSnapshots((existing) => new Map(existing).set(sessionId, { ...current, active: false }));
+    if (!current || (!current.active && !stepCache)) {
+      return;
     }
+    setSnapshots((existing) =>
+      new Map(existing).set(sessionId, {
+        ...current,
+        active: false,
+        ...(stepCache && { ...stepCache, ...sessionCacheFields(sessionId) }),
+      })
+    );
   }
 
   function countTokenDifference(previousText: string, nextText: string): number {
@@ -722,7 +732,11 @@ const tui: TuiPlugin = async (api) => {
     sessionCacheForStep.input += stepCache.input;
 
     if (info.finish === TOOL_CALL_FINISH_REASON) {
-      persistIdleSnapshot(sessionId, info.time.completed);
+      persistIdleSnapshot(sessionId, info.time.completed, {
+        cacheReadTokens,
+        cacheWriteTokens,
+        inputTokens,
+      });
       resetSession(sessionId);
       return;
     }
