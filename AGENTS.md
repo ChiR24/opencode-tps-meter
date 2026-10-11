@@ -83,7 +83,7 @@ OpenCode plugin that tracks AI token throughput in real-time. Displays TPS stati
    "server")`, which requires a `server()` function on whatever `./server` points at. The `/v2`
    exports are for programmatic `import` only. Locked in by the "resolves ./server and ./tui to
    modules valid on both plugin loaders" test in `src/__tests__/v2.test.ts`.
-7. **Register local builds at `<repo>/dist`, not the repo root.** The installed v2.0.2 resolves a
+7. **Register local builds at `<repo>/dist`, not the repo root.** The installed v2 resolves a
    LOCAL plugin directory by file path — it tries `<dir>/server` then `<dir>/index` for the server
    and `<dir>/tui` for the TUI (adding `.ts/.tsx/.js/.jsx/.mts/.mjs/.cts/.cjs`). It only consults
    `package.json#exports` when the target is an npm package (`target.name` set), so the repo root

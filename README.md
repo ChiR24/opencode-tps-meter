@@ -57,7 +57,7 @@ One package supports both OpenCode generations. They install as separate binarie
 | Default export shape | function *or* `{ id, server }` | `{ id, setup }` (object required) |
 | Toast fallback | Available (opt-in) | Not available — v2 server plugins have no UI surface |
 
-> Verified against OpenCode **2.0.2** (server reports `features: server+tui, status: active`), whose shipped binary implements the v2 TUI plugin API this package targets — its own built-in TUI plugins (`opencode.notifications`, `diff-viewer`) use `Plugin.define({ id, setup })` with `ctx.ui.slot({ append, render })` and `ctx.data.on(...)`. Also verified against `opencode2` beta `0.0.0-beta-17639`.
+> Tested on OpenCode v2 (server reports `features: server+tui, status: active`), whose shipped binary implements the v2 TUI plugin API this package targets — its own built-in TUI plugins (`opencode.notifications`, `diff-viewer`) use `Plugin.define({ id, setup })` with `ctx.ui.slot({ append, render })` and `ctx.data.on(...)`.
 
 ---
 

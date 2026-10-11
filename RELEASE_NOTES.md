@@ -1,7 +1,7 @@
 ## v0.4.0 — OpenCode v2 support (stable)
 
-Promotes `v0.4.0-beta.1` to stable with loader fixes verified end to end against
-OpenCode **2.0.2**: the server reports
+Promotes `v0.4.0-beta.1` to stable with loader fixes tested end to end on
+OpenCode v2: the server reports
 `"features":{"server":true,"tui":true},"state":{"status":"active"}` for the
 plugin, and the meter renders in the TUI prompt footer. Install with
 `opencode-tps-meter@latest`. Everything in the beta.1 notes below carries over.
@@ -17,7 +17,7 @@ plugin, and the meter renders in the TUI prompt footer. Install with
   `dist/v2/server.mjs` (`{ id, setup }`) fails the v1 `server()` requirement.
   The `/v2` exports remain for programmatic `import` only.
 - **Local `file://` installs must target `<package>/dist`, not the repo root.**
-  The 2.0.2 resolver handles local directories by file path (`<dir>/server`,
+  The v2 resolver handles local directories by file path (`<dir>/server`,
   `<dir>/index`, `<dir>/tui`) and ignores `package.json#exports` there, so the
   repo root (no root `index.*`) is silently skipped. `dist/` contains both
   `index.mjs` (server) and `tui.mjs` (TUI).
