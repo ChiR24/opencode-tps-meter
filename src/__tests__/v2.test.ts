@@ -1107,6 +1107,54 @@ describe("v2 theme normalization", () => {
 
     await (cleanup as unknown as () => void | Promise<void>)?.();
   });
+
+  it("colors the footer meter from the normalized theme, not the raw host theme", async () => {
+    const { testRender } = await import("@opentui/solid");
+    const { RGBA } = await import("@opentui/core");
+
+    // Distinct from any renderer default, so an unresolved color cannot pass by accident.
+    const live = RGBA.fromInts(0, 200, 100, 255);
+    const muted = RGBA.fromInts(90, 90, 90, 255);
+    const { handlers, claims, cleanup } = await setupWithTheme({
+      text: {
+        base: live,
+        muted,
+        feedback: {
+          error: { base: live },
+          warning: { base: live },
+          success: { base: live },
+          info: { base: live },
+        },
+      },
+    });
+
+    handlers.get("session.text.delta")!(
+      textDelta("ses-fg", "hello there, streaming tokens at a decent clip")
+    );
+    await delay(120);
+
+    const footer = claims.find((claim) => claim.after === "prompt.footer.status");
+    expect(footer).toBeDefined();
+
+    const setup = await testRender(() => footer!.render({ sessionID: "ses-fg" }), {
+      width: 80,
+      height: 5,
+    });
+    await setup.flush();
+
+    const span = setup
+      .captureSpans()
+      .lines.flatMap((line) => line.spans)
+      .find((s) => s.text.includes("TPS"));
+    expect(span).toBeDefined();
+    // The raw host theme has no text.default/text.subdued, so passing ctx.theme straight to the
+    // footer leaves fg unresolved; only the normalized theme yields one of these colors.
+    expect([live.toInts().join(","), muted.toInts().join(",")]).toContain(
+      span!.fg.toInts().join(",")
+    );
+
+    await (cleanup as unknown as () => void | Promise<void>)?.();
+  });
 });
 
 describe("v2 metrics", () => {
