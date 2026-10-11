@@ -37,6 +37,7 @@ export const defaultConfig: Config = {
   showInstant: true,
   showTotalTokens: true,
   showElapsed: false,
+  showCacheHit: true,
   format: "compact",
   minVisibleTPS: 0,
   fallbackTokenHeuristic: "chars_div_4",
@@ -147,6 +148,9 @@ function mergeConfig(partial: Partial<Config>, defaults: Config): Config {
     showElapsed: isBoolean(partial.showElapsed)
       ? partial.showElapsed
       : defaults.showElapsed,
+    showCacheHit: isBoolean(partial.showCacheHit)
+      ? partial.showCacheHit
+      : defaults.showCacheHit,
     format:
       isString(partial.format) &&
       ["compact", "verbose", "minimal"].includes(partial.format)
@@ -211,6 +215,7 @@ function loadConfigFile(filePath: string): Partial<Config> | null {
  * - TPS_METER_SHOW_INSTANT (boolean)
  * - TPS_METER_SHOW_TOTAL_TOKENS (boolean)
  * - TPS_METER_SHOW_ELAPSED (boolean)
+ * - TPS_METER_SHOW_CACHE_HIT (boolean)
  * - TPS_METER_FORMAT (string: compact/verbose/minimal)
  * - TPS_METER_MIN_VISIBLE_TPS (number)
  * - TPS_METER_FALLBACK_HEURISTIC (string: chars_div_4/chars_div_3/words_div_0_75)
@@ -261,6 +266,10 @@ function loadEnvConfig(): Partial<Config> {
 
   if (process.env.TPS_METER_SHOW_ELAPSED !== undefined) {
     envConfig.showElapsed = process.env.TPS_METER_SHOW_ELAPSED === "true";
+  }
+
+  if (process.env.TPS_METER_SHOW_CACHE_HIT !== undefined) {
+    envConfig.showCacheHit = process.env.TPS_METER_SHOW_CACHE_HIT === "true";
   }
 
   if (process.env.TPS_METER_FORMAT !== undefined) {

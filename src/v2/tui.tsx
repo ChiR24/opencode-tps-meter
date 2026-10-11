@@ -20,7 +20,7 @@
 import { createEffect, createMemo, createSignal, For, onCleanup, Show } from "solid-js";
 import { AGGREGATE_TICK_INTERVAL_MS } from "../constants.js";
 import { defaultConfig, loadConfigSync } from "../config.js";
-import { formatMeterText } from "../format.js";
+import { formatCacheHit, formatMeterText, formatSessionCacheHit } from "../format.js";
 import type { Config } from "../types.js";
 import {
   aggregateReading,
@@ -476,6 +476,14 @@ function CommandLayer(props: {
         if (s.toolMs > 0) parts.push(`gen ${tps(s.generationTps)}`);
         if (s.ttftMs > 0) parts.push(`ttft ${ms(s.ttftMs)}`);
         if (s.overheadTokens > 0) parts.push(`+${s.overheadTokens} overhead`);
+        const cache = formatCacheHit(s);
+        if (cache !== null) {
+          parts.push(`cache ${cache}`);
+        }
+        const sessionCache = formatSessionCacheHit(s);
+        if (sessionCache !== null) {
+          parts.push(`session cache ${sessionCache}`);
+        }
         return parts.join(" · ");
       })
       .join(" | ");

@@ -6,8 +6,10 @@ import { createTokenizer, createIncrementalCounter, type IncrementalCounter } fr
 import { defaultConfig, loadConfigSync } from "./config.js";
 import {
   AGGREGATE_TICK_INTERVAL_MS,
+  CLEANUP_INTERVAL_MS,
   COUNTABLE_PART_TYPES,
   INVALID_FINISH_REASONS,
+  MAX_MESSAGE_AGE_MS,
   MAX_REMEMBERED_SESSIONS,
   TOOL_CALL_FINISH_REASON,
 } from "./constants.js";
@@ -32,6 +34,10 @@ interface SessionState {
   /** Local time of the most recent token; feeds snapshot `lastActivityAt`. */
   lastTokenAt: number | null;
   lastPublishedAt: number;
+  /** Prompt cache accounting for the current turn, from the latest message.updated. */
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  inputTokens: number;
 }
 
 interface TuiSnapshot {
@@ -41,6 +47,12 @@ interface TuiSnapshot {
   totalTokens: number;
   elapsedMs: number;
   active: boolean;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  inputTokens: number;
+  sessionCacheReadTokens: number;
+  sessionCacheWriteTokens: number;
+  sessionInputTokens: number;
   /**
    * Local-clock time of the last token (or of the completed message), so finished subagents
    * can be aged out of the aggregate. Never the server's `info.time.completed`: the footer
@@ -54,6 +66,13 @@ interface TuiSnapshot {
    * that is re-dispatched rejoins at the end.
    */
   startedAt: number;
+}
+
+/** Prompt cache accounting summed over every reported step, kept for the whole session. */
+interface SessionCacheUsage {
+  read: number;
+  write: number;
+  input: number;
 }
 
 /** Longest parent chain walked; cycles and missing links end the walk sooner. */
@@ -207,6 +226,16 @@ const tui: TuiPlugin = async (api) => {
   const tokenizer = createTokenizer(tokenizerAlgorithm);
   const [snapshots, setSnapshots] = createSignal(new Map<string, TuiSnapshot>());
   const sessions = new Map<string, SessionState>();
+  // Session-scoped, so it survives resetSession and the reading stays on screen across steps.
+  const sessionCacheUsage = new Map<string, SessionCacheUsage>();
+  // Cache usage already folded into the session rollup, keyed by session then message id. A
+  // completed message can be updated more than once (structured-output attach), so only the
+  // increment since the previous update for that message may be added.
+  const accountedCacheUsage = new Map<string, Map<string, SessionCacheUsage>>();
+  // When each session last reported cache accounting, so a long-running TUI can prune the
+  // maps above once a session goes quiet.
+  const cacheAccountingSeenAt = new Map<string, number>();
+  let lastCacheSweepAt = 0;
   // Part-type keys hold accumulated TEXT (the full-part path diffs against it); the `:live`
   // key holds an incremental counter, since it was only ever read to compute a token
   // difference and re-counting the whole string per delta is O(total).
@@ -334,9 +363,87 @@ const tui: TuiPlugin = async (api) => {
       firstTokenAt: null,
       lastTokenAt: null,
       lastPublishedAt: 0,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 0,
+      inputTokens: 0,
     };
     sessions.set(sessionId, state);
     return state;
+  }
+
+  function getSessionCacheUsage(sessionId: string): SessionCacheUsage {
+    let usage = sessionCacheUsage.get(sessionId);
+    if (!usage) {
+      // A pruned session can resume while its reading is still on screen. Seed the totals
+      // from that snapshot so the session rate continues instead of restarting at zero.
+      const retained = snapshots().get(sessionId);
+      usage = {
+        read: retained?.sessionCacheReadTokens ?? 0,
+        write: retained?.sessionCacheWriteTokens ?? 0,
+        input: retained?.sessionInputTokens ?? 0,
+      };
+      sessionCacheUsage.set(sessionId, usage);
+    }
+    cacheAccountingSeenAt.set(sessionId, Date.now());
+    return usage;
+  }
+
+  /**
+   * Drops cache accounting for sessions that have gone quiet, so a long-running TUI cannot
+   * grow the accounting maps without bound. The reading is kept; a resumed session seeds a
+   * fresh entry from its snapshot, mirroring the v2 stale sweep.
+   */
+  function sweepCacheAccounting(now: number): void {
+    if (now - lastCacheSweepAt < CLEANUP_INTERVAL_MS) {
+      return;
+    }
+    lastCacheSweepAt = now;
+
+    for (const [sessionId, seenAt] of cacheAccountingSeenAt) {
+      if (now - seenAt <= MAX_MESSAGE_AGE_MS) {
+        continue;
+      }
+      sessionCacheUsage.delete(sessionId);
+      accountedCacheUsage.delete(sessionId);
+      cacheAccountingSeenAt.delete(sessionId);
+    }
+  }
+
+  /**
+   * Returns the cache usage to add for a message, given its current provider-reported totals.
+   *
+   * OpenCode can mark a message completed and then update the same completed message again
+   * (structured-output attach), and both updates pass the completion guard. Accumulating the
+   * raw totals would count that message twice and skew the session rate, so each message is
+   * accounted once and only the increment is returned.
+   */
+  function accountMessageCache(
+    sessionId: string,
+    messageId: string,
+    usage: SessionCacheUsage
+  ): SessionCacheUsage {
+    let byMessage = accountedCacheUsage.get(sessionId);
+    if (!byMessage) {
+      byMessage = new Map<string, SessionCacheUsage>();
+      accountedCacheUsage.set(sessionId, byMessage);
+    }
+    const previous = byMessage.get(messageId) ?? { read: 0, write: 0, input: 0 };
+    byMessage.set(messageId, { ...usage });
+    return {
+      read: Math.max(0, usage.read - previous.read),
+      write: Math.max(0, usage.write - previous.write),
+      input: Math.max(0, usage.input - previous.input),
+    };
+  }
+
+  /** Session-aggregated cache accounting, safe to read before any step has reported. */
+  function sessionCacheFields(sessionId: string) {
+    const usage = sessionCacheUsage.get(sessionId);
+    return {
+      sessionCacheReadTokens: usage?.read ?? 0,
+      sessionCacheWriteTokens: usage?.write ?? 0,
+      sessionInputTokens: usage?.input ?? 0,
+    };
   }
 
   function publish(sessionId: string, active: boolean, now: number = Date.now()): void {
@@ -359,6 +466,10 @@ const tui: TuiPlugin = async (api) => {
       totalTokens,
       elapsedMs: state.tracker.getElapsedMs(),
       active,
+      cacheReadTokens: state.cacheReadTokens,
+      cacheWriteTokens: state.cacheWriteTokens,
+      inputTokens: state.inputTokens,
+      ...sessionCacheFields(sessionId),
       // `now` may be the server's completion time (persistIdleSnapshot); this must be local.
       lastActivityAt: state.lastTokenAt ?? Date.now(),
       startedAt: sessionSpawnAt.get(sessionId) ?? state.firstTokenAt ?? Date.now(),
@@ -427,6 +538,7 @@ const tui: TuiPlugin = async (api) => {
       return;
     }
 
+    const state = sessions.get(sessionId);
     // Local time, not the server's `info.time.completed`: the footer ages this against
     // the local Date.now().
     const now = Date.now();
@@ -437,6 +549,10 @@ const tui: TuiPlugin = async (api) => {
       totalTokens,
       elapsedMs,
       active: false,
+      cacheReadTokens: state?.cacheReadTokens ?? 0,
+      cacheWriteTokens: state?.cacheWriteTokens ?? 0,
+      inputTokens: state?.inputTokens ?? 0,
+      ...sessionCacheFields(sessionId),
       lastActivityAt: now,
       startedAt: sessionSpawnAt.get(sessionId) ?? now,
     };
@@ -564,6 +680,7 @@ const tui: TuiPlugin = async (api) => {
   disposers.push(api.event.on("message.updated", (event) => {
     const info = event.properties.info;
     const sessionId = event.properties.sessionID || info.sessionID;
+    sweepCacheAccounting(Date.now());
     const roleCache = messageRoles.get(sessionId) ?? new Map<string, Role>();
     messageRoles.set(sessionId, roleCache);
     roleCache.set(info.id, info.role);
@@ -579,6 +696,30 @@ const tui: TuiPlugin = async (api) => {
     if (info.role !== "assistant" || !info.time.completed) {
       return;
     }
+
+    // Provider-reported prompt cache accounting for this step. Captured before any finish
+    // handling so a tool-calls step still freezes its cache numbers along with its TPS.
+    const cacheReadTokens = info.tokens.cache?.read ?? 0;
+    const cacheWriteTokens = info.tokens.cache?.write ?? 0;
+    const inputTokens = info.tokens.input ?? 0;
+    const cachedSession = getSessionState(sessionId);
+    cachedSession.cacheReadTokens = cacheReadTokens;
+    cachedSession.cacheWriteTokens = cacheWriteTokens;
+    cachedSession.inputTokens = inputTokens;
+
+    // Fold this step into the session rollup before any early return, so a tool-calls step
+    // contributes too and the session rate stays visible while the next step streams. Only
+    // the increment since this message's previous update is added, because a completed
+    // message can be updated again when structured output is attached.
+    const stepCache = accountMessageCache(sessionId, info.id, {
+      read: cacheReadTokens,
+      write: cacheWriteTokens,
+      input: inputTokens,
+    });
+    const sessionCacheForStep = getSessionCacheUsage(sessionId);
+    sessionCacheForStep.read += stepCache.read;
+    sessionCacheForStep.write += stepCache.write;
+    sessionCacheForStep.input += stepCache.input;
 
     if (info.finish === TOOL_CALL_FINISH_REASON) {
       persistIdleSnapshot(sessionId, info.time.completed);
@@ -653,6 +794,8 @@ const tui: TuiPlugin = async (api) => {
   disposers.push(api.event.on("session.idle", (event) => {
     persistIdleSnapshot(event.properties.sessionID);
     resetSession(event.properties.sessionID);
+    // The session is finished, so its per-message accounting is no longer needed.
+    accountedCacheUsage.delete(event.properties.sessionID);
     // The run is over: a re-dispatch is a new spawn and rejoins the footer at the end.
     sessionSpawnAt.delete(event.properties.sessionID);
   }));
@@ -664,6 +807,9 @@ const tui: TuiPlugin = async (api) => {
     sessions.clear();
     partTextCache.clear();
     messageRoles.clear();
+    sessionCacheUsage.clear();
+    accountedCacheUsage.clear();
+    cacheAccountingSeenAt.clear();
     sessionParents.clear();
     sessionAgents.clear();
     sessionSpawnAt.clear();

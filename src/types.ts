@@ -38,6 +38,9 @@ export interface Config {
   /** Whether to show elapsed time (default: false) */
   showElapsed: boolean;
 
+  /** Whether to show the prompt cache hit rate (default: true) */
+  showCacheHit: boolean;
+
   /** Display format style (default: 'compact') */
   format: 'compact' | 'verbose' | 'minimal';
 
@@ -309,8 +312,26 @@ export interface DisplayState {
   totalTokens: number;
   /** Elapsed time in milliseconds */
   elapsedMs: number;
+  /** Optional prompt cache accounting for the current turn */
+  cache?: TokenCacheInfo;
   /** Optional per-agent display entries */
   agents?: AgentDisplayState[];
+}
+
+/**
+ * Provider-reported prompt cache accounting.
+ *
+ * Mirrors OpenCode's `tokens.cache` plus the uncached `tokens.input`. `input` EXCLUDES
+ * cache reads and writes, so the prompt-side total is `input + read + write` and the hit
+ * rate is `read / (input + read + write)`.
+ */
+export interface TokenCacheInfo {
+  /** Prompt tokens served from the cache. */
+  read: number;
+  /** Prompt tokens written to the cache. */
+  write: number;
+  /** Uncached prompt input tokens. */
+  input: number;
 }
 
 /**
@@ -405,10 +426,16 @@ export interface UIManager {
     avgTps: number,
     totalTokens: number,
     elapsedMs: number,
-    agents?: AgentDisplayState[]
+    agents?: AgentDisplayState[],
+    cache?: TokenCacheInfo
   ): void;
   /** Displays final statistics immediately */
-  showFinalStats(totalTokens: number, avgTps: number, elapsedMs: number): void;
+  showFinalStats(
+    totalTokens: number,
+    avgTps: number,
+    elapsedMs: number,
+    cache?: TokenCacheInfo
+  ): void;
   /** Clears the display and cleans up resources */
   clear(): void;
   /** Changes the update interval for display throttling */
