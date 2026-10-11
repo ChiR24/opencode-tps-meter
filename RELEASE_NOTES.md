@@ -1,3 +1,78 @@
+## v0.4.1 — Accurate TPS, subagent throughput, cache hit rate, theme colors
+
+The throughput figures are now measured correctly, and three community features
+land alongside. Tested on OpenCode v1 and v2. Install with
+`opencode-tps-meter@latest`.
+
+### Accurate throughput
+
+- **No more five-digit spikes.** Hosts batch output before publishing it (v2
+  flushes every ~100ms), and the first batch of a stream was divided by the few
+  milliseconds before the meter's first update, so readings like `10364` appeared,
+  most visibly as a subagent's frozen average. Each chunk is now rated over the
+  interval it was actually generated in, and the opening chunk counts toward the
+  total but never toward a rate.
+- **The live rate is right from the start.** It used to begin at a fixed 100 TPS
+  and climb toward the real figure over several seconds on fast models. It is now
+  exact from the second chunk (about 100ms in) at any speed, with no smoothing lag.
+- **Settled averages describe what streamed.** A step's average is its streamed
+  tokens over the time they streamed, corrected by the provider's count only when
+  the two agree within 2x. Provider totals that include output the host never
+  streamed, such as hidden reasoning, no longer inflate the rate.
+- **Tool-call arguments count as output** (v2). The text a model writes for a tool
+  call (a file write, an edit) is now counted, so a step that only calls a tool has
+  a real reading instead of none.
+- **Calibration persists and is weighted by size** (v2). The live estimate's
+  per-model correction is saved, so new sessions start calibrated, and small steps
+  no longer swing it. Steps whose reasoning count the provider leaves ambiguous are
+  left out.
+- **A stalled stream shows its rate falling** instead of holding its last value.
+- **One clock per measurement.** v1 no longer divides by server completion time
+  minus a local first-token time.
+- **The v1 toast** keeps its main line on the primary session (a subagent's chunk
+  used to relabel the subagent's rate as the main one) and no longer drops an
+  update that lands inside its throttle window.
+- **Dashboard.** `gen` is replaced by `tools`, the time a turn spent running tools,
+  since tool time is never inside a step's rate window. The per-model ledger starts
+  fresh, as its old best/mean figures were recorded with the spiking formula.
+- Same-named subagents in the footer get a short id suffix, e.g. `explore(9B5c)`,
+  and a step that ends on an error now settles the reading and still counts its
+  usage.
+
+### Added
+
+- **Multi-session footer** (#8, @ondrejch). While subagents run, the footer
+  switches to an aggregate line, e.g. `TPS Σ 318 | main 63 | explore 91 | +2`.
+  Σ sums every session generating right now, and each agent is labeled by name.
+  Columns keep their spawn order, so they don't swap places. A subagent stays
+  visible through long tool calls and drops off about 4s after it finishes.
+  Works on both hosts: v1 resolves the session tree from `session.created` /
+  `session.updated` and `api.state.session`, v2 from `ctx.data.session`.
+- **Prompt cache hit rate** (#9, @Anigx). The footer shows
+  `cache N% · session cache N%`: the cached share of the prompt for the last
+  step and for the whole session, computed as
+  `cache.read / (input + cache.read + cache.write)`. It also appears in the v2
+  dashboard and the v1 final-stats toast. The figures appear once a session's
+  first step has finished. Toggle with `showCacheHit` (default `true`) or
+  `TPS_METER_SHOW_CACHE_HIT`.
+
+### Fixed
+
+- **Theme colors on current v2 hosts** (#10, @dragonish). v2 renamed its theme
+  tokens to `text.base` / `text.muted` / `feedback.<kind>.base`. The meter now
+  resolves those names, falling back to the older ones, instead of rendering in
+  the host's default color. The theme is also read live, so a theme switch
+  recolors the meter without restarting the TUI.
+- **Cache figures after a tool-call-only step.** A step that ends in a tool call
+  without streaming any text now updates the footer's cache figures on both
+  hosts, instead of leaving the previous step's numbers on screen.
+
+### Notes
+
+- New config option: `showCacheHit` (default `true`), env
+  `TPS_METER_SHOW_CACHE_HIT`. No other config changes.
+- Thanks to @ondrejch, @Anigx and @dragonish for the contributions.
+
 ## v0.4.0 — OpenCode v2 support (stable)
 
 Promotes `v0.4.0-beta.1` to stable with loader fixes tested end to end on
