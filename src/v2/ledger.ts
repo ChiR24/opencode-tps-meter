@@ -20,7 +20,7 @@ export interface LedgerEntry {
   samples: number;
   /** Provider-reported tokens, summed. */
   tokens: number;
-  /** Generation milliseconds (tool execution already subtracted), summed. */
+  /** Milliseconds spent generating those tokens, summed. Tool execution is never inside. */
   generationMs: number;
   /** Provider-reported cost, summed. */
   cost: number;
@@ -33,9 +33,22 @@ export interface LedgerEntry {
   ttftSamples: number;
 }
 
+/** A model's learned heuristic-to-provider token ratio. See v2/metrics.ts. */
+export interface CalibrationEntry {
+  factor: number;
+  samples: number;
+  /** Heuristic tokens behind the factor. */
+  weight?: number;
+}
+
 export interface LedgerData {
   version: number;
   models: Record<string, LedgerEntry>;
+  /**
+   * Per-model token calibration. Persisted so a new session's live rate is corrected from
+   * its first token, instead of running uncalibrated until its first step settles.
+   */
+  calibration?: Record<string, CalibrationEntry>;
 }
 
 export interface StepMeasurement {
@@ -52,10 +65,23 @@ export interface V2Ledger {
   read(): LedgerData;
   /** Mean tokens/sec for a model, or 0 when unmeasured. */
   meanTps(modelKey: string): number;
+  /** Saved per-model calibration, to seed the meter at startup. */
+  calibrations(): Record<string, CalibrationEntry>;
+  recordCalibration(modelKey: string, entry: CalibrationEntry): void;
+  /**
+   * Clears the throughput rollup. Calibration is kept: it describes the model's tokenizer,
+   * not its speed, and keeps refining itself step by step anyway.
+   */
   clear(): void;
 }
 
-const EMPTY: LedgerData = { version: 1, models: {} };
+/**
+ * Version 2 changed how a step's rate is measured. Version 1 rollups were fed by a formula
+ * that divided a host-batched chunk by a few milliseconds, so their best/mean figures are
+ * not comparable; they are left behind under the old key rather than mixed in.
+ */
+const LEDGER_KEY = "ledger.v2";
+const EMPTY: LedgerData = { version: 2, models: {} };
 
 function emptyEntry(): LedgerEntry {
   return {
@@ -71,14 +97,14 @@ function emptyEntry(): LedgerEntry {
 }
 
 export function createLedger(storage?: V2Storage): V2Ledger {
-  let fallback: LedgerData = { version: 1, models: {} };
+  let fallback: LedgerData = { ...EMPTY, models: {} };
 
   // The host's storage API is beta and hand-typed here. If calling it throws — wrong
   // signature, or a Solid store that must be created inside a reactive owner — fall back to
   // the in-memory rollup rather than taking the whole plugin down with us.
   let handle: V2StoreHandle<LedgerData> | undefined;
   try {
-    handle = storage?.store<LedgerData>("ledger", { initial: { ...EMPTY, models: {} } });
+    handle = storage?.store<LedgerData>(LEDGER_KEY, { initial: { ...EMPTY, models: {} } });
     if (handle && (!Array.isArray(handle) || typeof handle[1] !== "function")) {
       handle = undefined;
     }
@@ -152,6 +178,20 @@ export function createLedger(storage?: V2Storage): V2Ledger {
         return 0;
       }
       return entry.tokens / (entry.generationMs / 1000);
+    },
+
+    calibrations() {
+      const saved = read().calibration;
+      return saved ? { ...saved } : {};
+    },
+
+    recordCalibration(modelKey, entry) {
+      if (!modelKey || !Number.isFinite(entry.factor) || entry.factor <= 0) {
+        return;
+      }
+      mutate((draft) => {
+        draft.calibration = { ...(draft.calibration ?? {}), [modelKey]: { ...entry } };
+      });
     },
 
     clear() {

@@ -39,6 +39,23 @@ function textDelta(sessionID: string, delta: string, messageID = "msg_1"): V2Unk
   };
 }
 
+/**
+ * Streams `text` the way the host delivers it: an opening chunk, then the rest 100ms later
+ * in host time (the host flushes output every 100ms). The opening chunk alone has no
+ * measurable rate, so a single delta never produces a live reading.
+ */
+function stream(
+  meter: { handleEvent(event: V2UnknownEvent): void },
+  sessionID: string,
+  text: string,
+  messageID = "msg_1"
+): void {
+  const now = Date.now();
+  const half = Math.ceil(text.length / 2);
+  meter.handleEvent({ ...textDelta(sessionID, text.slice(0, half), messageID), created: now - 100 });
+  meter.handleEvent({ ...textDelta(sessionID, text.slice(half), messageID), created: now });
+}
+
 function reasoningDelta(sessionID: string, delta: string, messageID = "msg_1"): V2UnknownEvent {
   eventId += 1;
   return {
@@ -148,18 +165,21 @@ describe("v2 meter", () => {
     };
   }
 
-  it("publishes a live snapshot from session.text.delta after the startup delay", async () => {
+  it("publishes a live snapshot once a second chunk makes the rate measurable", () => {
     const { meter, snapshot } = createHarness();
+    const now = Date.now();
 
-    meter.handleEvent(textDelta("ses_1", "hello there, streaming tokens"));
+    // The opening chunk was generated over an interval the meter never saw: no rate yet.
+    meter.handleEvent({ ...textDelta("ses_1", "hello there, "), created: now - 100 });
     expect(snapshot("ses_1")).toBeUndefined();
 
-    await delay(40);
-
+    // The next flush gives a real interval, so the reading appears at once.
+    meter.handleEvent({ ...textDelta("ses_1", "streaming tokens"), created: now });
     const current = snapshot("ses_1");
     expect(current).toBeDefined();
     expect(current?.active).toBe(true);
     expect(current?.totalTokens).toBeGreaterThan(0);
+    expect(current?.instantTps).toBeGreaterThan(0);
 
     meter.dispose();
   });
@@ -167,7 +187,7 @@ describe("v2 meter", () => {
   it("counts reasoning deltas alongside text deltas", async () => {
     const { meter, snapshot } = createHarness();
 
-    meter.handleEvent(textDelta("ses_1", "abcdefgh"));
+    stream(meter, "ses_1", "abcdefgh");
     await delay(40);
     const afterText = snapshot("ses_1")?.totalTokens ?? 0;
 
@@ -183,9 +203,10 @@ describe("v2 meter", () => {
     const { meter, snapshot } = createHarness();
 
     // Twelve 1-char deltas: per-chunk chars/4 would round each up, cumulative gives 3.
-    for (const char of "abcdefghijkl") {
-      meter.handleEvent(textDelta("ses_1", char));
-    }
+    const base = Date.now() - 300;
+    [..."abcdefghijkl"].forEach((char, i) => {
+      meter.handleEvent({ ...textDelta("ses_1", char), created: base + i * 20 });
+    });
     await delay(40);
 
     expect(snapshot("ses_1")?.totalTokens).toBe(3);
@@ -196,7 +217,7 @@ describe("v2 meter", () => {
   it("prefers provider-reported tokens over the streamed heuristic at step end", async () => {
     const { meter, snapshot } = createHarness();
 
-    meter.handleEvent(textDelta("ses_1", "short"));
+    stream(meter, "ses_1", "short");
     await delay(40);
 
     meter.handleEvent(stepEnded("ses_1", "stop", { output: 500, reasoning: 100 }));
@@ -212,7 +233,7 @@ describe("v2 meter", () => {
   it("falls back to streamed counts when a step reports no tokens", async () => {
     const { meter, snapshot } = createHarness();
 
-    meter.handleEvent(textDelta("ses_1", "abcdefghijkl"));
+    stream(meter, "ses_1", "abcdefghijkl");
     await delay(40);
 
     meter.handleEvent(stepEnded("ses_1", "stop"));
@@ -225,7 +246,7 @@ describe("v2 meter", () => {
   it("keeps the reading visible when a step ends for tool calls", async () => {
     const { meter, snapshot } = createHarness();
 
-    meter.handleEvent(textDelta("ses_1", "streaming before a tool call"));
+    stream(meter, "ses_1", "streaming before a tool call");
     await delay(40);
     expect(snapshot("ses_1")?.active).toBe(true);
 
@@ -242,7 +263,7 @@ describe("v2 meter", () => {
   it("clears the active reading on an unknown finish reason", async () => {
     const { meter, snapshot } = createHarness();
 
-    meter.handleEvent(textDelta("ses_1", "streaming that will be invalidated"));
+    stream(meter, "ses_1", "streaming that will be invalidated");
     await delay(40);
     expect(snapshot("ses_1")?.active).toBe(true);
 
@@ -256,7 +277,7 @@ describe("v2 meter", () => {
   it("keeps the latest reading visible after the session idles", async () => {
     const { meter, snapshot } = createHarness();
 
-    meter.handleEvent(textDelta("ses_1", "streaming then going idle"));
+    stream(meter, "ses_1", "streaming then going idle");
     await delay(40);
 
     meter.handleEvent(sessionIdle("ses_1"));
@@ -268,9 +289,10 @@ describe("v2 meter", () => {
     meter.dispose();
   });
 
-  it("does not persist a reading when idling before the startup delay", () => {
+  it("does not persist a reading when idling before a rate is measurable", () => {
     const { meter, snapshot } = createHarness();
 
+    // Only the opening chunk arrived: there is no interval to rate it over.
     meter.handleEvent(textDelta("ses_1", "too fast to display"));
     meter.handleEvent(sessionIdle("ses_1"));
 
@@ -282,8 +304,8 @@ describe("v2 meter", () => {
   it("keeps sessions isolated", async () => {
     const { meter, snapshot } = createHarness();
 
-    meter.handleEvent(textDelta("ses_1", "abcdefghijkl", "msg_a"));
-    meter.handleEvent(textDelta("ses_2", "abcdefghijklmnopqrstuvwx", "msg_b"));
+    stream(meter, "ses_1", "abcdefghijkl", "msg_a");
+    stream(meter, "ses_2", "abcdefghijklmnopqrstuvwx", "msg_b");
     await delay(40);
 
     expect(snapshot("ses_1")?.totalTokens).toBe(3);
@@ -300,7 +322,7 @@ describe("v2 meter", () => {
   it("never substitutes cumulative session usage for a single step's total", async () => {
     const { meter, snapshot } = createHarness();
 
-    meter.handleEvent(textDelta("ses_1", "abcd")); // 4 chars -> 1 heuristic token
+    stream(meter, "ses_1", "abcdefgh"); // 8 chars -> 2 heuristic tokens
     await delay(40);
 
     // session.usage.updated is a CUMULATIVE SESSION total published from the accumulated
@@ -319,7 +341,7 @@ describe("v2 meter", () => {
     });
     meter.handleEvent(stepEnded("ses_1", "stop"));
 
-    expect(snapshot("ses_1")?.totalTokens).toBe(1);
+    expect(snapshot("ses_1")?.totalTokens).toBe(2);
 
     meter.dispose();
   });
@@ -327,7 +349,7 @@ describe("v2 meter", () => {
   it("derives hidden overhead as cumulative usage minus observed step deltas", async () => {
     const { meter, snapshot } = createHarness();
 
-    meter.handleEvent(textDelta("ses_1", "abcd"));
+    stream(meter, "ses_1", "abcdefgh");
     await delay(40);
 
     // Step reports 100 real output tokens...
@@ -346,7 +368,7 @@ describe("v2 meter", () => {
       },
     });
 
-    meter.handleEvent(textDelta("ses_1", "efgh"));
+    stream(meter, "ses_1", "ijklmnop");
     await delay(60);
 
     expect(snapshot("ses_1")?.overheadTokens).toBe(30);
@@ -357,7 +379,7 @@ describe("v2 meter", () => {
   it("reports zero overhead before any cumulative usage arrives", async () => {
     const { meter, snapshot } = createHarness();
 
-    meter.handleEvent(textDelta("ses_1", "abcdefghijkl"));
+    stream(meter, "ses_1", "abcdefghijkl");
     await delay(40);
 
     expect(snapshot("ses_1")?.overheadTokens).toBe(0);
@@ -368,7 +390,7 @@ describe("v2 meter", () => {
   it("exposes per-step and session prompt cache token totals", async () => {
     const { meter, snapshot } = createHarness();
 
-    meter.handleEvent(textDelta("ses_1", "streaming tokens here"));
+    stream(meter, "ses_1", "streaming tokens here");
     await delay(40);
 
     // Prompt side = input 100 + read 300 + write 0 = 400, so 75% was served from cache.
@@ -394,7 +416,7 @@ describe("v2 meter", () => {
     Date.now = () => clock;
 
     try {
-      meter.handleEvent(textDelta("ses_1", "streaming tokens here"));
+      stream(meter, "ses_1", "streaming tokens here");
       clock += 40;
       meter.handleEvent(
         stepEndedWithCache("ses_1", "tool-calls", { input: 100, output: 10, cacheRead: 300 })
@@ -403,12 +425,12 @@ describe("v2 meter", () => {
 
       // Go quiet past the stale threshold: the sweep frees sessionUsage but keeps the reading.
       clock += MAX_MESSAGE_AGE_MS + CLEANUP_INTERVAL_MS + 1;
-      meter.handleEvent(textDelta("ses_other", "trigger the sweep", "msg_other"));
+      stream(meter, "ses_other", "trigger the sweep", "msg_other");
       expect(snapshot("ses_1")?.sessionCacheReadTokens).toBe(300);
 
       // Resume the same session; the new step must add to the retained totals, not restart.
       clock += 40;
-      meter.handleEvent(textDelta("ses_1", "resuming the same session", "msg_2"));
+      stream(meter, "ses_1", "resuming the same session", "msg_2");
       clock += 40;
       meter.handleEvent(
         stepEndedWithCache("ses_1", "stop", { input: 30, output: 5, cacheRead: 0 }, "msg_2")
@@ -427,7 +449,7 @@ describe("v2 meter", () => {
     const { meter, snapshot } = createHarness();
 
     // Step 1 streams text and reports a 10% hit rate.
-    meter.handleEvent(textDelta("ses_1", "some streamed output here"));
+    stream(meter, "ses_1", "some streamed output here");
     await delay(40);
     meter.handleEvent(
       stepEndedWithCache("ses_1", "tool-calls", { input: 900, output: 5, cacheRead: 100 })
@@ -455,7 +477,7 @@ describe("v2 meter", () => {
   it("sends a no-delta step's cache accounting to the footer when the turn ends", async () => {
     const { meter, snapshot } = createHarness();
 
-    meter.handleEvent(textDelta("ses_1", "some streamed output here"));
+    stream(meter, "ses_1", "some streamed output here");
     await delay(40);
     meter.handleEvent(
       stepEndedWithCache("ses_1", "tool-calls", { input: 900, output: 5, cacheRead: 100 })
@@ -476,7 +498,7 @@ describe("v2 meter", () => {
 
   it("ignores non-numeric provider token counts instead of concatenating them", async () => {
     const { meter, snapshot } = createHarness();
-    meter.handleEvent(textDelta("ses_1", "abcdefghijkl"));
+    stream(meter, "ses_1", "abcdefghijkl");
     await delay(40);
 
     // A string field would make `output + reasoning` string-concatenate to "10050".
@@ -501,7 +523,7 @@ describe("v2 meter", () => {
 
   it("ignores negative and non-finite token counts", async () => {
     const { meter, snapshot } = createHarness();
-    meter.handleEvent(textDelta("ses_1", "abcdefghijkl"));
+    stream(meter, "ses_1", "abcdefghijkl");
     await delay(40);
 
     eventId += 1;
@@ -548,13 +570,13 @@ describe("v2 meter", () => {
 
     try {
       // A turn that streams and then vanishes: no step.ended, no session.idle.
-      meter.handleEvent(textDelta("ses_abandoned", "streaming then disconnected"));
+      stream(meter, "ses_abandoned", "streaming then disconnected");
       clock += 40;
-      meter.handleEvent(textDelta("ses_abandoned", " more text"));
+      stream(meter, "ses_abandoned", " more text");
       expect(meter.getSnapshots().has("ses_abandoned")).toBe(true);
 
       clock += MAX_MESSAGE_AGE_MS + CLEANUP_INTERVAL_MS + 1;
-      meter.handleEvent(textDelta("ses_live", "a new session arrives"));
+      stream(meter, "ses_live", "a new session arrives");
 
       // v1 left the final numbers on screen forever; deleting them here made the meter
       // appear to forget after five quiet minutes. Only the heavy state is freed.
@@ -580,14 +602,14 @@ describe("v2 meter", () => {
     try {
       const total = MAX_RETAINED_SNAPSHOTS + 20;
       for (let i = 0; i < total; i++) {
-        meter.handleEvent(textDelta(`ses_${i}`, "streaming output here", `msg_${i}`));
+        stream(meter, `ses_${i}`, "streaming output here", `msg_${i}`);
         clock += 20;
-        meter.handleEvent(textDelta(`ses_${i}`, " more output", `msg_${i}`));
+        stream(meter, `ses_${i}`, " more output", `msg_${i}`);
       }
       expect(meter.getSnapshots().size).toBe(total);
 
       clock += MAX_MESSAGE_AGE_MS + CLEANUP_INTERVAL_MS + 1;
-      meter.handleEvent(textDelta("ses_trigger", "sweep now", "msg_t"));
+      stream(meter, "ses_trigger", "sweep now", "msg_t");
 
       expect(meter.getSnapshots().size).toBeLessThanOrEqual(MAX_RETAINED_SNAPSHOTS + 1);
       // The most recent sessions survive; the oldest are evicted first.
@@ -622,14 +644,14 @@ describe("v2 meter", () => {
 
     const unsubscribe = meter.subscribe((snapshots) => seen.push(snapshots.size));
 
-    meter.handleEvent(textDelta("ses_1", "streaming for subscribers"));
+    stream(meter, "ses_1", "streaming for subscribers");
     await delay(40);
     expect(seen.length).toBeGreaterThan(0);
 
     const countAfterFirst = seen.length;
     unsubscribe();
 
-    meter.handleEvent(textDelta("ses_1", "more streaming"));
+    stream(meter, "ses_1", "more streaming");
     await delay(80);
     expect(seen.length).toBe(countAfterFirst);
 
@@ -639,7 +661,7 @@ describe("v2 meter", () => {
   it("clears state and pending timers on dispose", async () => {
     const { meter } = createHarness();
 
-    meter.handleEvent(textDelta("ses_1", "streaming then disposed"));
+    stream(meter, "ses_1", "streaming then disposed");
     meter.dispose();
 
     await delay(40);
@@ -733,10 +755,13 @@ describe("v2 plugin entries", () => {
       "session.idle",
       "session.reasoning.delta",
       "session.step.ended",
+      "session.step.failed",
       "session.step.started",
       "session.text.delta",
       "session.tool.called",
       "session.tool.failed",
+      "session.tool.input.delta",
+      "session.tool.input.ended",
       "session.tool.success",
       "session.usage.updated",
     ]);
@@ -753,10 +778,13 @@ describe("v2 plugin entries", () => {
       "session.idle",
       "session.reasoning.delta",
       "session.step.ended",
+      "session.step.failed",
       "session.step.started",
       "session.text.delta",
       "session.tool.called",
       "session.tool.failed",
+      "session.tool.input.delta",
+      "session.tool.input.ended",
       "session.tool.success",
       "session.usage.updated",
     ]);
@@ -790,8 +818,11 @@ describe("v2 plugin entries", () => {
     const { setupServer, getSnapshots } = await import("../v2/server.js");
 
     let aborted = false;
+    // Two flushes 100ms apart, as the host sends them: one chunk alone has no rate.
+    const now = Date.now();
     const events: V2UnknownEvent[] = [
-      textDelta("ses_srv", "streaming through the server plugin"),
+      { ...textDelta("ses_srv", "streaming through "), created: now - 100 },
+      { ...textDelta("ses_srv", "the server plugin"), created: now },
     ];
 
     const cleanup = setupServer({
@@ -1092,7 +1123,7 @@ describe("v2 theme normalization", () => {
     const onTextDelta = handlers.get("session.text.delta");
     expect(onTextDelta).toBeDefined();
 
-    onTextDelta!(textDelta("ses-flat", "hello there, streaming tokens at a decent clip"));
+    stream({ handleEvent: onTextDelta! }, "ses-flat", "hello there, streaming tokens at a decent clip");
     await delay(120);
 
     const render = claims[0]?.render;
@@ -1128,8 +1159,10 @@ describe("v2 theme normalization", () => {
       },
     });
 
-    handlers.get("session.text.delta")!(
-      textDelta("ses-fg", "hello there, streaming tokens at a decent clip")
+    stream(
+      { handleEvent: handlers.get("session.text.delta")! },
+      "ses-fg",
+      "hello there, streaming tokens at a decent clip"
     );
     await delay(120);
 
@@ -1191,21 +1224,21 @@ describe("v2 metrics", () => {
     meter.dispose();
   });
 
-  it("excludes tool execution time from generationTps", () => {
+  it("reports tool time without subtracting it from the generation rate", () => {
     const { meter, snap } = harness();
     const base = Date.now();
 
     meter.handleEvent(evt("session.execution.started", at(base, 0), { sessionID: "s" }));
     meter.handleEvent(textAt("s", "abcdefghijklmnopqrstuvwxyz01", at(base, 100)));
-    // A tool runs for 2s in the middle of the turn.
+    // A tool runs while the model is still writing: the only way tool time overlaps a step
+    // is a parallel tool call, and the model really was generating throughout it.
     meter.handleEvent(evt("session.tool.called", at(base, 200), { sessionID: "s", id: "c1" }));
     meter.handleEvent(evt("session.tool.success", at(base, 2200), { sessionID: "s", id: "c1" }));
     meter.handleEvent(textAt("s", "abcdefghijklmnopqrstuvwxyz02", at(base, 2300)));
 
     const s = snap("s");
     expect(s?.toolMs).toBe(2000);
-    // Dead time removed, so the model's own rate is strictly higher than end-to-end.
-    expect(s?.generationTps).toBeGreaterThan(s?.avgTps ?? 0);
+    expect(s?.generationTps).toBe(s?.avgTps);
     meter.dispose();
   });
 
@@ -1618,44 +1651,63 @@ describe("incremental token counting", () => {
   });
 });
 
-describe("smoothing latency", () => {
-  it("leaves the v1 tracker default untouched", async () => {
+describe("tracker rates", () => {
+  it("rates a chunk over the interval since the previous one, not its arrival instant", async () => {
     const { createTracker } = await import("../tracker.js");
-    const { DEFAULT_EWMA_HALF_LIFE_MS } = await import("../constants.js");
-
+    const t = createTracker({ rollingWindowMs: 1000 });
     const base = 1_000_000;
-    const feed = (t: { recordTokens: (n: number, ts: number) => void }) => {
-      for (let i = 1; i <= 40; i++) t.recordTokens(1, base + i * 10);
-    };
 
-    const implicit = createTracker({});
-    const explicit = createTracker({ ewmaHalfLifeMs: DEFAULT_EWMA_HALF_LIFE_MS });
-    feed(implicit);
-    feed(explicit);
+    // The host batches ~100ms of output per flush. A 159-token opening chunk divided by the
+    // ~10ms until the first publish read as 15,900 TPS; it was generated before the window.
+    t.recordTokens(159, base);
+    expect(t.isRateReady()).toBe(false);
+    expect(t.getSmoothedTPS()).toBe(0);
 
-    // Omitting the option must behave exactly like passing the v1 constant.
-    expect(implicit.getSmoothedTPS()).toBeCloseTo(explicit.getSmoothedTPS(), 6);
+    t.recordTokens(50, base + 100);
+    expect(t.isRateReady()).toBe(true);
+    expect(t.getSmoothedTPS()).toBeCloseTo(500, 6);
+    expect(t.getAverageTPS()).toBeCloseTo(500, 6);
+    // The opening chunk still counts toward the total.
+    expect(t.getTotalTokens()).toBe(209);
   });
 
-  it("converges faster with the v2 half-life", async () => {
+  it("reports the true rate from the second chunk, with no seed value or smoothing lag", async () => {
     const { createTracker } = await import("../tracker.js");
-    const { DEFAULT_EWMA_HALF_LIFE_MS, V2_EWMA_HALF_LIFE_MS } = await import("../constants.js");
+    const t = createTracker({ rollingWindowMs: 1000 });
+    const base = 1_000_000;
 
-    expect(V2_EWMA_HALF_LIFE_MS).toBeLessThan(DEFAULT_EWMA_HALF_LIFE_MS);
-
-    const converge = (halfLife: number): number => {
-      const t = createTracker({ rollingWindowMs: 1000, ewmaHalfLifeMs: halfLife });
-      const base = 1_000_000;
-      for (let i = 1; i <= 600; i++) {
-        t.recordTokens(0.9, base + i * 10); // steady 90 TPS
-        if (t.getSmoothedTPS() >= 81) return i * 10;
+    // A fast model: 70 tokens per 100ms flush is 700 TPS. The old tracker seeded every
+    // stream at 100 TPS and crept up over seconds.
+    for (let i = 0; i <= 10; i++) {
+      t.recordTokens(70, base + i * 100);
+      if (i >= 1) {
+        expect(t.getSmoothedTPS()).toBeCloseTo(700, 6);
       }
-      return Number.POSITIVE_INFINITY;
-    };
+    }
+  });
 
-    const v1 = converge(DEFAULT_EWMA_HALF_LIFE_MS);
-    const v2 = converge(V2_EWMA_HALF_LIFE_MS);
-    expect(v2).toBeLessThan(v1);
+  it("falls to zero once a stream stalls past the window", async () => {
+    const { createTracker } = await import("../tracker.js");
+    const t = createTracker({ rollingWindowMs: 1000 });
+    const base = 1_000_000;
+
+    t.recordTokens(10, base);
+    t.recordTokens(10, base + 100);
+    expect(t.getInstantTPS(base + 100)).toBeCloseTo(100, 6);
+    // 10 rated tokens over the 600ms since the stream started.
+    expect(t.getInstantTPS(base + 600)).toBeCloseTo(10 / 0.6, 6);
+    expect(t.getInstantTPS(base + 1200)).toBe(0);
+  });
+
+  it("corrects a step average with the provider count only when the two agree", async () => {
+    const { correctedAverage } = await import("../tracker.js");
+
+    // The heuristic counted 100 tokens; the provider says 120 of the same output.
+    expect(correctedAverage(50, 100, 120)).toBeCloseTo(60, 6);
+    // 10x more than streamed: hidden output, so the streamed figure stands.
+    expect(correctedAverage(50, 100, 1000)).toBe(50);
+    expect(correctedAverage(50, 100, 0)).toBe(50);
+    expect(correctedAverage(0, 100, 120)).toBe(0);
   });
 });
 
@@ -1711,13 +1763,16 @@ describe("publish latency", () => {
       updates += 1;
     });
 
+    // Warm up with two flushes so the stream has a measurable rate and a first publish.
     const base = Date.now();
-    meter.handleEvent({
-      id: "warm",
-      created: base,
-      type: "session.text.delta",
-      data: { sessionID: "s", assistantMessageID: "m", ordinal: 0, delta: "warm up text" },
-    } as unknown as V2UnknownEvent);
+    for (const [id, created] of [["warm-1", base - 100], ["warm-2", base]] as const) {
+      meter.handleEvent({
+        id,
+        created,
+        type: "session.text.delta",
+        data: { sessionID: "s", assistantMessageID: "m", ordinal: 0, delta: "warm up text" },
+      } as unknown as V2UnknownEvent);
+    }
     await delay(40);
 
     const before = updates;
@@ -1927,4 +1982,324 @@ describe("build invariants", () => {
     expect(typeof v2Server.setup).toBe("function");
     if ("tui" in v2Server) expect(typeof v2Server.tui).toBe("function");
   }, 120_000);
+});
+
+describe("v2 accurate rates", () => {
+  beforeEach(() => {
+    for (const key of Object.keys(stableEnv) as Array<keyof typeof stableEnv>) {
+      originalEnv.set(key, process.env[key]);
+      process.env[key] = stableEnv[key];
+    }
+  });
+
+  afterEach(() => {
+    for (const key of Object.keys(stableEnv) as Array<keyof typeof stableEnv>) {
+      const previous = originalEnv.get(key);
+      if (previous === undefined) delete process.env[key];
+      else process.env[key] = previous;
+    }
+    originalEnv.clear();
+  });
+
+  const chars = (tokens: number) => "abcd".repeat(tokens);
+
+  /** An opening chunk at `start`, then `count` chunks of `perChunk` tokens every 100ms. */
+  function streamSteadily(
+    meter: { handleEvent(event: V2UnknownEvent): void },
+    start: number,
+    count: number,
+    perChunk: number
+  ): void {
+    meter.handleEvent(textAt("s", chars(perChunk), start));
+    for (let i = 1; i <= count; i++) {
+      meter.handleEvent(textAt("s", chars(perChunk), start + i * 100));
+    }
+  }
+
+  it("never reports the opening chunk divided by a few milliseconds", () => {
+    const meter = createMeter(loadConfigSync());
+    const base = Date.now() - 1000;
+
+    // Live log: a 159-token opening chunk read as 15,900 TPS at the first publish.
+    meter.handleEvent(textAt("s", chars(150), base));
+    meter.handleEvent(textAt("s", chars(50), base + 100));
+
+    const s = meter.getSnapshots().get("s");
+    expect(s?.instantTps).toBeCloseTo(500, 6);
+    expect(s?.avgTps).toBeCloseTo(500, 6);
+    expect(s?.totalTokens).toBe(200);
+    meter.dispose();
+  });
+
+  it("never rates a tool call delivered whole over the host's started-to-ended gap", () => {
+    const meter = createMeter(loadConfigSync());
+    const base = Date.now() - 5000;
+    const tool = { sessionID: "s", assistantMessageID: "msg_1", id: "call_1" };
+
+    // Live log: the provider sent an 850-token call at once; the host emitted input.started
+    // and input.ended 97ms apart, which the previous build rated at 8,763 TPS. The step
+    // really began 2.5s earlier (`started`), though its event arrived with the output.
+    meter.handleEvent(
+      evt("session.step.started", at(base, 2400), { sessionID: "s", assistantMessageID: "msg_1", started: base })
+    );
+    meter.handleEvent(evt("session.tool.input.started", at(base, 2400), { ...tool, name: "write" }));
+    meter.handleEvent(evt("session.tool.input.ended", at(base, 2497), { ...tool, text: chars(850) }));
+    meter.handleEvent({ ...stepEnded("s", "tool-calls", { output: 875, reasoning: 0 }), created: at(base, 2500) });
+
+    const s = meter.getSnapshots().get("s");
+    expect(s?.totalTokens).toBe(875);
+    // No interval was seen, so the honest figure is the whole step: 875 tokens in 2.5s.
+    expect(s?.avgTps).toBeCloseTo(350, 6);
+    meter.dispose();
+  });
+
+  it("rates a tool call that follows text over the gap since the text", () => {
+    const meter = createMeter(loadConfigSync());
+    const base = Date.now() - 5000;
+    const tool = { sessionID: "s", assistantMessageID: "msg_1", id: "call_1" };
+
+    meter.handleEvent(textAt("s", chars(10), at(base, 0)));
+    meter.handleEvent(textAt("s", chars(10), at(base, 100)));
+    // The model wrote the arguments after its text: 400 tokens over the following 1.9s.
+    meter.handleEvent(evt("session.tool.input.ended", at(base, 2000), { ...tool, text: chars(400) }));
+    meter.handleEvent({ ...stepEnded("s", "tool-calls"), created: at(base, 2000) });
+
+    // 410 rated tokens (10 text + 400 tool) over the 2s since the opening chunk.
+    expect(meter.getSnapshots().get("s")?.avgTps).toBeCloseTo(205, 6);
+    meter.dispose();
+  });
+
+  it("counts tool input deltas once, even when input.ended repeats the full text", () => {
+    const meter = createMeter(loadConfigSync());
+    const base = Date.now() - 3000;
+    const tool = { sessionID: "s", assistantMessageID: "msg_1", id: "call_1" };
+
+    meter.handleEvent(evt("session.tool.input.delta", at(base, 0), { ...tool, delta: chars(100) }));
+    meter.handleEvent(evt("session.tool.input.ended", at(base, 1000), { ...tool, text: chars(200) }));
+    // No provider count, so the settled total is exactly what the meter counted: 300 if the
+    // ended text had been counted again on top of the delta.
+    meter.handleEvent(stepEnded("s", "tool-calls"));
+
+    const s = meter.getSnapshots().get("s");
+    expect(s?.totalTokens).toBe(200);
+    // The first 100 tokens opened the stream; the remaining 100 arrived over 1s.
+    expect(s?.avgTps).toBeCloseTo(100, 6);
+    meter.dispose();
+  });
+
+  it("keeps the streamed rate when the provider counts output that never streamed", () => {
+    const meter = createMeter(loadConfigSync());
+    const base = Date.now() - 3000;
+
+    // 10 tokens per 100ms is 100 TPS. Live log: a provider reported 7,788 output tokens for
+    // a step that streamed 728, and dividing that by the stream window read as 2,607 TPS.
+    streamSteadily(meter, base, 20, 10);
+    meter.handleEvent(stepEnded("s", "stop", { output: 7788, reasoning: 0 }));
+
+    const s = meter.getSnapshots().get("s");
+    expect(s?.totalTokens).toBe(7788);
+    expect(s?.avgTps).toBeCloseTo(100, 6);
+    meter.dispose();
+  });
+
+  it("corrects the streamed rate with the provider count when the two agree", () => {
+    const meter = createMeter(loadConfigSync());
+    const base = Date.now() - 3000;
+
+    // 210 heuristic tokens streamed; the provider counted 240 of the same output.
+    streamSteadily(meter, base, 20, 10);
+    meter.handleEvent(stepEnded("s", "stop", { output: 240, reasoning: 0 }));
+
+    expect(meter.getSnapshots().get("s")?.avgTps).toBeCloseTo(100 * (240 / 210), 6);
+    meter.dispose();
+  });
+
+  it("leaves reasoning that never streamed out of the comparison", () => {
+    const meter = createMeter(loadConfigSync());
+    const base = Date.now() - 3000;
+
+    streamSteadily(meter, base, 20, 10);
+    // 150 visible output tokens against 210 streamed; the 150 reasoning tokens were never
+    // shown. Counting them would claim 300 tokens of streamed output and inflate the rate.
+    meter.handleEvent(stepEnded("s", "stop", { output: 150, reasoning: 150 }));
+
+    const s = meter.getSnapshots().get("s");
+    expect(s?.avgTps).toBeCloseTo(100 * (150 / 210), 6);
+    expect(s?.totalTokens).toBe(300);
+    meter.dispose();
+  });
+
+  it("settles a failed step and still folds its usage", () => {
+    const meter = createMeter(loadConfigSync());
+    const base = Date.now() - 3000;
+
+    streamSteadily(meter, base, 5, 10);
+    meter.handleEvent(
+      evt("session.step.failed", at(base, 600), {
+        sessionID: "s",
+        assistantMessageID: "msg_1",
+        tokens: { input: 900, output: 60, reasoning: 0, cache: { read: 100, write: 0 } },
+      })
+    );
+
+    const s = meter.getSnapshots().get("s");
+    expect(s?.active).toBe(false);
+    expect(s?.sessionCacheReadTokens).toBe(100);
+    meter.dispose();
+  });
+
+  it("feeds every settled step to the ledger, with time to first token once per turn", () => {
+    const steps: Array<{ tokens: number; generationMs: number; ttftMs: number }> = [];
+    const meter = createMeter(loadConfigSync(), { onStepSettled: (m) => steps.push(m) });
+    const base = Date.now() - 5000;
+
+    meter.handleEvent(evt("session.execution.started", at(base, 0), { sessionID: "s" }));
+    streamSteadily(meter, base + 200, 10, 10);
+    meter.handleEvent(stepEnded("s", "tool-calls", { output: 110, reasoning: 0 }));
+    streamSteadily(meter, base + 2000, 10, 10);
+    meter.handleEvent(stepEnded("s", "stop", { output: 110, reasoning: 0 }));
+
+    expect(steps).toHaveLength(2);
+    expect(steps[0]?.ttftMs).toBe(200);
+    expect(steps[1]?.ttftMs).toBe(0);
+    for (const step of steps) {
+      // The ledger's time is the one implied by the displayed rate, so its means match it.
+      expect(step.tokens / (step.generationMs / 1000)).toBeCloseTo(100 * (110 / 110), 6);
+    }
+    meter.dispose();
+  });
+});
+
+describe("v2 stalls and calibration", () => {
+  beforeEach(() => {
+    for (const key of Object.keys(stableEnv) as Array<keyof typeof stableEnv>) {
+      originalEnv.set(key, process.env[key]);
+      process.env[key] = stableEnv[key];
+    }
+  });
+
+  afterEach(() => {
+    for (const key of Object.keys(stableEnv) as Array<keyof typeof stableEnv>) {
+      const previous = originalEnv.get(key);
+      if (previous === undefined) delete process.env[key];
+      else process.env[key] = previous;
+    }
+    originalEnv.clear();
+  });
+
+  const chars = (tokens: number) => "abcd".repeat(tokens);
+  const model = { providerID: "p", id: "m" };
+
+  it("lets a stalled stream's live rate fall instead of freezing at its last value", async () => {
+    const meter = createMeter(loadConfigSync({ rollingWindowMs: 600 }));
+    const now = Date.now();
+    meter.handleEvent({ ...textDelta("s", chars(10)), created: now - 100 });
+    meter.handleEvent({ ...textDelta("s", chars(10)), created: now });
+    const live = meter.getSnapshots().get("s")?.instantTps ?? 0;
+    expect(live).toBeCloseTo(100, 6);
+
+    // No more output: the reading republishes with the rate as of now, which keeps falling.
+    await delay(320);
+    const falling = meter.getSnapshots().get("s")?.instantTps ?? 0;
+    expect(falling).toBeGreaterThan(0);
+    expect(falling).toBeLessThan(live);
+
+    // Once the last chunk leaves the window the stream reads zero, and the timer stops.
+    await delay(700);
+    const stalled = meter.getSnapshots().get("s");
+    expect(stalled?.instantTps).toBe(0);
+    expect(stalled?.active).toBe(true);
+    meter.dispose();
+  });
+
+  it("starts a session calibrated from the factor an earlier session saved", () => {
+    const meter = createMeter(loadConfigSync(), {
+      initialCalibration: { "p/m": { factor: 2, samples: 5 } },
+    });
+    const base = Date.now() - 1000;
+    meter.handleEvent(evt("session.step.started", at(base, 0), { sessionID: "s", assistantMessageID: "msg_1", model }));
+    meter.handleEvent(textAt("s", chars(10), at(base, 100)));
+    meter.handleEvent(textAt("s", chars(10), at(base, 200)));
+
+    // 20 heuristic tokens, scaled by the saved factor from the very first chunk.
+    expect(meter.getSnapshots().get("s")?.totalTokens).toBe(40);
+    meter.dispose();
+  });
+
+  it("ignores a saved factor outside the trusted band", () => {
+    const meter = createMeter(loadConfigSync(), {
+      initialCalibration: { "p/m": { factor: 10, samples: 5 } },
+    });
+    const base = Date.now() - 1000;
+    meter.handleEvent(evt("session.step.started", at(base, 0), { sessionID: "s", assistantMessageID: "msg_1", model }));
+    meter.handleEvent(textAt("s", chars(10), at(base, 100)));
+    meter.handleEvent(textAt("s", chars(10), at(base, 200)));
+
+    expect(meter.getSnapshots().get("s")?.totalTokens).toBe(20);
+    meter.dispose();
+  });
+
+  it("reports each accepted calibration sample so it can be persisted", () => {
+    const saved: Array<[string, { factor: number; samples: number }]> = [];
+    const meter = createMeter(loadConfigSync(), {
+      onCalibrated: (key, calibration) => saved.push([key, calibration]),
+    });
+    const base = Date.now() - 1000;
+    meter.handleEvent(evt("session.step.started", at(base, 0), { sessionID: "s", assistantMessageID: "msg_1", model }));
+    meter.handleEvent(textAt("s", chars(10), at(base, 100)));
+    meter.handleEvent(textAt("s", chars(10), at(base, 200)));
+    meter.handleEvent(stepEnded("s", "stop", { output: 30, reasoning: 0 }));
+
+    expect(saved).toEqual([["p/m", { factor: 1.5, samples: 1, weight: 20 }]]);
+    meter.dispose();
+  });
+
+  it("weights calibration by size, so a tiny step barely moves it", () => {
+    const saved: Array<{ factor: number }> = [];
+    const meter = createMeter(loadConfigSync(), { onCalibrated: (_key, c) => saved.push(c) });
+    const base = Date.now() - 5000;
+    const step = (offset: number, rawTokens: number, provider: number) => {
+      meter.handleEvent(evt("session.step.started", at(base, offset), { sessionID: "s", assistantMessageID: "msg_1", model }));
+      meter.handleEvent(textAt("s", chars(rawTokens / 2), at(base, offset + 100)));
+      meter.handleEvent(textAt("s", chars(rawTokens / 2), at(base, offset + 200)));
+      meter.handleEvent({ ...stepEnded("s", "stop", { output: provider, reasoning: 0 }), created: at(base, offset + 300) });
+    };
+
+    step(0, 1000, 1000); // a long answer: the heuristic was exact
+    // A 20-token tool call whose provider count includes call framing: ratio 2. An unweighted
+    // average gave it the same say as the 1000-token answer.
+    step(1000, 20, 40);
+    expect(saved.at(-1)?.factor).toBeCloseTo(1040 / 1020, 6);
+    meter.dispose();
+  });
+
+  it("leaves a step out of correction and calibration when its reasoning count is unknown", () => {
+    const saved: unknown[] = [];
+    const meter = createMeter(loadConfigSync(), { onCalibrated: (_key, c) => saved.push(c) });
+    const base = Date.now() - 5000;
+    meter.handleEvent(evt("session.step.started", at(base, 0), { sessionID: "s", assistantMessageID: "msg_1", model }));
+    meter.handleEvent({ ...reasoningDelta("s", chars(100)), created: at(base, 100) });
+    meter.handleEvent({ ...reasoningDelta("s", chars(100)), created: at(base, 1100) });
+    // Live log: reasoning streamed, the provider reported reasoning 0 and an output below
+    // what streamed. Folded in or left out, the count is not comparable.
+    meter.handleEvent({ ...stepEnded("s", "stop", { output: 120, reasoning: 0 }), created: at(base, 1100) });
+
+    expect(meter.getSnapshots().get("s")?.avgTps).toBeCloseTo(100, 6);
+    expect(saved).toEqual([]);
+    meter.dispose();
+  });
+
+  it("keeps calibration in the ledger through a stats reset", async () => {
+    const { createLedger } = await import("../v2/ledger.js");
+    const ledger = createLedger();
+
+    ledger.record({ modelKey: "p/m", tokens: 100, generationMs: 1000, cost: 0, ttftMs: 0 });
+    ledger.recordCalibration("p/m", { factor: 1.2, samples: 3 });
+    expect(ledger.calibrations()).toEqual({ "p/m": { factor: 1.2, samples: 3 } });
+
+    // /tps reset clears throughput; calibration describes the tokenizer, not the speed.
+    ledger.clear();
+    expect(ledger.meanTps("p/m")).toBe(0);
+    expect(ledger.calibrations()).toEqual({ "p/m": { factor: 1.2, samples: 3 } });
+  });
 });

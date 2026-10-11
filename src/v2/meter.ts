@@ -16,17 +16,17 @@
  * @module v2/meter
  */
 
-import { createTracker } from "../tracker.js";
+import { correctedAverage, createTracker } from "../tracker.js";
 import { createIncrementalCounter, type IncrementalCounter } from "../tokenCounter.js";
-import { createMetrics } from "./metrics.js";
+import { createMetrics, type Calibration } from "./metrics.js";
 import {
   CLEANUP_INTERVAL_MS,
   INVALID_FINISH_REASONS,
   MAX_MESSAGE_AGE_MS,
   MAX_RETAINED_SNAPSHOTS,
   DEFAULT_UPDATE_INTERVAL_MS,
+  STALL_REPUBLISH_MS,
   TOOL_CALL_FINISH_REASON,
-  V2_EWMA_HALF_LIFE_MS,
   V2_UPDATE_INTERVAL_MS,
 } from "../constants.js";
 import type { Config, TPSTracker } from "../types.js";
@@ -39,7 +39,10 @@ import type {
   V2SessionToolSettled,
   V2SessionReasoningDelta,
   V2SessionStepEnded,
+  V2SessionStepFailed,
   V2SessionTextDelta,
+  V2SessionToolInputDelta,
+  V2SessionToolInputEnded,
   V2SessionUsageUpdated,
   V2UnknownEvent,
 } from "./types.js";
@@ -49,9 +52,12 @@ const HANDLED_EVENT_TYPES: ReadonlySet<string> = new Set<V2AnyMeterEvent["type"]
   "session.text.delta",
   "session.reasoning.delta",
   "session.step.ended",
+  "session.step.failed",
   "session.usage.updated",
   "session.idle",
   "session.step.started",
+  "session.tool.input.delta",
+  "session.tool.input.ended",
   "session.tool.called",
   "session.tool.success",
   "session.tool.failed",
@@ -80,7 +86,10 @@ export interface V2Snapshot {
   ttftMs: number;
   /** Milliseconds this turn spent inside tool execution. */
   toolMs: number;
-  /** Tokens per second excluding tool execution time — the model's true rate. */
+  /**
+   * The model's generation rate. Tool execution happens between steps, never inside a
+   * step's measured window, so this equals the step average; kept for the dashboard.
+   */
   generationTps: number;
   /** `providerID/modelID[#variant]`, or "default" before attribution arrives. */
   modelKey: string;
@@ -133,7 +142,7 @@ export interface V2StepMeasurement {
   modelKey: string;
   agent?: string;
   tokens: number;
-  /** Elapsed with tool execution subtracted. */
+  /** Time spent generating `tokens`, implied by the step's measured rate. */
   generationMs: number;
   cost: number;
   ttftMs: number;
@@ -141,6 +150,10 @@ export interface V2StepMeasurement {
 
 export interface V2MeterHooks {
   readonly onStepSettled?: (measurement: V2StepMeasurement) => void;
+  /** Per-model token calibration saved by an earlier session. */
+  readonly initialCalibration?: Readonly<Record<string, Calibration>>;
+  /** A model's calibration changed; persist it so the next session starts calibrated. */
+  readonly onCalibrated?: (modelKey: string, calibration: Calibration) => void;
 }
 
 export interface V2Meter {
@@ -180,6 +193,11 @@ interface SessionState {
   /** Wall-clock time of the most recent token; feeds snapshot `lastActivityAt`. */
   lastTokenWallAt: number | null;
   lastPublishedAt: number;
+  /**
+   * Reasoning deltas arrived this step. When they did not, provider-reported reasoning
+   * tokens were generated out of sight and must not be compared with what streamed.
+   */
+  sawReasoning: boolean;
   /** Prompt cache accounting from the latest step, for display.
    *
    * `input` here is OpenCode's `tokens.input`, which EXCLUDES cache reads and writes, so
@@ -284,7 +302,10 @@ export function createMeter(config: Config, hooks?: V2MeterHooks): V2Meter {
         : "heuristic";
 
   const sessions = new Map<string, SessionState>();
-  const metrics = createMetrics();
+  const metrics = createMetrics({
+    initial: hooks?.initialCalibration,
+    onCalibrated: hooks?.onCalibrated,
+  });
   /**
    * One incremental counter per `${messageID}:${ordinal}:${kind}`.
    *
@@ -295,6 +316,8 @@ export function createMeter(config: Config, hooks?: V2MeterHooks): V2Meter {
    */
   const streamText = new Map<string, Map<string, IncrementalCounter>>();
   const publishTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  /** Per session: fires when a live stream has gone quiet, to show its rate falling. */
+  const stallTimers = new Map<string, ReturnType<typeof setTimeout>>();
   const listeners = new Set<(snapshots: ReadonlyMap<string, V2Snapshot>) => void>();
   /** Last time each session produced an event, for the stale sweep. */
   const lastActivityAt = new Map<string, number>();
@@ -307,6 +330,15 @@ export function createMeter(config: Config, hooks?: V2MeterHooks): V2Meter {
    * session counts as a new spawn and entries never outlive the session.
    */
   const sessionSpawnAt = new Map<string, number>();
+  /**
+   * Characters of each tool call's arguments already counted from input deltas, per session,
+   * so input.ended (which repeats the full text) adds only the remainder.
+   */
+  const toolInputs = new Map<string, Map<string, number>>();
+  /** Host time each session's current step started; the fallback window for its rate. */
+  const stepStartedAt = new Map<string, number>();
+  /** Sessions whose turn time-to-first-token has already gone to the ledger. */
+  const ttftRecorded = new Set<string>();
 
   let snapshots: ReadonlyMap<string, V2Snapshot> = new Map();
   let lastSweepAt = 0;
@@ -330,13 +362,19 @@ export function createMeter(config: Config, hooks?: V2MeterHooks): V2Meter {
     return usage;
   }
 
-  /** Session-aggregated cache accounting, safe to read before any step has reported. */
+  /**
+   * Session-aggregated cache accounting, safe to read before any step has reported.
+   *
+   * Goes through getSessionUsage so a session the stale sweep freed is re-seeded from its
+   * retained reading first. Reading the freed map directly would hand the session's next
+   * live publish zeros, and that publish would overwrite the very totals it should carry on.
+   */
   function sessionCacheFields(sessionID: string) {
-    const usage = sessionUsage.get(sessionID);
+    const usage = getSessionUsage(sessionID);
     return {
-      sessionCacheReadTokens: usage?.cacheReadTokens ?? 0,
-      sessionCacheWriteTokens: usage?.cacheWriteTokens ?? 0,
-      sessionInputTokens: usage?.inputTokens ?? 0,
+      sessionCacheReadTokens: usage.cacheReadTokens,
+      sessionCacheWriteTokens: usage.cacheWriteTokens,
+      sessionInputTokens: usage.inputTokens,
     };
   }
 
@@ -368,7 +406,6 @@ export function createMeter(config: Config, hooks?: V2MeterHooks): V2Meter {
       tracker: createTracker({
         sessionId: sessionID,
         rollingWindowMs: config.rollingWindowMs,
-        ewmaHalfLifeMs: V2_EWMA_HALF_LIFE_MS,
       }),
       firstTokenAt: null,
       lastTokenAt: null,
@@ -377,6 +414,7 @@ export function createMeter(config: Config, hooks?: V2MeterHooks): V2Meter {
       lastPublishedWallAt: 0,
       firstTokenWallAt: null,
       dirty: false,
+      sawReasoning: false,
       cacheReadTokens: 0,
       cacheWriteTokens: 0,
       inputTokens: 0,
@@ -393,10 +431,46 @@ export function createMeter(config: Config, hooks?: V2MeterHooks): V2Meter {
     }
   }
 
+  function clearStallTimer(sessionID: string): void {
+    const timer = stallTimers.get(sessionID);
+    if (timer) {
+      clearTimeout(timer);
+      stallTimers.delete(sessionID);
+    }
+  }
+
+  /**
+   * Republishes a live reading whose stream has gone quiet, with the rate as of now.
+   *
+   * The tracker can rate any moment, but a reading only changes when output arrives, so a
+   * stalled stream kept showing its last speed. Wall time since the last chunk is carried
+   * onto the host clock the tracker uses. Repeats until the rate reaches zero; the next
+   * chunk, step end or idle takes over from there.
+   */
+  function republishStalled(sessionID: string): void {
+    stallTimers.delete(sessionID);
+    const state = sessions.get(sessionID);
+    const current = snapshots.get(sessionID);
+    if (!state || !current?.active || state.lastTokenAt === null || state.lastTokenWallAt === null) {
+      return;
+    }
+    const hostNow = state.lastTokenAt + (Date.now() - state.lastTokenWallAt);
+    const instantTps = state.tracker.getInstantTPS(hostNow);
+    mutateSnapshots((draft) => {
+      draft.set(sessionID, { ...current, instantTps });
+    });
+    if (instantTps > 0) {
+      stallTimers.set(sessionID, setTimeout(() => republishStalled(sessionID), STALL_REPUBLISH_MS));
+    }
+  }
+
   function resetSession(sessionID: string): void {
     clearPublishTimer(sessionID);
+    clearStallTimer(sessionID);
     sessions.delete(sessionID);
     streamText.delete(sessionID);
+    toolInputs.delete(sessionID);
+    stepStartedAt.delete(sessionID);
   }
 
   /**
@@ -435,6 +509,7 @@ export function createMeter(config: Config, hooks?: V2MeterHooks): V2Meter {
       sessionUsage.delete(sessionID);
       metrics.forget(sessionID);
       sessionSpawnAt.delete(sessionID);
+      ttftRecorded.delete(sessionID);
       // Keep the activity stamp only while a reading survives, so it can be aged out later.
       if (!snapshots.has(sessionID)) {
         lastActivityAt.delete(sessionID);
@@ -459,32 +534,14 @@ export function createMeter(config: Config, hooks?: V2MeterHooks): V2Meter {
     });
   }
 
-  /**
-   * Fields derived from turn decomposition and attribution.
-   *
-   * generationTps subtracts tool execution from the elapsed window, so a turn that spent
-   * 8s of its 10s running a shell command reports the model's real rate rather than an
-   * average diluted by waiting. v1 had no event timestamps and so could not do this.
-   */
-  /** Elapsed measured on the host clock, falling back to the tracker before two samples. */
-  function elapsedFor(state: SessionState): number {
-    if (state.firstTokenAt !== null && state.lastTokenAt !== null) {
-      const span = state.lastTokenAt - state.firstTokenAt;
-      if (span > 0) {
-        return span;
-      }
-    }
-    return state.tracker.getElapsedMs();
-  }
-
-  function derivedFields(sessionID: string, totalTokens: number, elapsedMs: number) {
+  /** Fields derived from turn decomposition and attribution. */
+  function derivedFields(sessionID: string, avgTps: number) {
     const turn = metrics.turnOf(sessionID);
     const attribution = metrics.attributionOf(sessionID);
-    const generationMs = Math.max(0, elapsedMs - turn.toolMs);
     return {
       ttftMs: turn.ttftMs,
       toolMs: turn.toolMs,
-      generationTps: generationMs > 0 ? totalTokens / (generationMs / 1000) : 0,
+      generationTps: avgTps,
       modelKey: attribution.key,
       agent: attribution.agent,
       calibrationSamples: metrics.samplesOf(sessionID),
@@ -498,8 +555,10 @@ export function createMeter(config: Config, hooks?: V2MeterHooks): V2Meter {
       return;
     }
 
+    // Nothing goes on screen until a rate is measurable: a figure computed over a few
+    // milliseconds is noise, and it is exactly what produced five-digit readings.
     const totalTokens = state.tracker.getTotalTokens();
-    if (totalTokens === 0) {
+    if (totalTokens === 0 || !state.tracker.isRateReady()) {
       return;
     }
 
@@ -507,23 +566,23 @@ export function createMeter(config: Config, hooks?: V2MeterHooks): V2Meter {
     state.lastPublishedAt = now;
     state.lastPublishedWallAt = Date.now();
     state.dirty = false;
+    const avgTps = state.tracker.getAverageTPS();
     mutateSnapshots((draft) => {
-      const elapsedMs = elapsedFor(state);
       draft.set(sessionID, {
         sessionID,
         lastActivityAt: state.lastTokenWallAt ?? Date.now(),
         startedAt: sessionSpawnAt.get(sessionID) ?? state.firstTokenAt ?? now,
         instantTps: state.tracker.getSmoothedTPS(),
-        avgTps: elapsedMs > 0 ? totalTokens / (elapsedMs / 1000) : state.tracker.getAverageTPS(),
+        avgTps,
         totalTokens,
-        elapsedMs,
+        elapsedMs: state.tracker.getElapsedMs(),
         active,
         overheadTokens: overheadFor(sessionID),
         cacheReadTokens: state.cacheReadTokens,
         cacheWriteTokens: state.cacheWriteTokens,
         inputTokens: state.inputTokens,
         ...sessionCacheFields(sessionID),
-        ...derivedFields(sessionID, totalTokens, elapsedMs),
+        ...derivedFields(sessionID, avgTps),
       });
     });
   }
@@ -548,16 +607,49 @@ export function createMeter(config: Config, hooks?: V2MeterHooks): V2Meter {
     return Math.max(0, usage.cumulativeTokens - usage.observedStepTokens);
   }
 
+  /**
+   * The settled figures for a step that just ended.
+   *
+   * The rate comes from what streamed, timed by when it streamed, corrected by the provider's
+   * count when the two agree (see correctedAverage). A step too short to time (one chunk, or
+   * none) falls back to its whole duration from step start. That includes time to first
+   * token, so it reads low rather than high.
+   */
+  function settledReading(
+    sessionID: string,
+    state: SessionState | undefined,
+    providerTokens: number,
+    providerVisible: number,
+    endedAt: number
+  ): { totalTokens: number; avgTps: number; elapsedMs: number } {
+    const streamed = state?.tracker.getTotalTokens() ?? 0;
+    const totalTokens = providerTokens > 0 ? providerTokens : streamed;
+    const streamedAvg = state?.tracker.getAverageTPS() ?? 0;
+    if (state && streamedAvg > 0) {
+      return {
+        totalTokens,
+        avgTps: correctedAverage(streamedAvg, streamed, providerVisible),
+        elapsedMs: state.tracker.getElapsedMs(),
+      };
+    }
+    const startedAt = stepStartedAt.get(sessionID);
+    const elapsedMs = startedAt !== undefined ? Math.max(0, endedAt - startedAt) : 0;
+    return {
+      totalTokens,
+      avgTps: elapsedMs > 0 ? totalTokens / (elapsedMs / 1000) : 0,
+      elapsedMs,
+    };
+  }
+
   function publishFinal(
     sessionID: string,
-    totalTokens: number,
-    avgTps: number,
-    elapsedMs: number,
+    reading: { totalTokens: number; avgTps: number; elapsedMs: number },
     overheadTokens: number,
     at: number,
     stepCache?: StepCacheFields
   ): boolean {
-    if (totalTokens === 0 || elapsedMs < config.initialDisplayDelayMs) {
+    const { totalTokens, avgTps, elapsedMs } = reading;
+    if (totalTokens <= 0 || !(avgTps > 0)) {
       return false;
     }
     const state = sessions.get(sessionID);
@@ -581,7 +673,7 @@ export function createMeter(config: Config, hooks?: V2MeterHooks): V2Meter {
         overheadTokens,
         ...cacheFields,
         ...sessionCacheFields(sessionID),
-        ...derivedFields(sessionID, totalTokens, elapsedMs),
+        ...derivedFields(sessionID, avgTps),
       });
     });
     return true;
@@ -627,11 +719,9 @@ export function createMeter(config: Config, hooks?: V2MeterHooks): V2Meter {
     stepCache?: StepCacheFields
   ): boolean {
     const state = sessions.get(sessionID);
-    if (state && state.tracker.getTotalTokens() > 0) {
-      if (state.firstTokenAt !== null && now - state.firstTokenAt >= config.initialDisplayDelayMs) {
-        publish(sessionID, false, now);
-        return true;
-      }
+    if (state?.tracker.isRateReady()) {
+      publish(sessionID, false, now);
+      return true;
     }
 
     const current = snapshots.get(sessionID);
@@ -749,23 +839,25 @@ export function createMeter(config: Config, hooks?: V2MeterHooks): V2Meter {
     return counter.add(delta);
   }
 
+  /** Records tokens that arrived at `at` (host clock), rated over the gap since the last. */
   function recordTokens(sessionID: string, tokenCount: number, at: number): void {
     if (tokenCount <= 0) {
       return;
     }
-    const now = at;
     const state = getSessionState(sessionID);
     if (state.firstTokenAt === null) {
-      state.firstTokenAt = now;
+      state.firstTokenAt = at;
       state.firstTokenWallAt = Date.now();
     }
     if (!sessionSpawnAt.has(sessionID)) {
-      sessionSpawnAt.set(sessionID, now);
+      sessionSpawnAt.set(sessionID, at);
     }
-    state.lastTokenAt = now;
+    state.lastTokenAt = at;
     state.lastTokenWallAt = Date.now();
-    state.tracker.recordTokens(tokenCount, now);
-    maybePublishActive(sessionID, now);
+    state.tracker.recordTokens(tokenCount, at);
+    maybePublishActive(sessionID, at);
+    clearStallTimer(sessionID);
+    stallTimers.set(sessionID, setTimeout(() => republishStalled(sessionID), STALL_REPUBLISH_MS));
   }
 
   function handleDelta(event: V2SessionTextDelta | V2SessionReasoningDelta): void {
@@ -775,11 +867,62 @@ export function createMeter(config: Config, hooks?: V2MeterHooks): V2Meter {
     }
     const kind = event.type === "session.reasoning.delta" ? "reasoning" : "text";
     const at = eventTime(event, Date.now());
+    if (kind === "reasoning") {
+      getSessionState(sessionID).sawReasoning = true;
+    }
     const raw = countDelta(sessionID, assistantMessageID, ordinal, kind, delta);
     metrics.onFirstToken(sessionID, at);
     // scale() applies the model's learned chars-per-token factor and carries the fractional
     // remainder, so calibration never silently drops sub-token amounts.
     recordTokens(sessionID, metrics.scale(sessionID, raw), at);
+  }
+
+  function toolInputKey(event: { data: { assistantMessageID?: string; id: string } }): string {
+    return `${event.data.assistantMessageID ?? ""}:tool:${event.data.id}`;
+  }
+
+  /**
+   * Counts tool-call arguments: output the model generated, so it belongs in the total.
+   *
+   * They are rated like any other chunk, over the gap since the previous one. NOT from
+   * session.tool.input.started: providers that do not stream tool arguments deliver the
+   * whole call at once, and the host then emits started and ended ~100ms apart, so that
+   * window read as 8,763 TPS for an 850-token call in live testing. A tool call that is the
+   * step's first output is its opening chunk, and the step falls back to its whole duration.
+   */
+  function handleToolInput(event: V2SessionToolInputDelta | V2SessionToolInputEnded): void {
+    const { sessionID } = event.data;
+    if (typeof event.data.id !== "string") {
+      return;
+    }
+    const at = eventTime(event, Date.now());
+    const key = toolInputKey(event);
+    const inputs = toolInputs.get(sessionID) ?? new Map<string, number>();
+    toolInputs.set(sessionID, inputs);
+    const counted = inputs.get(key) ?? 0;
+
+    let added: string;
+    if (event.type === "session.tool.input.delta") {
+      added = typeof event.data.delta === "string" ? event.data.delta : "";
+      // Remember how much was counted so input.ended adds only the remainder.
+      inputs.set(key, counted + added.length);
+    } else {
+      const text = typeof event.data.text === "string" ? event.data.text : "";
+      added = text.slice(counted);
+      inputs.delete(key);
+    }
+    if (added.length === 0) {
+      return;
+    }
+
+    const cache = getStreamCache(sessionID);
+    let counter = cache.get(key);
+    if (!counter) {
+      counter = createIncrementalCounter(algorithm);
+      cache.set(key, counter);
+    }
+    metrics.onFirstToken(sessionID, at);
+    recordTokens(sessionID, metrics.scale(sessionID, counter.add(added)), at);
   }
 
   function handleUsageUpdated(event: V2SessionUsageUpdated): void {
@@ -793,6 +936,16 @@ export function createMeter(config: Config, hooks?: V2MeterHooks): V2Meter {
 
   function handleStepStarted(event: V2SessionStepStarted): void {
     metrics.onStepStarted(event.data.sessionID, event.data.model, event.data.agent);
+    // Prefer the step's own start stamp: the event is published with the first output, so its
+    // `created` would leave a whole-call delivery's generation time out of the window.
+    const created = eventTime(event, Date.now());
+    const started = event.data.started;
+    const plausible =
+      typeof started === "number" &&
+      Number.isFinite(started) &&
+      started <= created &&
+      created - started < 86_400_000;
+    stepStartedAt.set(event.data.sessionID, plausible ? started : created);
   }
 
   function handleToolCalled(event: V2SessionToolCalled): void {
@@ -805,6 +958,7 @@ export function createMeter(config: Config, hooks?: V2MeterHooks): V2Meter {
 
   function handleExecutionStarted(event: V2SessionExecutionStarted): void {
     metrics.onExecutionStarted(event.data.sessionID, eventTime(event, Date.now()));
+    ttftRecorded.delete(event.data.sessionID);
   }
 
   function handleExecutionSettled(event: V2SessionExecutionSettled): void {
@@ -814,98 +968,107 @@ export function createMeter(config: Config, hooks?: V2MeterHooks): V2Meter {
     );
   }
 
-  function handleStepEnded(event: V2SessionStepEnded): void {
-    const { sessionID, finish, tokens } = event.data;
-    const now = eventTime(event, Date.now());
-
-    // Capture the step's prompt cache accounting before any early return, so a tool-calls
-    // step still freezes its cache numbers alongside its TPS. Kept in locals rather than
-    // only on session state, because a step with no text/reasoning deltas never creates
-    // state and must still reach the footer.
+  /**
+   * Folds a settled step's provider usage into the session: cache accounting, the observed
+   * total behind the overhead residual, and one calibration sample.
+   *
+   * Runs for every step that reports usage — including one that ends to run tools, and one
+   * that never streamed anything — so none of them is missing from the session figures.
+   */
+  function foldStepUsage(
+    sessionID: string,
+    tokens: V2SessionStepEnded["data"]["tokens"] | undefined
+  ): { stepCache: StepCacheFields; providerTokens: number; providerVisible: number } {
     const stepCache: StepCacheFields = {
       cacheReadTokens: toTokenCount(tokens?.cache?.read),
       cacheWriteTokens: toTokenCount(tokens?.cache?.write),
       inputTokens: toTokenCount(tokens?.input),
     };
-
-    const stepState = sessions.get(sessionID);
-    if (stepState) {
-      stepState.cacheReadTokens = stepCache.cacheReadTokens;
-      stepState.cacheWriteTokens = stepCache.cacheWriteTokens;
-      stepState.inputTokens = stepCache.inputTokens;
+    const state = sessions.get(sessionID);
+    if (state) {
+      state.cacheReadTokens = stepCache.cacheReadTokens;
+      state.cacheWriteTokens = stepCache.cacheWriteTokens;
+      state.inputTokens = stepCache.inputTokens;
     }
 
-    // Fold this step's cache accounting into the session rollup. Done before any early
-    // return so a tool-calls step contributes too, and so the session rate stays on screen
-    // while the next step streams (this state outlives resetSession).
-    const sessionUsageForStep = getSessionUsage(sessionID);
-    sessionUsageForStep.cacheReadTokens += stepCache.cacheReadTokens;
-    sessionUsageForStep.cacheWriteTokens += stepCache.cacheWriteTokens;
-    sessionUsageForStep.inputTokens += stepCache.inputTokens;
+    const usage = getSessionUsage(sessionID);
+    usage.cacheReadTokens += stepCache.cacheReadTokens;
+    usage.cacheWriteTokens += stepCache.cacheWriteTokens;
+    usage.inputTokens += stepCache.inputTokens;
 
-    // Every settled step consumed tokens, including one that ends to run tools — record it
-    // before any early return or the overhead residual overcounts.
-    const settledTokens = toTokenCount(tokens?.output) + toTokenCount(tokens?.reasoning);
-    if (settledTokens > 0) {
-      sessionUsageForStep.observedStepTokens += settledTokens;
+    const output = toTokenCount(tokens?.output);
+    const reasoning = toTokenCount(tokens?.reasoning);
+    const providerTokens = output + reasoning;
+    if (providerTokens > 0) {
+      usage.observedStepTokens += providerTokens;
     }
-    // One closed calibration loop per step: heuristic tokens streamed vs provider truth.
-    metrics.calibrate(sessionID, settledTokens);
+    // Compare like with like: reasoning the host never streamed is in the provider's count
+    // but not in the heuristic one, so it would skew both calibration and the step's rate.
+    // And when reasoning streamed but the provider reports none, it either folded reasoning
+    // into `output` or left it out; either way the count is not comparable, so it is unused
+    // (0) rather than guessed at. Live testing hit exactly this and scaled rates down 40%.
+    const providerVisible =
+      state?.sawReasoning && reasoning === 0 ? 0 : output + (state?.sawReasoning ? reasoning : 0);
+    metrics.calibrate(sessionID, providerVisible);
+    return { stepCache, providerTokens, providerVisible };
+  }
 
-    // A step that ends to run tools is not the end of the turn — hold the last reading
-    // on screen so the meter does not blink out between tool calls.
-    if (finish === TOOL_CALL_FINISH_REASON) {
-      persistIdleSnapshot(sessionID, now, stepCache);
-      resetSession(sessionID);
-      return;
-    }
+  function handleStepEnded(event: V2SessionStepEnded): void {
+    const { sessionID, finish } = event.data;
+    const now = eventTime(event, Date.now());
+    const state = sessions.get(sessionID);
+    const { stepCache, providerTokens, providerVisible } = foldStepUsage(
+      sessionID,
+      event.data.tokens
+    );
 
-    if (finish && INVALID_FINISH_REASONS.has(finish)) {
+    // A finish the host could not classify says nothing trustworthy about this step.
+    if (finish && finish !== TOOL_CALL_FINISH_REASON && INVALID_FINISH_REASONS.has(finish)) {
       resetSession(sessionID);
       clearActiveSnapshot(sessionID);
       return;
     }
 
-    const state = sessions.get(sessionID);
-    const stepTokens = settledTokens;
-    const trackedTokens = state?.tracker.getTotalTokens() ?? 0;
-    // Fall back to the streamed heuristic, never to the cumulative session total —
-    // session.usage.updated is a whole-session figure and would wildly overstate one step.
-    const totalTokens = stepTokens > 0 ? stepTokens : trackedTokens;
-    const elapsedMs = state?.firstTokenAt ? Math.max(0, now - state.firstTokenAt) : 0;
-    const avgTps = elapsedMs > 0 ? totalTokens / (elapsedMs / 1000) : 0;
-
-    const published = publishFinal(
-      sessionID,
-      totalTokens,
-      avgTps,
-      elapsedMs,
-      overheadFor(sessionID),
-      now,
-      stepCache
-    );
-    if (!published) {
-      // No deltas means no tracker and no elapsed window to publish, but the step's cache
-      // accounting should still reach the retained reading.
+    // Every other step settles the same way, including one that ends to run tools: its
+    // reading stays on screen, frozen, until the next step streams.
+    const reading = settledReading(sessionID, state, providerTokens, providerVisible, now);
+    if (!publishFinal(sessionID, reading, overheadFor(sessionID), now, stepCache)) {
+      // Nothing measurable to show, but the step's cache accounting still belongs on screen.
       mergeSnapshotCache(sessionID, stepCache);
     }
 
-    // Feed the durable rollup. An aborted turn is excluded: its elapsed window is truncated
-    // at an arbitrary point, so folding it in would drag every average down.
+    // Feed the durable rollup. An aborted turn is excluded: its window was cut off at an
+    // arbitrary point, so folding it in would drag every average down.
     const turn = metrics.turnOf(sessionID);
-    if (!turn.interrupted && totalTokens > 0) {
+    if (!turn.interrupted && reading.totalTokens > 0 && reading.avgTps > 0) {
       const attribution = metrics.attributionOf(sessionID);
+      // Time to first token belongs to the turn, so it is recorded once, not once per step.
+      const ttftMs = ttftRecorded.has(sessionID) ? 0 : turn.ttftMs;
+      if (ttftMs > 0) {
+        ttftRecorded.add(sessionID);
+      }
       hooks?.onStepSettled?.({
         sessionID,
         modelKey: attribution.key,
         agent: attribution.agent,
-        tokens: totalTokens,
-        generationMs: Math.max(0, elapsedMs - turn.toolMs),
+        tokens: reading.totalTokens,
+        generationMs: (reading.totalTokens / reading.avgTps) * 1000,
         cost: typeof event.data.cost === "number" && event.data.cost > 0 ? event.data.cost : 0,
-        ttftMs: turn.ttftMs,
+        ttftMs,
       });
     }
 
+    resetSession(sessionID);
+  }
+
+  /**
+   * A step that ended on an error. Its usage still counts when the provider reported any;
+   * the reading freezes where it was, since a failed step's rate is not one to settle on.
+   */
+  function handleStepFailed(event: V2SessionStepFailed): void {
+    const { sessionID } = event.data;
+    const { stepCache } = foldStepUsage(sessionID, event.data.tokens);
+    persistIdleSnapshot(sessionID, eventTime(event, Date.now()), stepCache);
     resetSession(sessionID);
   }
 
@@ -949,11 +1112,19 @@ export function createMeter(config: Config, hooks?: V2MeterHooks): V2Meter {
         case "session.step.ended":
           handleStepEnded(event);
           break;
+        case "session.step.failed":
+          handleStepFailed(event);
+          break;
+        case "session.tool.input.delta":
+        case "session.tool.input.ended":
+          handleToolInput(event);
+          break;
         case "session.idle":
           persistIdleSnapshot(event.data.sessionID, eventTime(event, Date.now()));
           resetSession(event.data.sessionID);
           // The run is over: a re-dispatch is a new spawn and rejoins the footer at the end.
           sessionSpawnAt.delete(event.data.sessionID);
+          ttftRecorded.delete(event.data.sessionID);
           break;
       }
     },
@@ -974,11 +1145,18 @@ export function createMeter(config: Config, hooks?: V2MeterHooks): V2Meter {
         clearTimeout(timer);
       }
       publishTimers.clear();
+      for (const timer of stallTimers.values()) {
+        clearTimeout(timer);
+      }
+      stallTimers.clear();
       sessions.clear();
       streamText.clear();
       lastActivityAt.clear();
       sessionUsage.clear();
       sessionSpawnAt.clear();
+      toolInputs.clear();
+      stepStartedAt.clear();
+      ttftRecorded.clear();
       metrics.dispose();
       listeners.clear();
       snapshots = new Map();

@@ -17,38 +17,30 @@ export const DEFAULT_INITIAL_DISPLAY_DELAY_MS = 10;
 /** Default rolling window duration for TPS calculation (ms) */
 export const DEFAULT_ROLLING_WINDOW_MS = 1000;
 
-/** Maximum number of entries in the ring buffer */
-export const MAX_BUFFER_SIZE = 100;
-
-/** Minimum window duration for TPS calculation (seconds) to avoid division by near-zero */
-export const MIN_WINDOW_DURATION_SECONDS = 0.3;
-
-/** Token count threshold to trigger burst smoothing (tokens) */
-export const BURST_TOKEN_THRESHOLD = 50;
-
-/** Default EWMA half-life (ms) for smoothing normal streaming */
-export const DEFAULT_EWMA_HALF_LIFE_MS = 250;
+/**
+ * Maximum chunks kept for the rolling window. Past this the oldest two are merged, so a
+ * very chatty stream coarsens the window edge instead of dropping tokens from it.
+ */
+export const MAX_BUFFER_SIZE = 256;
 
 /**
- * EWMA half-life (ms) for normal streaming on v2.
+ * Shortest generation span (ms) a rate is computed over.
  *
- * Lower than the v1 default: v2 timestamps tokens with the host clock rather than the
- * event-flush clock, so the rolling window is already an accurate average and the extra
- * exponential lag mostly just delays the reading.
+ * Below this, one chunk more or less swings the figure wildly, so the meter reports nothing
+ * rather than a guess. Kept well under v2's ~100ms output flush so the first live reading
+ * appears with the second chunk.
  */
-export const V2_EWMA_HALF_LIFE_MS = 120;
+export const MIN_RATE_SPAN_MS = 50;
 
-/** EWMA half-life (ms) applied during medium bursts (50-200 tokens) */
-export const BURST_EWMA_HALF_LIFE_MS = 3000;
-
-/** Token count threshold for very large bursts (tool outputs) */
-export const LARGE_BURST_THRESHOLD = 200;
-
-/** EWMA half-life (ms) for very large bursts */
-export const LARGE_BURST_EWMA_HALF_LIFE_MS = 5000;
-
-/** Maximum initial TPS value to prevent startup spikes */
-export const MAX_INITIAL_TPS = 100;
+/**
+ * Accepted range for provider tokens / streamed tokens on one step.
+ *
+ * Inside it, the provider's exact count corrects the heuristic's estimate of the step's
+ * rate. Outside it the two are not counting the same output (hidden reasoning, content the
+ * host never streamed), so scaling by the ratio would invent throughput.
+ */
+export const MIN_PROVIDER_RATIO = 0.5;
+export const MAX_PROVIDER_RATIO = 2;
 
 // =============================================================================
 // UI Display Constants
@@ -75,6 +67,16 @@ export const V2_UPDATE_INTERVAL_MS = 8;
  * line is on screen: the single-session meter does not depend on time.
  */
 export const AGGREGATE_TICK_INTERVAL_MS = 500;
+
+/**
+ * How long a live stream may go quiet (ms) before its reading is republished with the rate
+ * as of now, and how often that repeats until output resumes or the rate reaches zero.
+ *
+ * A reading only changes when output arrives, so without this a stalled stream (rate limit,
+ * a slow provider) kept showing its last speed. Comfortably above v2's ~100ms output flush,
+ * so a healthy stream never triggers it.
+ */
+export const STALL_REPUBLISH_MS = 250;
 
 /** Minimum interval between toast updates (ms) - prevents UI flooding */
 export const MIN_TOAST_INTERVAL_MS = 80;

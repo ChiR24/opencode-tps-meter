@@ -1,7 +1,7 @@
 import type { TuiPlugin, TuiPluginApi, TuiPluginModule } from "@opencode-ai/plugin/tui";
 import { createEffect, createMemo, createSignal, onCleanup, Show } from "solid-js";
 import { agentNameFromMessage } from "./agentName.js";
-import { createTracker } from "./tracker.js";
+import { correctedAverage, createTracker } from "./tracker.js";
 import { createTokenizer, createIncrementalCounter, type IncrementalCounter } from "./tokenCounter.js";
 import { defaultConfig, loadConfigSync } from "./config.js";
 import {
@@ -11,6 +11,7 @@ import {
   INVALID_FINISH_REASONS,
   MAX_MESSAGE_AGE_MS,
   MAX_REMEMBERED_SESSIONS,
+  STALL_REPUBLISH_MS,
   TOOL_CALL_FINISH_REASON,
 } from "./constants.js";
 import { formatMeterText } from "./format.js";
@@ -34,6 +35,11 @@ interface SessionState {
   /** Local time of the most recent token; feeds snapshot `lastActivityAt`. */
   lastTokenAt: number | null;
   lastPublishedAt: number;
+  /**
+   * A reasoning part produced tokens this step. When none did, provider-reported reasoning
+   * was generated out of sight and must not be compared with what streamed.
+   */
+  sawReasoning: boolean;
   /** Prompt cache accounting for the current turn, from the latest message.updated. */
   cacheReadTokens: number;
   cacheWriteTokens: number;
@@ -242,6 +248,8 @@ const tui: TuiPlugin = async (api) => {
   const partTextCache = new Map<string, Map<string, string | IncrementalCounter>>();
   const messageRoles = new Map<string, Map<string, Role>>();
   const publishTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  /** Per session: fires when a live stream has gone quiet, to show its rate falling. */
+  const stallTimers = new Map<string, ReturnType<typeof setTimeout>>();
   const disposers: Array<() => void> = [];
   /**
    * Parent links and agent names per session, for multi-session attribution.
@@ -363,6 +371,7 @@ const tui: TuiPlugin = async (api) => {
       firstTokenAt: null,
       lastTokenAt: null,
       lastPublishedAt: 0,
+      sawReasoning: false,
       cacheReadTokens: 0,
       cacheWriteTokens: 0,
       inputTokens: 0,
@@ -452,8 +461,10 @@ const tui: TuiPlugin = async (api) => {
       return;
     }
 
+    // Nothing goes on screen until a rate is measurable: a figure computed over a few
+    // milliseconds is noise, and it is exactly what produced five-digit readings.
     const totalTokens = state.tracker.getTotalTokens();
-    if (totalTokens === 0) {
+    if (totalTokens === 0 || !state.tracker.isRateReady()) {
       return;
     }
 
@@ -533,9 +544,47 @@ const tui: TuiPlugin = async (api) => {
     }
   }
 
-  function publishFinal(sessionId: string, totalTokens: number, avgTps: number, elapsedMs: number): void {
-    if (totalTokens === 0 || elapsedMs < config.initialDisplayDelayMs) {
-      return;
+  /**
+   * The settled figures for a completed assistant message.
+   *
+   * The rate comes from what streamed, timed by when it streamed, corrected by the provider's
+   * count when the two agree (see correctedAverage). A message too short to time falls back
+   * to its whole duration, created to completed. Both are server timestamps, so the fallback
+   * never divides one clock by another; it includes time to first token, so it reads low
+   * rather than high.
+   */
+  function settledReading(
+    state: SessionState | undefined,
+    providerTokens: number,
+    providerVisible: number,
+    createdAt: number,
+    completedAt: number
+  ): { totalTokens: number; avgTps: number; elapsedMs: number } {
+    const streamed = state?.tracker.getTotalTokens() ?? 0;
+    const totalTokens = providerTokens > 0 ? providerTokens : streamed;
+    const streamedAvg = state?.tracker.getAverageTPS() ?? 0;
+    if (state && streamedAvg > 0) {
+      return {
+        totalTokens,
+        avgTps: correctedAverage(streamedAvg, streamed, providerVisible),
+        elapsedMs: state.tracker.getElapsedMs(),
+      };
+    }
+    const elapsedMs = Math.max(0, completedAt - createdAt);
+    return {
+      totalTokens,
+      avgTps: elapsedMs > 0 ? totalTokens / (elapsedMs / 1000) : 0,
+      elapsedMs,
+    };
+  }
+
+  function publishFinal(
+    sessionId: string,
+    reading: { totalTokens: number; avgTps: number; elapsedMs: number }
+  ): boolean {
+    const { totalTokens, avgTps, elapsedMs } = reading;
+    if (totalTokens <= 0 || !(avgTps > 0)) {
+      return false;
     }
 
     const state = sessions.get(sessionId);
@@ -557,10 +606,39 @@ const tui: TuiPlugin = async (api) => {
       startedAt: sessionSpawnAt.get(sessionId) ?? now,
     };
     setSnapshots((current) => new Map(current).set(sessionId, nextSnapshot));
+    return true;
+  }
+
+  function clearStallTimer(sessionId: string): void {
+    const timer = stallTimers.get(sessionId);
+    if (timer) {
+      clearTimeout(timer);
+      stallTimers.delete(sessionId);
+    }
+  }
+
+  /**
+   * Republishes a live reading whose stream has gone quiet, with the rate as of now, so a
+   * stalled stream shows its speed falling instead of holding its last value. Repeats until
+   * the rate reaches zero; the next chunk, message completion or idle takes over from there.
+   */
+  function republishStalled(sessionId: string): void {
+    stallTimers.delete(sessionId);
+    const state = sessions.get(sessionId);
+    const current = snapshots().get(sessionId);
+    if (!state || !current?.active) {
+      return;
+    }
+    const instantTps = state.tracker.getInstantTPS(Date.now());
+    setSnapshots((existing) => new Map(existing).set(sessionId, { ...current, instantTps }));
+    if (instantTps > 0) {
+      stallTimers.set(sessionId, setTimeout(() => republishStalled(sessionId), STALL_REPUBLISH_MS));
+    }
   }
 
   function resetSession(sessionId: string): void {
     clearPublishTimer(sessionId);
+    clearStallTimer(sessionId);
     sessions.delete(sessionId);
     partTextCache.delete(sessionId);
     messageRoles.delete(sessionId);
@@ -588,11 +666,7 @@ const tui: TuiPlugin = async (api) => {
     stepCache?: Pick<TuiSnapshot, "cacheReadTokens" | "cacheWriteTokens" | "inputTokens">
   ): void {
     const state = sessions.get(sessionId);
-    if (
-      state?.tracker.getTotalTokens() &&
-      state.firstTokenAt !== null &&
-      now - state.firstTokenAt >= config.initialDisplayDelayMs
-    ) {
+    if (state?.tracker.isRateReady()) {
       publish(sessionId, false, now);
       return;
     }
@@ -656,6 +730,8 @@ const tui: TuiPlugin = async (api) => {
 
     state.tracker.recordTokens(tokenCount, now);
     maybePublishActive(sessionId, now);
+    clearStallTimer(sessionId);
+    stallTimers.set(sessionId, setTimeout(() => republishStalled(sessionId), STALL_REPUBLISH_MS));
     return true;
   }
 
@@ -731,32 +807,38 @@ const tui: TuiPlugin = async (api) => {
     sessionCacheForStep.write += stepCache.write;
     sessionCacheForStep.input += stepCache.input;
 
-    if (info.finish === TOOL_CALL_FINISH_REASON) {
-      persistIdleSnapshot(sessionId, info.time.completed, {
-        cacheReadTokens,
-        cacheWriteTokens,
-        inputTokens,
-      });
-      resetSession(sessionId);
-      return;
-    }
-
-    if (info.finish && INVALID_FINISH_REASONS.has(info.finish)) {
+    // A finish the host could not classify says nothing trustworthy about this message.
+    if (
+      info.finish &&
+      info.finish !== TOOL_CALL_FINISH_REASON &&
+      INVALID_FINISH_REASONS.has(info.finish)
+    ) {
       resetSession(sessionId);
       clearActiveSnapshot(sessionId);
       return;
     }
 
     const state = sessions.get(sessionId);
-    const reportedTokens = info.tokens.output + info.tokens.reasoning;
-    const trackedTokens = state?.tracker.getTotalTokens() ?? 0;
-    const totalTokens = reportedTokens > 0 ? reportedTokens : trackedTokens;
-    const elapsedMs = state?.firstTokenAt
-      ? Math.max(0, info.time.completed - state.firstTokenAt)
-      : Math.max(0, info.time.completed - info.time.created);
-    const avgTps = elapsedMs > 0 ? totalTokens / (elapsedMs / 1000) : 0;
+    const output = typeof info.tokens.output === "number" ? info.tokens.output : 0;
+    const reasoning = typeof info.tokens.reasoning === "number" ? info.tokens.reasoning : 0;
+    const reading = settledReading(
+      state,
+      output + reasoning,
+      // Streamed reasoning with none reported is not comparable (see the v2 meter): unused.
+      state?.sawReasoning && reasoning === 0 ? 0 : output + (state?.sawReasoning ? reasoning : 0),
+      info.time.created,
+      info.time.completed
+    );
 
-    publishFinal(sessionId, totalTokens, avgTps, elapsedMs);
+    // Every other message settles the same way, including one that ends to run tools: its
+    // reading stays on screen, frozen, until the next message streams.
+    if (!publishFinal(sessionId, reading)) {
+      persistIdleSnapshot(sessionId, info.time.completed, {
+        cacheReadTokens,
+        cacheWriteTokens,
+        inputTokens,
+      });
+    }
     resetSession(sessionId);
   }));
 
@@ -801,7 +883,9 @@ const tui: TuiPlugin = async (api) => {
         ? countTokenDifference(previousText, text)
         : tokenizer.count(text);
       sessionCache.set(cacheKey, text);
-      recordTokenCount(event.properties.sessionID, tokenCount);
+      if (recordTokenCount(event.properties.sessionID, tokenCount) && part.type === "reasoning") {
+        getSessionState(event.properties.sessionID).sawReasoning = true;
+      }
     }
   }));
 
@@ -831,6 +915,10 @@ const tui: TuiPlugin = async (api) => {
       clearTimeout(timer);
     }
     publishTimers.clear();
+    for (const timer of stallTimers.values()) {
+      clearTimeout(timer);
+    }
+    stallTimers.clear();
     setSnapshots(new Map<string, TuiSnapshot>());
   });
 };

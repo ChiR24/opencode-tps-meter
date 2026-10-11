@@ -148,7 +148,10 @@ describe("v1 multi-session footer", () => {
       });
     };
 
-    /** Streams a little text so the session gets a live snapshot. */
+    /**
+     * Streams a little text so the session gets a live snapshot. Two chunks a real interval
+     * apart, as a host delivers them: the opening chunk alone has no measurable rate.
+     */
     const stream = async (sessionId: string, text = "streamed output text here") => {
       handlers.get("message.updated")?.({
         type: "message.updated",
@@ -163,17 +166,20 @@ describe("v1 multi-session footer", () => {
           },
         },
       });
-      handlers.get("message.part.delta")?.({
-        type: "message.part.delta",
-        properties: {
-          sessionID: sessionId,
-          messageID: `${sessionId}-assistant`,
-          partID: `${sessionId}-part`,
-          field: "text",
-          delta: text,
-        },
-      });
-      await delay(60);
+      const half = Math.ceil(text.length / 2);
+      for (const delta of [text.slice(0, half), text.slice(half)]) {
+        handlers.get("message.part.delta")?.({
+          type: "message.part.delta",
+          properties: {
+            sessionID: sessionId,
+            messageID: `${sessionId}-assistant`,
+            partID: `${sessionId}-part`,
+            field: "text",
+            delta,
+          },
+        });
+        await delay(60);
+      }
     };
 
     /** Completes the session's assistant message; `completedAt` is SERVER time. */

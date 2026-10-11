@@ -51,6 +51,18 @@ function textDelta(sessionID: string, delta: string, created?: number): V2Unknow
   };
 }
 
+/**
+ * A short stream as the host delivers it: an opening chunk, then the rest ~100ms later
+ * (the host flushes output every 100ms). The opening chunk alone has no measurable rate.
+ */
+function streamed(sessionID: string, text: string, created = Date.now()): V2UnknownEvent[] {
+  const half = Math.ceil(text.length / 2);
+  return [
+    textDelta(sessionID, text.slice(0, half), created - 100),
+    textDelta(sessionID, text.slice(half), created),
+  ];
+}
+
 function stepEnded(
   sessionID: string,
   finish: string,
@@ -146,6 +158,29 @@ describe("collectMeterEntries", () => {
 
     expect(entries.map((e) => e.label)).toEqual(["main", "explore", shortSessionLabel("childB")]);
     expect(hasSubagentEntries(entries)).toBe(true);
+  });
+
+  it("tells same-named subagents apart with a short, stable session suffix", () => {
+    const entries = collectMeterEntries({
+      rootID: "root",
+      memberIDs: ["root", "ses_aaaa9B5c", "ses_bbbbA1dF", "ses_ccccQ7x2"],
+      snapshots: new Map([
+        ["root", snap({ sessionID: "root" })],
+        ["ses_aaaa9B5c", snap({ sessionID: "ses_aaaa9B5c", startedAt: NOW - 30 })],
+        ["ses_bbbbA1dF", snap({ sessionID: "ses_bbbbA1dF", startedAt: NOW - 20 })],
+        ["ses_ccccQ7x2", snap({ sessionID: "ses_ccccQ7x2", startedAt: NOW - 10 })],
+      ]),
+      // Three explore agents read as "explore | explore | explore" without a suffix.
+      agentOf: (id) => (id === "ses_ccccQ7x2" ? "general" : id === "root" ? undefined : "explore"),
+      now: NOW,
+    });
+
+    expect(entries.map((e) => e.label)).toEqual([
+      "main",
+      "explore(9B5c)",
+      "explore(A1dF)",
+      "general",
+    ]);
   });
 
   it("falls back to a short session identifier when no agent name exists", () => {
@@ -437,7 +472,7 @@ describe("multi-session footer integration", () => {
         ["subA", "explore agent scanning the codebase"],
         ["subB", "general agent doing general things"],
       ] as const) {
-        meter.handleEvent(textDelta(id, text));
+        streamed(id, text).forEach((e) => meter.handleEvent(e));
       }
       await delay(60);
 
@@ -473,8 +508,8 @@ describe("multi-session footer integration", () => {
     const meter = createMeter(loadConfigSync());
 
     try {
-      meter.handleEvent(textDelta("root", "the main turn continues onward"));
-      meter.handleEvent(textDelta("subA", "short-lived explore work"));
+      streamed("root", "the main turn continues onward").forEach((e) => meter.handleEvent(e));
+      streamed("subA", "short-lived explore work").forEach((e) => meter.handleEvent(e));
       await delay(60);
 
       // Subagent finishes its whole turn...
@@ -514,7 +549,7 @@ describe("multi-session footer integration", () => {
       // A remote service 10s behind: tolerated by eventTime, fatal to a 4s linger window
       // if the footer compared the host stamp against its own Date.now().
       const skew = 10_000;
-      meter.handleEvent(textDelta("subA", "remote service streaming", Date.now() - skew));
+      streamed("subA", "remote service streaming", Date.now() - skew).forEach((e) => meter.handleEvent(e));
       await delay(60);
       expect(Math.abs(Date.now() - (meter.getSnapshots().get("subA")?.lastActivityAt ?? 0))).toBeLessThan(1000);
 
@@ -539,16 +574,16 @@ describe("multi-session footer integration", () => {
       }).map((e) => e.sessionID);
 
     try {
-      meter.handleEvent(textDelta("root", "dispatching two subagents now"));
-      meter.handleEvent(textDelta("subA", "first subagent output", Date.now() - 5));
+      streamed("root", "dispatching two subagents now").forEach((e) => meter.handleEvent(e));
+      streamed("subA", "first subagent output", Date.now() - 5).forEach((e) => meter.handleEvent(e));
       await delay(20);
-      meter.handleEvent(textDelta("subB", "second subagent output"));
+      streamed("subB", "second subagent output").forEach((e) => meter.handleEvent(e));
       await delay(60);
       expect(order()).toEqual(["root", "subA", "subB"]);
 
       // A tool-call break is not the end of the run: subA keeps its column.
       meter.handleEvent(stepEnded("subA", "tool-calls", { output: 5, reasoning: 0 }));
-      meter.handleEvent(textDelta("subA", "resumed after the tool returned"));
+      streamed("subA", "resumed after the tool returned").forEach((e) => meter.handleEvent(e));
       await delay(60);
       expect(order()).toEqual(["root", "subA", "subB"]);
 
@@ -556,7 +591,7 @@ describe("multi-session footer integration", () => {
       meter.handleEvent(stepEnded("subA", "stop", { output: 5, reasoning: 0 }));
       meter.handleEvent(idle("subA"));
       await delay(5);
-      meter.handleEvent(textDelta("subA", "continued with the same session id"));
+      streamed("subA", "continued with the same session id").forEach((e) => meter.handleEvent(e));
       await delay(60);
       expect(order()).toEqual(["root", "subB", "subA"]);
     } finally {
@@ -574,7 +609,7 @@ describe("multi-session footer integration", () => {
 
     try {
       meter.handleEvent(textDelta("ses_gone", "streams and then disconnects"));
-      clock += 40;
+      clock += 100;
       meter.handleEvent(textDelta("ses_gone", " without a terminal event"));
       const firstSpawn = meter.getSnapshots().get("ses_gone")?.startedAt ?? 0;
       expect(firstSpawn).toBeGreaterThan(0);
@@ -584,7 +619,7 @@ describe("multi-session footer integration", () => {
 
       // Had the stamp survived the sweep, this would still report the old spawn time.
       meter.handleEvent(textDelta("ses_gone", "the session comes back to life"));
-      clock += 40;
+      clock += 100;
       meter.handleEvent(textDelta("ses_gone", " and keeps streaming"));
       expect(meter.getSnapshots().get("ses_gone")?.startedAt).toBeGreaterThan(firstSpawn);
     } finally {
@@ -712,8 +747,8 @@ describe("v2 footer slot", () => {
 
   it("renders main plus live subagents, with Σ covering everything generating", async () => {
     const footer = await createFooter(familyTree);
-    footer.emit(textDelta("root", "main agent streaming along here"));
-    footer.emit(textDelta("subA", "explore agent scanning the codebase"));
+    streamed("root", "main agent streaming along here").forEach(footer.emit);
+    streamed("subA", "explore agent scanning the codebase").forEach(footer.emit);
     await delay(60);
 
     const view = await footer.render("root");
@@ -727,8 +762,8 @@ describe("v2 footer slot", () => {
   it("still shows streaming subagents when the root has no reading of its own", async () => {
     // The root's first step was a pure tool call (task dispatch): no text, no reading.
     const footer = await createFooter(familyTree);
-    footer.emit(textDelta("subA", "explore agent scanning the codebase"));
-    footer.emit(textDelta("subB", "general agent doing general things"));
+    streamed("subA", "explore agent scanning the codebase").forEach(footer.emit);
+    streamed("subB", "general agent doing general things").forEach(footer.emit);
     await delay(60);
 
     const frame = (await footer.render("root")).frame();
@@ -737,11 +772,11 @@ describe("v2 footer slot", () => {
 
   it("colours the aggregate by its own state, not by the waiting root", async () => {
     const footer = await createFooter(familyTree);
-    footer.emit(textDelta("root", "planning the fan-out before dispatch"));
+    streamed("root", "planning the fan-out before dispatch").forEach(footer.emit);
     await delay(60);
     // The root dispatches: its step ends to run the task tool, so its reading settles.
     footer.emit(stepEnded("root", "tool-calls", { output: 8, reasoning: 0 }));
-    footer.emit(textDelta("subA", "explore agent scanning the codebase"));
+    streamed("subA", "explore agent scanning the codebase").forEach(footer.emit);
     await delay(60);
 
     const view = await footer.render("root");
@@ -757,8 +792,8 @@ describe("v2 footer slot", () => {
         throw new Error("unsynced session");
       },
     });
-    footer.emit(textDelta("root", "main agent streaming along here"));
-    footer.emit(textDelta("subA", "explore agent scanning the codebase"));
+    streamed("root", "main agent streaming along here").forEach(footer.emit);
+    streamed("subA", "explore agent scanning the codebase").forEach(footer.emit);
     await delay(60);
 
     const frame = (await footer.render("root")).frame();
@@ -767,8 +802,8 @@ describe("v2 footer slot", () => {
 
   it("falls back to the single-session meter when the family lookup drifts", async () => {
     const footer = await createFooter({ root: () => "root", family: () => undefined });
-    footer.emit(textDelta("root", "main agent streaming along here"));
-    footer.emit(textDelta("subA", "explore agent scanning the codebase"));
+    streamed("root", "main agent streaming along here").forEach(footer.emit);
+    streamed("subA", "explore agent scanning the codebase").forEach(footer.emit);
     await delay(60);
 
     // Viewing the child: a stale root with no members would render `Σ | explore` and no main.
@@ -780,8 +815,8 @@ describe("v2 footer slot", () => {
 
   it("ages finished subagents out on the heartbeat, with no further events", async () => {
     const footer = await createFooter(familyTree);
-    footer.emit(textDelta("root", "main agent streaming along here"));
-    footer.emit(textDelta("subA", "explore agent scanning the codebase"));
+    streamed("root", "main agent streaming along here").forEach(footer.emit);
+    streamed("subA", "explore agent scanning the codebase").forEach(footer.emit);
     await delay(60);
     footer.emit(stepEnded("subA", "stop", { output: 9, reasoning: 0 }));
 

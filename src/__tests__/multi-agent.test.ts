@@ -361,9 +361,14 @@ describe("Multi-Agent TPS Meter Tests", () => {
         event: createMessageUpdatedEvent(helperSessionId, "msg-helper", "streaming", agent2),
       });
 
-      // Send primary tokens to establish primarySessionId
+      // Send primary tokens to establish primarySessionId. Two chunks a real interval
+      // apart: an opening chunk alone has no measurable rate, so no primary TPS line.
       await handlers.event!({
         event: createPartUpdatedEvent(primarySessionId, "msg-primary", "primary-start "),
+      });
+      await delay(60);
+      await handlers.event!({
+        event: createPartUpdatedEvent(primarySessionId, "msg-primary", "primary-start more "),
       });
 
       // Send tokens to agents (cross-session)
@@ -401,10 +406,12 @@ describe("Multi-Agent TPS Meter Tests", () => {
         event: createMessageUpdatedEvent(primarySessionId, "msg-primary", "streaming"),
       });
 
+      // Spread over real time: chunks delivered in the same instant are one opening burst.
       for (let i = 0; i < 15; i++) {
         await handlers.event!({
           event: createPartUpdatedEvent(primarySessionId, "msg-primary", `primary-${i} `),
         });
+        await delay(10);
       }
 
       await delay(MIN_TPS_ELAPSED_MS + 200);

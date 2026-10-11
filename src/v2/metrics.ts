@@ -16,8 +16,13 @@ import type { V2ModelRef } from "./types.js";
 /** Calibration is only trusted inside this band; outside it the sample is noise. */
 const MIN_FACTOR = 0.25;
 const MAX_FACTOR = 4;
-/** EWMA weight for a new calibration sample. */
-const CALIBRATION_ALPHA = 0.3;
+/**
+ * Heuristic tokens of evidence a factor remembers. Samples are weighted by size, so a
+ * 25-token tool call (whose provider count includes call framing the arguments lack, ~2x in
+ * live testing) barely moves a factor built on thousands of tokens; beyond this much
+ * evidence, older samples fade so the factor still follows the model.
+ */
+const CALIBRATION_MEMORY_TOKENS = 20_000;
 /** A step must stream at least this many heuristic tokens before it can calibrate. */
 const MIN_CALIBRATION_TOKENS = 8;
 
@@ -37,9 +42,18 @@ export interface ModelAttribution {
   agent?: string;
 }
 
-interface Calibration {
+export interface Calibration {
   factor: number;
   samples: number;
+  /** Heuristic tokens behind the factor, capped at CALIBRATION_MEMORY_TOKENS. */
+  weight?: number;
+}
+
+export interface MetricsOptions {
+  /** Per-model calibration learned in earlier sessions. Out-of-band entries are ignored. */
+  readonly initial?: Readonly<Record<string, Calibration>>;
+  /** Called after every accepted sample, so the caller can persist the new factor. */
+  readonly onCalibrated?: (modelKey: string, calibration: Calibration) => void;
 }
 
 interface SessionMetrics {
@@ -76,10 +90,25 @@ export interface V2Metrics {
   dispose(): void;
 }
 
-export function createMetrics(): V2Metrics {
+export function createMetrics(options: MetricsOptions = {}): V2Metrics {
   const sessions = new Map<string, SessionMetrics>();
   /** Learned per model, so it survives session churn and benefits every later session. */
   const calibration = new Map<string, Calibration>();
+  for (const [key, saved] of Object.entries(options.initial ?? {})) {
+    if (
+      saved &&
+      Number.isFinite(saved.factor) &&
+      saved.factor >= MIN_FACTOR &&
+      saved.factor <= MAX_FACTOR &&
+      saved.samples > 0
+    ) {
+      calibration.set(key, {
+        factor: saved.factor,
+        samples: saved.samples,
+        weight: typeof saved.weight === "number" && saved.weight > 0 ? saved.weight : undefined,
+      });
+    }
+  }
 
   function get(sessionID: string): SessionMetrics {
     let state = sessions.get(sessionID);
@@ -190,14 +219,22 @@ export function createMetrics(): V2Metrics {
 
       const key = state.attribution.key;
       const existing = calibration.get(key);
-      if (!existing) {
-        calibration.set(key, { factor: sample, samples: 1 });
-        return;
+      // A factor saved before weights existed counts as a modest amount of evidence.
+      const weight = existing
+        ? Math.min(existing.weight ?? existing.samples * 200, CALIBRATION_MEMORY_TOKENS)
+        : 0;
+      const next: Calibration = {
+        factor: (existing ? existing.factor * weight : 0) + realTokens,
+        samples: (existing?.samples ?? 0) + 1,
+        weight: Math.min(weight + heuristic, CALIBRATION_MEMORY_TOKENS),
+      };
+      next.factor /= weight + heuristic;
+      calibration.set(key, next);
+      try {
+        options.onCalibrated?.(key, { ...next });
+      } catch {
+        // Persisting is best-effort; the in-memory factor is already in effect.
       }
-      calibration.set(key, {
-        factor: existing.factor * (1 - CALIBRATION_ALPHA) + sample * CALIBRATION_ALPHA,
-        samples: existing.samples + 1,
-      });
     },
 
     turnOf(sessionID) {

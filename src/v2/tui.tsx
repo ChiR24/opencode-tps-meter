@@ -50,9 +50,12 @@ const SUBSCRIBED_EVENTS: ReadonlyArray<V2AnyMeterEvent["type"]> = [
   "session.text.delta",
   "session.reasoning.delta",
   "session.step.ended",
+  "session.step.failed",
   "session.usage.updated",
   "session.idle",
   "session.step.started",
+  "session.tool.input.delta",
+  "session.tool.input.ended",
   "session.tool.called",
   "session.tool.success",
   "session.tool.failed",
@@ -320,9 +323,9 @@ function MeterView(props: {
       return base;
     }
     const extra: string[] = [];
-    // generationTps only differs from the headline once tool time has been subtracted.
+    // Time this turn spent running tools. It is never inside a step's rate window.
     if (snapshot.toolMs > 0) {
-      extra.push(`gen ${tps(snapshot.generationTps)}`);
+      extra.push(`tools ${ms(snapshot.toolMs)}`);
     }
     if (snapshot.ttftMs > 0) {
       extra.push(`ttft ${ms(snapshot.ttftMs)}`);
@@ -476,7 +479,7 @@ function DashboardPage(props: {
           <For each={live()}>
             {(s) => (
               <text fg={props.theme.text.default}>
-                {`  ${s.modelKey}  ${tps(s.instantTps)} t/s  gen ${tps(s.generationTps)}  ${s.totalTokens} tok`}
+                {`  ${s.modelKey}  ${tps(s.instantTps)} t/s  avg ${tps(s.avgTps)}  ${s.totalTokens} tok`}
               </text>
             )}
           </For>
@@ -526,7 +529,7 @@ function CommandLayer(props: {
     return entries
       .map((s) => {
         const parts = [`${tps(s.active ? s.instantTps : s.avgTps)} TPS`, `${s.totalTokens} tok`];
-        if (s.toolMs > 0) parts.push(`gen ${tps(s.generationTps)}`);
+        if (s.toolMs > 0) parts.push(`tools ${ms(s.toolMs)}`);
         if (s.ttftMs > 0) parts.push(`ttft ${ms(s.ttftMs)}`);
         if (s.overheadTokens > 0) parts.push(`+${s.overheadTokens} overhead`);
         const cache = formatCacheHit(s);
@@ -607,12 +610,26 @@ export function setupTui(ctx: V2TuiContext): V2Cleanup | void {
 
   const theme = normalizeTheme(() => ctx.theme);
   const ledger = createLedger(ctx.storage);
+  let initialCalibration = {};
+  try {
+    initialCalibration = ledger.calibrations();
+  } catch {
+    // Start uncalibrated; the meter learns again from the first settled step.
+  }
   const meter = createMeter(config, {
     onStepSettled: (measurement) => {
       try {
         ledger.record(measurement);
       } catch {
         // A durable-store failure must never interrupt metering.
+      }
+    },
+    initialCalibration,
+    onCalibrated: (modelKey, calibration) => {
+      try {
+        ledger.recordCalibration(modelKey, calibration);
+      } catch {
+        // Same: persisting calibration is best-effort.
       }
     },
   });

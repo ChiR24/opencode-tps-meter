@@ -362,14 +362,6 @@ export interface TPSTrackerOptions {
   sessionId?: string;
   /** Optional rolling window duration in milliseconds */
   rollingWindowMs?: number;
-  /**
-   * EWMA half-life for normal streaming, in milliseconds.
-   *
-   * Lower responds faster at the cost of a jumpier reading. Defaults to
-   * DEFAULT_EWMA_HALF_LIFE_MS so v1 behaviour is unchanged; v2 opts into a faster value
-   * because its rolling window already does the smoothing.
-   */
-  ewmaHalfLifeMs?: number;
 }
 
 /**
@@ -378,9 +370,11 @@ export interface TPSTrackerOptions {
  * @interface BufferEntry
  */
 export interface BufferEntry {
-  /** Timestamp in milliseconds */
-  timestamp: number;
-  /** Token count at this timestamp */
+  /** Arrival of the previous chunk: the start of this chunk's generation interval (ms) */
+  from: number;
+  /** When they arrived (ms) */
+  at: number;
+  /** Tokens in the chunk */
   count: number;
 }
 
@@ -390,17 +384,23 @@ export interface BufferEntry {
  * @interface TPSTracker
  */
 export interface TPSTracker {
-  /** Records a token count at the specified time */
+  /**
+   * Records tokens that arrived at `timestamp` (default: now), rated over the interval since
+   * the previous chunk. The opening chunk of a stream counts toward the total but never
+   * toward a rate: it was generated over an interval the tracker never saw.
+   */
   recordTokens(count: number, timestamp?: number): void;
-  /** Calculates the instantaneous TPS over the last 2-second rolling window */
-  getInstantTPS(): number;
-  /** Gets the EWMA-smoothed TPS to prevent spikes from bursts */
+  /** Live rate over the rolling window ending at `now` (default: the latest chunk). */
+  getInstantTPS(now?: number): number;
+  /** Live rate over the rolling window ending at the latest chunk. 0 until measurable. */
   getSmoothedTPS(): number;
-  /** Calculates the average TPS over the entire session */
+  /** Rated tokens over the whole generation span. 0 until measurable. */
   getAverageTPS(): number;
-  /** Gets the total number of tokens recorded */
+  /** True once enough generation time has been seen to report a rate. */
+  isRateReady(): boolean;
+  /** Gets the total number of tokens recorded, including the unrated opening chunk */
   getTotalTokens(): number;
-  /** Gets the elapsed time since tracking began */
+  /** Generation span covered so far, in the caller's clock */
   getElapsedMs(): number;
   /** Gets the optional session ID */
   getSessionId(): string | undefined;

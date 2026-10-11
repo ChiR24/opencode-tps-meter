@@ -8,7 +8,7 @@
 
 ## OVERVIEW
 
-OpenCode plugin that tracks AI token throughput in real-time. Displays TPS statistics with a rolling 2-second window using toast notifications or TUI status bar.
+OpenCode plugin that tracks AI token throughput in real-time. Displays TPS statistics with a rolling window (default 1s) using toast notifications or TUI status bar.
 
 **Stack:** TypeScript 5.x, Bun runtime, dual-format builds (ESM + CJS)
 
@@ -22,7 +22,7 @@ OpenCode plugin that tracks AI token throughput in real-time. Displays TPS stati
 │   ├── index.ts          # dual-host module: { id, server (v1), setup (v2) }
 │   ├── tui.tsx           # dual-host TUI module: { id, tui (v1), setup (v2) }
 │   ├── types.ts          # v1 TypeScript interfaces
-│   ├── tracker.ts        # TPS calculation logic (ring buffer) - shared v1/v2
+│   ├── tracker.ts        # interval-based rate tracking + correctedAverage - shared v1/v2
 │   ├── tokenCounter.ts   # Heuristic token counting - shared v1/v2
 │   ├── config.ts         # Config loading (env + JSON + v2 inline options) - shared
 │   ├── constants.ts      # Shared constants
@@ -110,7 +110,7 @@ Never import `src/ui.ts` or `src/types.ts` event types from v2 code — those ar
 | v2 TUI meter | `src/v2/tui.tsx:103` | `prompt.footer.status` slot, `ctx.data.on` |
 | v2 server entry | `src/v2/server.ts:44` | `ctx.event.subscribe()` async iterable; no UI surface |
 | v2 API types | `src/v2/types.ts` | Hand-written structural types for the beta v2 API |
-| TPS calculation | `src/tracker.ts:20` | Rolling window, ring buffer (shared v1/v2) |
+| TPS calculation | `src/tracker.ts` | Chunks rated over their generation interval (shared v1/v2) |
 | Meter text formatting | `src/format.ts:41` | Shared so v1 and v2 render identically |
 | UI display (v1 only) | `src/ui.ts:19` | Throttled toast updates; no v2 equivalent |
 | Token counting | `src/tokenCounter.ts:129` | Heuristic: chars/4, words/0.75, or chars/3 |
@@ -132,7 +132,7 @@ Never import `src/ui.ts` or `src/types.ts` event types from v2 code — those ar
 | `agentNameFromMessage` | Function | `agentName.ts` | v1 payload agent name; shared by server plugin and TUI |
 | `setupTui` | Function | `v2/tui.tsx:103` | v2 TUI setup; returns cleanup |
 | `setupServer` | Function | `v2/server.ts:44` | v2 server setup; returns cleanup |
-| `createTracker` | Factory | `tracker.ts:20` | TPS tracker with ring buffer (shared) |
+| `createTracker` | Factory | `tracker.ts` | Interval-based rate tracker (shared) |
 | `createUIManager` | Factory | `ui.ts:19` | v1 toast display manager with throttling |
 | `createTokenizer` | Factory | `tokenCounter.ts:129` | Heuristic token counter (shared) |
 | `formatMeterText` | Function | `format.ts:41` | Shared meter line rendering |
@@ -209,11 +209,38 @@ No role filtering is needed on v2 — text/reasoning deltas are assistant output
 
 **Clock discipline.** The TUI flushes events in ~10ms batches, so `Date.now()` inside a handler
 is FLUSH time and every event in a batch shares it. Use each event's host-stamped `created`
-(`eventTime()` in meter.ts). Note `src/tracker.ts` measures elapsed with its own `Date.now()`,
-so v2 derives elapsed from `firstTokenAt`/`lastTokenAt` instead — never mix the two clocks.
+(`eventTime()` in meter.ts). `src/tracker.ts` does all its maths on the timestamps it is given
+(host time on v2, local time on v1), so one tracker never mixes clocks; on v1, a fallback that
+needs server time uses `info.time.created` → `completed`, both server stamps.
 The one deliberate exception is snapshot `lastActivityAt`: consumers age it against their OWN
 `Date.now()`, so it is stamped on the local wall clock (`lastTokenWallAt`) on both hosts — never
 from event `created` or v1's `info.time.completed`, which a remote service can skew by seconds.
+
+**Rate measurement (do not regress — each rule fixed a live spike).**
+1. The host batches output: v2 flushes text/reasoning every ~100ms (live: chunks ~200-300ms
+   apart), and tool-call arguments arrive whole in `session.tool.input.ended`. A chunk's tokens
+   were generated over the interval since the previous chunk, and `tracker.recordTokens` rates
+   them over exactly that. NEVER rate tool input from `session.tool.input.started`: with
+   providers that deliver a call whole, started and ended land ~100ms apart (live: 850 tokens
+   read as 8,763 TPS).
+2. The opening chunk of a stream is total-only, never rated: it was generated over an interval the
+   meter never saw. Dividing it by the ~10ms before the first publish produced 15,900 TPS.
+3. Nothing publishes until `tracker.isRateReady()` (>= `MIN_RATE_SPAN_MS` of generation).
+4. Never divide provider token counts by the streamed window. The settled average is the streamed
+   average, scaled by provider/streamed only inside `[MIN_PROVIDER_RATIO, MAX_PROVIDER_RATIO]`
+   (`correctedAverage`). Provider reasoning counts only if reasoning deltas actually streamed
+   (`sawReasoning`); hidden reasoning otherwise inflates the rate. If reasoning streamed but the
+   provider reports `reasoning: 0`, the count is ambiguous (folded into output, or omitted):
+   skip both correction and calibration for that step (live: rates scaled down 40%).
+7. A step too short to time falls back to tokens over the whole step, from `step.started`'s
+   `started` field (the event itself is published late, with the first output).
+8. Calibration is a size-weighted ratio of sums (`CALIBRATION_MEMORY_TOKENS`), persisted per
+   model in the ledger: tiny tool steps read ~2x (provider counts call framing) and must not
+   swing it.
+5. Tool execution runs between steps, never inside a step's window, so it is never subtracted
+   from a rate (`generationTps` equals the step average; `toolMs` is reported on its own).
+6. The ledger (`ledger.v2` store key) gets `generationMs` implied by the displayed rate, so its
+   per-model means agree with the footer. `ledger` (v1 key) held spike-polluted figures.
 
 **Cumulative vs per-step.** `session.step.ended.tokens` is a PER-STEP DELTA;
 `session.usage.updated.tokens` is a CUMULATIVE SESSION TOTAL that also includes auto-title and

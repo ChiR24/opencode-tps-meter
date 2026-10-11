@@ -842,7 +842,73 @@ describe("TUI plugin", () => {
     expect(frame).not.toContain("10 tok");
   });
 
-  it("publishes the first live snapshot after the configured latency without waiting for another delta", async () => {
+  it("lets a stalled stream's live rate fall instead of holding its last value", async () => {
+    const { disposeCallbacks, handlers, slotPlugin, testRender, theme } = await createHarness();
+    const messageUpdated = handlers.get("message.updated");
+    const partDelta = handlers.get("message.part.delta");
+    if (!messageUpdated || !partDelta) {
+      throw new Error("required TUI handlers were not registered");
+    }
+    messageUpdated({
+      type: "message.updated",
+      properties: {
+        sessionID: "session-stall",
+        info: {
+          id: "message-stall",
+          sessionID: "session-stall",
+          role: "assistant",
+          time: { created: Date.now() },
+          parentID: "parent-1",
+          modelID: "model",
+          providerID: "provider",
+          mode: "chat",
+          agent: "build",
+          path: { cwd: ".", root: "." },
+          cost: 0,
+          tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+        },
+      },
+    });
+    const chunk = (delta: string) =>
+      partDelta({
+        type: "message.part.delta",
+        properties: {
+          sessionID: "session-stall",
+          messageID: "message-stall",
+          partID: "part-1",
+          field: "text",
+          delta,
+        },
+      });
+    chunk("abcd".repeat(10));
+    await delay(100);
+    chunk("abcd".repeat(10));
+
+    const slot = slotPlugin?.slots.session_prompt_right;
+    if (!slot) {
+      throw new Error("session_prompt_right slot was not registered");
+    }
+    const view = await testRender(() => slot({ theme }, { session_id: "session-stall" }), { width: 80, height: 5 });
+    const liveTps = async () => {
+      await view.flush();
+      return Number(/([0-9.]+) TPS/.exec(view.captureCharFrame())?.[1] ?? "NaN");
+    };
+
+    const live = await liveTps();
+    expect(live).toBeGreaterThan(0);
+    // No more output: the reading republishes with the rate as of now, which keeps falling.
+    await delay(400);
+    const falling = await liveTps();
+    expect(falling).toBeGreaterThan(0);
+    expect(falling).toBeLessThan(live);
+
+    view.renderer.destroy();
+    for (const callback of disposeCallbacks) {
+      await callback();
+    }
+  });
+
+  it("publishes the first live snapshot as soon as a second chunk gives it a rate", async () => {
     const { disposeCallbacks, handlers, slotPlugin, testRender, theme } = await createHarness();
 
     const messageUpdated = handlers.get("message.updated");
@@ -887,6 +953,19 @@ describe("TUI plugin", () => {
         delta: "abcd",
       },
     });
+    // The opening chunk alone has no measurable rate; the next one, a real interval later,
+    // gives the first live reading.
+    await delay(60);
+    partDelta({
+      type: "message.part.delta",
+      properties: {
+        sessionID: "session-live-latency",
+        messageID: "message-live-latency",
+        partID: "part-1",
+        field: "text",
+        delta: "efgh",
+      },
+    });
 
     const slot = slotPlugin?.slots.session_prompt_right;
     if (!slot) {
@@ -900,7 +979,7 @@ describe("TUI plugin", () => {
     const frame = delayed.captureCharFrame();
 
     expect(frame).toContain("TPS");
-    expect(frame).toContain("1 tok");
+    expect(frame).toContain("2 tok");
 
     for (const callback of disposeCallbacks) {
       await callback();
@@ -953,6 +1032,19 @@ describe("TUI plugin", () => {
         delta: "abcd",
       },
     });
+    // The opening chunk alone has no measurable rate; the next one, a real interval later,
+    // gives the first live reading.
+    await delay(60);
+    partDelta({
+      type: "message.part.delta",
+      properties: {
+        sessionID: "session-idle-persist",
+        messageID: "message-idle-persist",
+        partID: "part-1",
+        field: "text",
+        delta: "efgh",
+      },
+    });
 
     await delay(40);
 
@@ -973,7 +1065,7 @@ describe("TUI plugin", () => {
     const frame = setup.captureCharFrame();
 
     expect(frame).toContain("TPS");
-    expect(frame).toContain("1 tok");
+    expect(frame).toContain("2 tok");
 
     for (const callback of disposeCallbacks) {
       await callback();

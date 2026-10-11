@@ -17,7 +17,7 @@ import type {
   AgentDisplayState,
 } from "./types.js";
 import { agentNameFromMessage } from "./agentName.js";
-import { createTracker } from "./tracker.js";
+import { correctedAverage, createTracker } from "./tracker.js";
 import { createUIManager } from "./ui.js";
 import { createTokenizer, createIncrementalCounter, type IncrementalCounter } from "./tokenCounter.js";
 import { loadConfigSync, defaultConfig } from "./config.js";
@@ -203,6 +203,8 @@ function TpsMeterPlugin(
     label: string;
     firstTokenAt: number | null;
     lastUpdated: number;
+    /** A reasoning part produced tokens; otherwise reported reasoning was never streamed. */
+    sawReasoning?: boolean;
     /** Agent metadata - may not be populated for cross-session agents */
     agent?: AgentIdentity;
     agentId?: string;
@@ -375,6 +377,32 @@ function TpsMeterPlugin(
   }
 
   /**
+   * Shows the main toast line, which always describes the PRIMARY session.
+   *
+   * It used to be computed from whichever session's chunk had just arrived, so a subagent's
+   * event briefly relabelled that subagent's rate as the main one. Returns false while the
+   * primary has no measurable rate yet, so the caller can fall back to agent lines alone.
+   */
+  function showPrimaryLine(agents: AgentDisplayState[]): boolean {
+    const primary = primarySessionId ? sessionTrackers.get(primarySessionId)?.aggregate : undefined;
+    if (!primary?.isRateReady()) {
+      return false;
+    }
+    const liveTps = primary.getSmoothedTPS();
+    if (liveTps < resolvedConfig.minVisibleTPS) {
+      return false;
+    }
+    ui.updateDisplay(
+      liveTps,
+      primary.getAverageTPS(),
+      primary.getTotalTokens(),
+      primary.getElapsedMs(),
+      agents
+    );
+    return true;
+  }
+
+  /**
    * Gets ALL active background agents across ALL sessions.
    * Uses messageAgentCache (keyed by messageId) to get agent names.
    * Uses messageId (not sessionId) for unique identifiers to prevent collisions.
@@ -505,18 +533,7 @@ function TpsMeterPlugin(
       
       // Get all agents and check primary activity
       const allAgents = getAllActiveAgentsGlobally(now);
-      const hasPrimaryActivity = isPrimarySessionActive(now);
-      
-      if (hasPrimaryActivity) {
-        const smoothedTps = sessionState.aggregate.getSmoothedTPS();
-        const avgTps = sessionState.aggregate.getAverageTPS();
-        const totalTokens = sessionState.aggregate.getTotalTokens();
-        const elapsedMs = sessionState.aggregate.getElapsedMs();
-        
-        if (smoothedTps >= resolvedConfig.minVisibleTPS) {
-          ui.updateDisplay(smoothedTps, avgTps, totalTokens, elapsedMs, allAgents);
-        }
-      } else if (allAgents.length > 0) {
+      if (!(isPrimarySessionActive(now) && showPrimaryLine(allAgents)) && allAgents.length > 0) {
         ui.updateDisplay(0, 0, 0, 0, allAgents);
       }
       
@@ -691,6 +708,9 @@ function handleMessagePartUpdated(event: MessageEvent): void {
     logger.debug(`[TpsMeter] Tracker initialized ${metaLabel} (${metaInfo}) session=${sessionId} primary=${primarySessionId} isBg=${isBg} key=${trackerKey} message=${messageId} part=${part?.id ?? event.properties.partID ?? "?"}`);
   }
   messageTracker.lastUpdated = now;
+  if (part?.type === "reasoning") {
+    messageTracker.sawReasoning = true;
+  }
 
   sessionState.aggregate.recordTokens(tokenCount, now);
   messageTracker.tracker.recordTokens(tokenCount, now);
@@ -703,8 +723,6 @@ function handleMessagePartUpdated(event: MessageEvent): void {
 
   const smoothedTps = sessionState.aggregate.getSmoothedTPS();
   const avgTps = sessionState.aggregate.getAverageTPS();
-  const totalTokens = sessionState.aggregate.getTotalTokens();
-  const elapsedMs = sessionState.aggregate.getElapsedMs();
   const elapsedSinceFirstToken =
     sessionState.aggregateFirstTokenAt === null
     ? 0
@@ -716,11 +734,7 @@ function handleMessagePartUpdated(event: MessageEvent): void {
     clearDisplayTimer(sessionId);
 
     const allAgents = getAllActiveAgentsGlobally(now);
-    const hasPrimaryActivity = isPrimarySessionActive(now) && smoothedTps >= resolvedConfig.minVisibleTPS;
-
-    if (hasPrimaryActivity) {
-      ui.updateDisplay(smoothedTps, avgTps, totalTokens, elapsedMs, allAgents);
-    } else if (allAgents.length > 0) {
+    if (!(isPrimarySessionActive(now) && showPrimaryLine(allAgents)) && allAgents.length > 0) {
       ui.updateDisplay(0, 0, 0, 0, allAgents);
     }
   }
@@ -779,19 +793,34 @@ function handleMessagePartUpdated(event: MessageEvent): void {
       if (info.time?.completed) {
         const completedAt = info.time?.completed ?? Date.now();
         const createdAt = info.time?.created ?? completedAt;
-        const firstTokenAt = messageTracker.firstTokenAt ?? createdAt;
-        const elapsedMs = Math.max(0, completedAt - firstTokenAt);
         const cachedTokens = tokenCache.get(messageId) ?? 0;
         const totalTokens = reportedTokens > 0 ? reportedTokens : cachedTokens;
-        const avgTps = elapsedMs > 0 ? totalTokens / (elapsedMs / 1000) : 0;
+        // Rate what streamed over when it streamed (local clock on both ends), corrected by
+        // the provider's count when the two agree. A message too short to time falls back to
+        // created -> completed: both server timestamps, so the clocks never mix.
+        const streamedAvg = messageTracker.tracker.getAverageTPS();
+        const elapsedMs =
+          streamedAvg > 0
+            ? messageTracker.tracker.getElapsedMs()
+            : Math.max(0, completedAt - createdAt);
+        const avgTps =
+          streamedAvg > 0
+            ? correctedAverage(
+                streamedAvg,
+                messageTracker.tracker.getTotalTokens(),
+                // Streamed reasoning with none reported is not comparable: unused.
+                messageTracker.sawReasoning && reasoningTokens === 0
+                  ? 0
+                  : outputTokens + (messageTracker.sawReasoning ? reasoningTokens : 0)
+              )
+            : elapsedMs > 0
+              ? totalTokens / (elapsedMs / 1000)
+              : 0;
         const hasValidFinish =
           info.finish !== undefined &&
           info.finish !== null &&
           !INVALID_FINISH_REASONS.has(info.finish);
-        const shouldShowFinalStats =
-          hasValidFinish &&
-          totalTokens > 0 &&
-          elapsedMs >= resolvedConfig.initialDisplayDelayMs;
+        const shouldShowFinalStats = hasValidFinish && totalTokens > 0 && avgTps > 0;
 
         if (shouldShowFinalStats) {
           // Display final stats

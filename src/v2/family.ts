@@ -47,6 +47,9 @@ export const SUBAGENT_LINGER_MS = 4000;
 /** Maximum agent entries rendered before the remainder collapses into `+N`. */
 export const MAX_METER_ENTRIES = 4;
 
+/** Session-id characters appended to tell same-named subagents apart. */
+const DUPLICATE_SUFFIX_LENGTH = 4;
+
 /** One agent's contribution to the aggregate footer line. */
 export interface AgentMeterEntry {
   readonly sessionID: string;
@@ -158,7 +161,7 @@ export function collectMeterEntries(options: {
     });
   }
 
-  return entries.sort((a, b) => {
+  entries.sort((a, b) => {
     if (a.isRoot !== b.isRoot) {
       return a.isRoot ? -1 : 1;
     }
@@ -171,6 +174,18 @@ export function collectMeterEntries(options: {
     }
     return a.sessionID < b.sessionID ? -1 : a.sessionID > b.sessionID ? 1 : 0;
   });
+
+  // Several subagents of one type would all read "explore". Tag each with a short id;
+  // ids are stable, unlike a position number that shifts as entries drop off.
+  const counts = new Map<string, number>();
+  for (const entry of entries) {
+    counts.set(entry.label, (counts.get(entry.label) ?? 0) + 1);
+  }
+  return entries.map((entry) =>
+    (counts.get(entry.label) ?? 0) > 1
+      ? { ...entry, label: `${entry.label}(${entry.sessionID.slice(-DUPLICATE_SUFFIX_LENGTH)})` }
+      : entry
+  );
 }
 
 /** True once work has fanned out — i.e. at least one non-root entry qualifies. */

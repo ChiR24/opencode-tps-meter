@@ -1,251 +1,185 @@
 /**
- * Token tracking logic for OpenCode TPS Meter Plugin
- * Implements a TPS tracker with a configurable rolling window using a ring buffer
- * Includes EWMA smoothing to prevent spikes from bursty token arrivals
+ * Token throughput tracking, shared by v1 and v2.
+ *
+ * Every recorded chunk carries the interval it was GENERATED in, not just the moment it
+ * arrived. Hosts batch output before publishing it (v2 flushes text every ~100ms), so a
+ * chunk's tokens were produced between the previous chunk and this one. Dividing a chunk by
+ * anything shorter is what produced readings like 10,000 TPS.
+ *
+ * The opening chunk of a stream is the special case: it was generated over an interval the
+ * meter never saw (from request start, through any prefill, to its arrival). It counts toward
+ * the token total but never toward a rate.
+ *
+ * All maths uses the timestamps the caller records with, so one tracker never mixes clocks:
+ * v2 passes host event times, v1 passes local time.
  */
 
 import type { TPSTrackerOptions, BufferEntry, TPSTracker } from "./types.js";
-import { MAX_BUFFER_SIZE, DEFAULT_ROLLING_WINDOW_MS, MIN_WINDOW_DURATION_SECONDS, BURST_TOKEN_THRESHOLD, DEFAULT_EWMA_HALF_LIFE_MS, BURST_EWMA_HALF_LIFE_MS, LARGE_BURST_THRESHOLD, LARGE_BURST_EWMA_HALF_LIFE_MS, MAX_INITIAL_TPS } from "./constants.js";
+import {
+  MAX_BUFFER_SIZE,
+  DEFAULT_ROLLING_WINDOW_MS,
+  MIN_RATE_SPAN_MS,
+  MIN_PROVIDER_RATIO,
+  MAX_PROVIDER_RATIO,
+} from "./constants.js";
 
 /**
- * Creates a TPSTracker instance - Tracks tokens per second with a rolling window
+ * A settled step's average, corrected by the provider's exact token count.
  *
- * Uses a ring buffer to efficiently track token counts over time.
- * Maximum buffer size of 100 entries with automatic pruning of entries
- * older than the configured window duration.
- *
- * @param options - Optional configuration including sessionId
- * @returns TPSTracker instance with methods to track and calculate TPS
+ * The streamed average divides heuristic tokens by the time they streamed over, so both
+ * sides describe the same output. When the provider's count of that same output
+ * (`providerVisible`: output, plus reasoning only if reasoning actually streamed) is close
+ * to the heuristic's, it replaces the heuristic's estimate. When it is far off, the two are
+ * not counting the same thing, and the streamed figure stands.
  */
+export function correctedAverage(
+  streamedAvg: number,
+  streamedTokens: number,
+  providerVisible: number
+): number {
+  if (!(streamedAvg > 0) || !(streamedTokens > 0) || !(providerVisible > 0)) {
+    return streamedAvg > 0 ? streamedAvg : 0;
+  }
+  const ratio = providerVisible / streamedTokens;
+  return ratio >= MIN_PROVIDER_RATIO && ratio <= MAX_PROVIDER_RATIO
+    ? streamedAvg * ratio
+    : streamedAvg;
+}
+
 export function createTracker(options: TPSTrackerOptions = {}): TPSTracker {
-  // Private state
-  let startTime: number = Date.now();
-  let totalTokens: number = 0;
-  let buffer: Array<BufferEntry> = [];
   const sessionId: string | undefined = options.sessionId;
   const windowMs =
     typeof options.rollingWindowMs === "number" && options.rollingWindowMs > 0
       ? options.rollingWindowMs
       : DEFAULT_ROLLING_WINDOW_MS;
 
-  const normalHalfLifeMs =
-    typeof options.ewmaHalfLifeMs === "number" && options.ewmaHalfLifeMs > 0
-      ? options.ewmaHalfLifeMs
-      : DEFAULT_EWMA_HALF_LIFE_MS;
+  /** Rated chunks still relevant to the rolling window, oldest first. */
+  let entries: BufferEntry[] = [];
+  /** Every token recorded, including the unrated opening chunk. */
+  let totalTokens = 0;
+  /** Tokens with a known generation interval: the numerator of every rate. */
+  let ratedTokens = 0;
+  /** Start of the measurable generation window, or null before the first chunk. */
+  let origin: number | null = null;
+  /** Arrival time of the latest chunk. */
+  let lastAt: number | null = null;
 
-  // EWMA smoothing state
-  let smoothedTps = 0;
-  let lastSmoothedAt = 0;
-  let hasSmoothedValue = false;
-
-  /**
-   * Prunes entries older than the rolling window and enforces max buffer size
-   * @param now - Current timestamp for age calculations
-   */
-  function pruneBuffer(now: number): void {
-    const cutoff = now - windowMs;
-
-    // Find first valid entry index (first entry not older than cutoff)
-    const validStartIndex = buffer.findIndex(e => e.timestamp >= cutoff);
-
-    // Remove expired entries in place
-    if (validStartIndex === -1) {
-      // All entries are expired — clear the buffer
-      buffer.length = 0;
-    } else if (validStartIndex > 0) {
-      buffer.splice(0, validStartIndex);
+  function prune(): void {
+    if (lastAt === null) {
+      return;
     }
-
-    // Trim to max size from the end if needed
-    if (buffer.length > MAX_BUFFER_SIZE) {
-      buffer.splice(0, buffer.length - MAX_BUFFER_SIZE);
+    const cutoff = lastAt - windowMs;
+    let drop = 0;
+    while (drop < entries.length && entries[drop].at <= cutoff) {
+      drop++;
+    }
+    if (drop > 0) {
+      entries.splice(0, drop);
+    }
+    // Merge rather than drop when the cap is hit: dropping would silently undercount the
+    // window, while merging two adjacent chunks only coarsens where its edge falls.
+    while (entries.length > MAX_BUFFER_SIZE) {
+      const [a, b] = entries;
+      entries.splice(0, 2, { from: Math.min(a.from, b.from), at: b.at, count: a.count + b.count });
     }
   }
 
-  /**
-   * Calculates the instantaneous TPS from the buffer (unsmoothed raw value).
-   * Uses `now - oldestTimestamp` as the denominator so idle time between
-   * bursts naturally lowers the reported rate instead of being ignored.
-   * @param now - Current timestamp
-   * @returns Raw instantaneous TPS
-   */
-  function calculateRawTPS(now: number): number {
-    if (buffer.length === 0) {
-      return 0;
+  /** Tokens per second over the window ending at `now`, or null while unmeasurable. */
+  function rateAt(now: number): number | null {
+    if (origin === null) {
+      return null;
     }
-
-    const cutoff = now - windowMs;
-
-    // Calculate total tokens in the window
-    let tokensInWindow = 0;
-    let oldestTimestamp = now;
-
-    for (const entry of buffer) {
-      if (entry.timestamp >= cutoff) {
-        tokensInWindow += entry.count;
-        if (entry.timestamp < oldestTimestamp) {
-          oldestTimestamp = entry.timestamp;
-        }
+    const start = Math.max(now - windowMs, origin);
+    const spanMs = now - start;
+    if (spanMs < MIN_RATE_SPAN_MS) {
+      return null;
+    }
+    let tokens = 0;
+    for (const entry of entries) {
+      if (entry.at <= start || entry.from >= now) {
+        continue;
       }
+      // Count only the part of the chunk's generation interval inside the window.
+      const length = entry.at - entry.from;
+      const overlap = Math.min(entry.at, now) - Math.max(entry.from, start);
+      tokens += length > 0 ? (entry.count * overlap) / length : entry.count;
     }
-
-    // If no valid entries in window, return 0
-    if (tokensInWindow === 0) {
-      return 0;
-    }
-
-    // Use elapsed from oldest entry to NOW — not to newest entry.
-    // This prevents inflated TPS when tokens arrive in short bursts:
-    // idle time after the burst grows the denominator naturally.
-    const windowDurationMs = now - oldestTimestamp;
-    const windowDurationSeconds = windowDurationMs / 1000;
-
-    // If window is too short (< 300ms), use minimum duration to avoid spikes
-    const effectiveDuration = Math.max(windowDurationSeconds, MIN_WINDOW_DURATION_SECONDS);
-
-    return tokensInWindow / effectiveDuration;
+    return tokens / (spanMs / 1000);
   }
 
-  // Return the public interface
   return {
-    /**
-     * Records a token count at the specified time (or now if not specified)
-     * Uses token-duration smoothing to prevent spikes from large bursts
-     * @param count - Number of tokens to record
-     * @param timestamp - Optional timestamp (defaults to current time)
-     */
     recordTokens(count: number, timestamp?: number): void {
-      const ts = timestamp ?? Date.now();
-
-      // Update total tokens
+      if (!(count > 0)) {
+        return;
+      }
+      // Never let a late-stamped event run the clock backwards.
+      const at = Math.max(timestamp ?? Date.now(), lastAt ?? -Infinity);
       totalTokens += count;
 
-      // Add entry to buffer
-      buffer.push({ timestamp: ts, count });
-
-      // Prune old entries and maintain buffer size
-      pruneBuffer(ts);
-
-      // Update smoothed TPS using EWMA
-      const rawTPS = calculateRawTPS(ts);
-      if (!hasSmoothedValue) {
-        // Cap initial TPS to prevent burst spikes from setting unreasonably high baseline
-        smoothedTps = Math.min(rawTPS, MAX_INITIAL_TPS);
-        hasSmoothedValue = true;
-      } else {
-        // Ensure minimum time delta of 1ms to avoid alpha=1 (no update)
-        const timeDelta = Math.max(1, ts - lastSmoothedAt);
-        
-        // 3-level burst detection with progressively stronger smoothing
-        let halfLife: number;
-        if (count > LARGE_BURST_THRESHOLD) {
-          // Very large bursts (tool outputs) - strongest smoothing
-          halfLife = LARGE_BURST_EWMA_HALF_LIFE_MS;
-        } else if (count > BURST_TOKEN_THRESHOLD) {
-          // Medium bursts - moderate smoothing
-          halfLife = BURST_EWMA_HALF_LIFE_MS;
-        } else {
-          // Normal streaming - responsive
-          halfLife = normalHalfLifeMs;
-        }
-        
-        const alpha = Math.exp(-Math.LN2 * timeDelta / halfLife);
-        smoothedTps = alpha * smoothedTps + (1 - alpha) * rawTPS;
+      // Opening chunk, or one delivered in the same instant (v1 stamps a whole batch with one
+      // local time): generated over an interval we never saw. Total only.
+      if (lastAt === null || (ratedTokens === 0 && at === lastAt)) {
+        origin = at;
+        lastAt = at;
+        return;
       }
-      lastSmoothedAt = ts;
+
+      entries.push({ from: lastAt, at, count });
+      lastAt = at;
+      ratedTokens += count;
+      prune();
     },
 
-    /**
-     * Calculates the instantaneous TPS over the configured rolling window
-     * @returns Tokens per second over the rolling window, or 0 if no data
-     */
-    getInstantTPS(): number {
-      return calculateRawTPS(Date.now());
+    getInstantTPS(now?: number): number {
+      return lastAt === null ? 0 : (rateAt(now ?? lastAt) ?? 0);
     },
 
-    /**
-     * Gets the smoothed TPS using EWMA to prevent spikes
-     * @returns Smoothed tokens per second
-     */
     getSmoothedTPS(): number {
-      return hasSmoothedValue ? smoothedTps : calculateRawTPS(Date.now());
+      return lastAt === null ? 0 : (rateAt(lastAt) ?? 0);
     },
 
-    /**
-     * Calculates the average TPS over the entire session
-     * @returns Average tokens per second since tracking began, or 0 if no time elapsed
-     */
     getAverageTPS(): number {
-      const elapsedSeconds = (Date.now() - startTime) / 1000;
-
-      // Handle edge case: no time elapsed
-      if (elapsedSeconds === 0) {
+      if (origin === null || lastAt === null) {
         return 0;
       }
-
-      return totalTokens / elapsedSeconds;
+      const spanMs = lastAt - origin;
+      return spanMs >= MIN_RATE_SPAN_MS ? ratedTokens / (spanMs / 1000) : 0;
     },
 
-    /**
-     * Gets the total number of tokens recorded
-     * @returns Total tokens counted
-     */
+    isRateReady(): boolean {
+      return lastAt !== null && rateAt(lastAt) !== null;
+    },
+
     getTotalTokens(): number {
       return totalTokens;
     },
 
-    /**
-     * Gets the elapsed time since tracking began
-     * @returns Elapsed time in milliseconds
-     */
     getElapsedMs(): number {
-      return Date.now() - startTime;
+      return origin === null || lastAt === null ? 0 : lastAt - origin;
     },
 
-    /**
-     * Gets the optional session ID
-     * @returns Session identifier or undefined
-     */
     getSessionId(): string | undefined {
       return sessionId;
     },
 
-    /**
-     * Resets all tracking data
-     * Clears buffer, total tokens, and resets start time
-     */
     reset(): void {
-      startTime = Date.now();
+      entries = [];
       totalTokens = 0;
-      buffer = [];
-      smoothedTps = 0;
-      hasSmoothedValue = false;
-      lastSmoothedAt = 0;
-      // Note: sessionId is preserved across resets
+      ratedTokens = 0;
+      origin = null;
+      lastAt = null;
     },
 
-    /**
-     * Gets the current number of entries in the buffer
-     * @returns Buffer entry count
-     */
     getBufferSize(): number {
-      return buffer.length;
+      return entries.length;
     },
 
-    /**
-     * Gets the maximum buffer size
-     * @returns Maximum number of entries the buffer can hold
-     */
     getMaxBufferSize(): number {
       return MAX_BUFFER_SIZE;
     },
 
-    /**
-     * Gets the rolling window duration in milliseconds
-     * @returns Window duration in milliseconds
-     */
     getWindowMs(): number {
       return windowMs;
-    }
+    },
   };
 }

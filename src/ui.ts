@@ -192,16 +192,20 @@ export function createUIManager(
    * @param message - Message to display
    * @param isFinal - Whether this is a final stats message
    * @param instantTps - Current instantaneous TPS value (for color coding)
+   * @returns Milliseconds to wait before the message may be shown, or 0 once handled
    */
-  function display(message: string, isFinal: boolean = false, instantTps: number = 0): void {
+  function display(message: string, isFinal: boolean = false, instantTps: number = 0): number {
     const minToastIntervalMs = Math.max(MIN_TOAST_INTERVAL_MS, uiConfig.updateIntervalMs * 2);
     const toastDuration = Math.max(DEFAULT_TOAST_DURATION_MS, minToastIntervalMs * 20);
     const now = Date.now();
 
     if (!isFinal) {
-      // Skip if same message OR if within the minimum interval
-      if (message === lastToastMessage || now - lastToastAt < minToastIntervalMs) {
-        return;
+      if (message === lastToastMessage) {
+        return 0;
+      }
+      const waitMs = minToastIntervalMs - (now - lastToastAt);
+      if (waitMs > 0) {
+        return waitMs;
       }
     }
 
@@ -273,6 +277,7 @@ export function createUIManager(
       lastToastAt = now;
       lastToastMessage = message;
     }
+    return 0;
   }
 
   /**
@@ -286,9 +291,29 @@ export function createUIManager(
       if (pendingState.totalTokens === 0 && pendingState.agents?.length) {
         tpsForColor = Math.max(...pendingState.agents.map(a => a.instantTps));
       }
-      display(formatted, false, tpsForColor);
+      const waitMs = display(formatted, false, tpsForColor);
+      if (waitMs > 0) {
+        // Throttled, not superseded: keep the update and show it once the interval allows.
+        // Dropping it lost the last update before a stream went quiet, leaving the toast stale.
+        if (!flushTimer) {
+          flushTimer = setTimeout(() => {
+            flushTimer = null;
+            lastFlushAt = Date.now();
+            flushPendingUpdate();
+          }, waitMs);
+        }
+        return;
+      }
       pendingState = null;
     }
+  }
+
+  function cancelPendingUpdate(): void {
+    if (flushTimer) {
+      clearTimeout(flushTimer);
+      flushTimer = null;
+    }
+    pendingState = null;
   }
 
   /**
@@ -350,8 +375,9 @@ export function createUIManager(
       elapsedMs: number,
       cache?: TokenCacheInfo
     ): void {
-      // Flush any pending updates first to ensure latest state is captured
-      flushPendingUpdate();
+      // The final figures supersede any live update still waiting on the throttle; showing
+      // it first would only flash a stale reading, and a deferred one would replace these.
+      cancelPendingUpdate();
 
       // Clear lastToastMessage to ensure final stats always displays
       // This prevents duplicate toast suppression when flushPendingUpdate just showed an update
@@ -378,11 +404,9 @@ export function createUIManager(
         flushTimer = null;
       }
 
-      // Flush any pending updates
+      // Flush any pending updates, then drop anything the throttle deferred.
       flushPendingUpdate();
-
-      // Reset state
-      pendingState = null;
+      cancelPendingUpdate();
 
     },
 

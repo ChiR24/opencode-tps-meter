@@ -317,6 +317,11 @@ export type V2SessionStepStarted = V2Envelope<
     assistantMessageID: string;
     agent?: string;
     model?: V2ModelRef;
+    /**
+     * When the step really began. The host publishes step.started lazily, with the step's
+     * first output, so the event's own `created` misses the request and any buffered output.
+     */
+    started?: number;
   }
 >;
 
@@ -324,6 +329,32 @@ export type V2SessionStepStarted = V2Envelope<
 export type V2SessionToolInputStarted = V2Envelope<
   "session.tool.input.started",
   { sessionID: string; assistantMessageID?: string; id: string; name?: string }
+>;
+
+/**
+ * A chunk of a tool call's arguments. Current hosts buffer tool input and publish only
+ * session.tool.input.ended, but the event is part of the protocol, so it is counted if sent.
+ */
+export type V2SessionToolInputDelta = V2Envelope<
+  "session.tool.input.delta",
+  { sessionID: string; assistantMessageID?: string; id: string; delta: string }
+>;
+
+/** The model finished a tool call's arguments; `text` is the complete input. */
+export type V2SessionToolInputEnded = V2Envelope<
+  "session.tool.input.ended",
+  { sessionID: string; assistantMessageID?: string; id: string; text: string }
+>;
+
+/** A step ended on an error. Token usage is reported only when the provider sent any. */
+export type V2SessionStepFailed = V2Envelope<
+  "session.step.failed",
+  {
+    sessionID: string;
+    assistantMessageID?: string;
+    cost?: number;
+    tokens?: V2TokenUsage;
+  }
 >;
 
 /** Tool execution began (host stamps time.ran from this event's `created`). */
@@ -353,7 +384,10 @@ export type V2SessionExecutionSettled = V2Envelope<
 /** Extended union the meter consumes for Tier 2 metrics. */
 export type V2ExtendedEvent =
   | V2SessionStepStarted
+  | V2SessionStepFailed
   | V2SessionToolInputStarted
+  | V2SessionToolInputDelta
+  | V2SessionToolInputEnded
   | V2SessionToolCalled
   | V2SessionToolSettled
   | V2SessionExecutionStarted
