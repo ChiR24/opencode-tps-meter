@@ -32,9 +32,11 @@ land alongside. Tested on OpenCode v1 and v2. Install with
 - **The v1 toast** keeps its main line on the primary session (a subagent's chunk
   used to relabel the subagent's rate as the main one) and no longer drops an
   update that lands inside its throttle window.
-- **Dashboard.** `gen` is replaced by `tools`, the time a turn spent running tools,
-  since tool time is never inside a step's rate window. The per-model ledger starts
-  fresh, as its old best/mean figures were recorded with the spiking formula.
+- **Tool time and the dashboard** (v2). The `gen` figure is gone: the detailed footer
+  and `/tps detail` now show `tools`, the time a turn spent running tools (tool time
+  is never inside a step's rate window), and the dashboard's live rows show `avg`
+  in its place. The per-model ledger starts fresh, as its old best/mean figures were
+  recorded with the spiking formula.
 - Same-named subagents in the footer get a short id suffix, e.g. `explore(9B5c)`,
   and a step that ends on an error now settles the reading and still counts its
   usage.
@@ -52,7 +54,7 @@ land alongside. Tested on OpenCode v1 and v2. Install with
   `cache N% · session cache N%`: the cached share of the prompt for the last
   step and for the whole session, computed as
   `cache.read / (input + cache.read + cache.write)`. It also appears in the v2
-  dashboard and the v1 final-stats toast. The figures appear once a session's
+  `/tps detail` toast and the v1 final-stats toast (last step only). The figures appear once a session's
   first step has finished. Toggle with `showCacheHit` (default `true`) or
   `TPS_METER_SHOW_CACHE_HIT`.
 
@@ -129,8 +131,11 @@ The plugin now runs on **both** OpenCode generations from one package. Nothing a
 - **Self-calibrating tokenizer** — each step compares streamed heuristic tokens against the
   provider's reported count and learns a per-model correction (EWMA, fractional carry, samples
   outside 0.25-4x rejected). The live rate stops being a fixed chars/4 guess.
+  *(v0.4.1: the correction is now weighted by step size rather than an EWMA, and persisted per model.)*
 - **Generation vs end-to-end throughput** — tool execution is bracketed by
   `session.tool.called`/`.success` and subtracted, so dead time no longer dilutes the rate.
+  *(v0.4.1: tool time is no longer subtracted from any rate, since it never falls inside a step's
+  window; it is reported on its own as `tools`.)*
 - **Time to first token** — measured from `session.execution.started` on the host clock.
 - **Hidden overhead** — the residual between cumulative session usage and the sum of per-step
   deltas is exactly the auto-title and compaction spend.
@@ -166,6 +171,8 @@ The plugin now runs on **both** OpenCode generations from one package. Nothing a
 - **Faster smoothing on v2.** The EWMA half-life is now a tracker option. v2 uses 120ms instead
   of 250ms, cutting time-to-90%-of-a-steady-rate from **940ms to 540ms**. v1 is untouched:
   omitting the option behaves exactly as before, and a test asserts it.
+  *(v0.4.1: the EWMA is gone on both hosts; the live rate is the plain rolling window, exact from the
+  second chunk.)*
 
 ### 🐞 Fixed
 
