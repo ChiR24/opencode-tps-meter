@@ -38,6 +38,7 @@ export const defaultConfig: Config = {
   showTotalTokens: true,
   showElapsed: false,
   showCacheHit: true,
+  showTtft: false,
   format: "compact",
   minVisibleTPS: 0,
   fallbackTokenHeuristic: "chars_div_4",
@@ -151,6 +152,9 @@ function mergeConfig(partial: Partial<Config>, defaults: Config): Config {
     showCacheHit: isBoolean(partial.showCacheHit)
       ? partial.showCacheHit
       : defaults.showCacheHit,
+    showTtft: isBoolean(partial.showTtft)
+      ? partial.showTtft
+      : defaults.showTtft,
     format:
       isString(partial.format) &&
       ["compact", "verbose", "minimal"].includes(partial.format)
@@ -270,6 +274,10 @@ function loadEnvConfig(): Partial<Config> {
 
   if (process.env.TPS_METER_SHOW_CACHE_HIT !== undefined) {
     envConfig.showCacheHit = process.env.TPS_METER_SHOW_CACHE_HIT === "true";
+  }
+
+  if (process.env.TPS_METER_SHOW_TTFT !== undefined) {
+    envConfig.showTtft = process.env.TPS_METER_SHOW_TTFT === "true";
   }
 
   if (process.env.TPS_METER_FORMAT !== undefined) {

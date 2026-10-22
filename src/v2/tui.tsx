@@ -319,22 +319,23 @@ function MeterView(props: {
       return "";
     }
     const base = formatMeterText(snapshot, props.config);
-    if (props.mode() !== "detailed") {
-      return base;
-    }
     const extra: string[] = [];
-    // Time this turn spent running tools. It is never inside a step's rate window.
-    if (snapshot.toolMs > 0) {
-      extra.push(`tools ${ms(snapshot.toolMs)}`);
-    }
-    if (snapshot.ttftMs > 0) {
+    if (props.mode() === "detailed") {
+      // Time this turn spent running tools. It is never inside a step's rate window.
+      if (snapshot.toolMs > 0) {
+        extra.push(`tools ${ms(snapshot.toolMs)}`);
+      }
+      if (snapshot.ttftMs > 0) {
+        extra.push(`ttft ${ms(snapshot.ttftMs)}`);
+      }
+      if (snapshot.overheadTokens > 0) {
+        extra.push(`+${snapshot.overheadTokens} ovh`);
+      }
+      if (snapshot.interrupted) {
+        extra.push("aborted");
+      }
+    } else if (props.config.showTtft && snapshot.ttftMs > 0) {
       extra.push(`ttft ${ms(snapshot.ttftMs)}`);
-    }
-    if (snapshot.overheadTokens > 0) {
-      extra.push(`+${snapshot.overheadTokens} ovh`);
-    }
-    if (snapshot.interrupted) {
-      extra.push("aborted");
     }
     return extra.length > 0 ? `${base} · ${extra.join(" · ")}` : base;
   });
