@@ -181,6 +181,8 @@ the footer meter and nothing else.
 /tps reset        clear the durable ledger
 ```
 
+The dashboard closes with `escape` or `q` and returns to wherever you opened it from.
+
 **Latency.** Token counting is incremental — each chunk is scanned once and never re-read, so
 absorbing a long response is linear rather than quadratic. The live rate is exact from the
 second chunk of a stream (about 100ms in on v2) with no seed value or smoothing lag, and the

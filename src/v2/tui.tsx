@@ -39,6 +39,7 @@ import type {
   V2PluginDefinition,
   V2ResolvedTheme,
   V2Rgba,
+  V2Route,
   V2SessionData,
   V2SlotInput,
   V2TuiContext,
@@ -72,6 +73,19 @@ const MODE_ORDER: readonly DisplayMode[] = ["compact", "detailed", "hidden"];
 
 /** Route name for the dashboard page. */
 const DASHBOARD_ROUTE = "tps";
+
+/** Where to go when the dashboard is dismissed, based on the route it was opened from. */
+function returnRouteFrom(route: V2Route): Record<string, unknown> {
+  if (route.type === "session" && route.sessionID) {
+    return { type: "session", sessionID: route.sessionID };
+  }
+  if (route.type === "plugin" && route.name) {
+    return route.data
+      ? { type: "plugin", name: route.name, data: route.data }
+      : { type: "plugin", name: route.name };
+  }
+  return { type: "home" };
+}
 
 function loadTuiConfig(options?: Readonly<Record<string, unknown>>): Config {
   try {
@@ -550,6 +564,22 @@ function CommandLayer(props: {
     mode: "global",
     commands: [
       {
+        id: "tps.back",
+        bind: "escape,q",
+        title: "Back",
+        description: "Leave the throughput dashboard",
+        group: "TPS Meter",
+        enabled: () => props.ctx.ui.router?.current()?.name === DASHBOARD_ROUTE,
+        run: () => {
+          const router = props.ctx.ui.router;
+          if (!router) {
+            return;
+          }
+          const back = router.current().data?.returnRoute as Record<string, unknown> | undefined;
+          router.navigate(back ?? { type: "home" });
+        },
+      },
+      {
         id: "tps.toggle",
         title: "Throughput meter",
         description: "Open the dashboard, cycle the meter, or show current stats",
@@ -560,7 +590,16 @@ function CommandLayer(props: {
           const arg = (input ?? "").trim().toLowerCase();
 
           if (arg === "" && props.ctx.ui.router) {
-            props.ctx.ui.router.navigate({ type: "plugin", name: DASHBOARD_ROUTE });
+            const router = props.ctx.ui.router;
+            const current = router.current();
+            if (current.name === DASHBOARD_ROUTE) {
+              return;
+            }
+            router.navigate({
+              type: "plugin",
+              name: DASHBOARD_ROUTE,
+              data: { returnRoute: returnRouteFrom(current) },
+            });
             return;
           }
           if (arg === "detail" || arg === "details") {
