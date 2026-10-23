@@ -50,10 +50,23 @@ export function cacheHitRatio(
   return read / promptTokens;
 }
 
-/** Formats a 0..1 ratio as a whole-percent string, e.g. "91%". */
+/**
+ * Formats a 0..1 ratio as a whole-percent string, e.g. "91%".
+ *
+ * Rounding must never cross the 100 boundary. A ratio of 0.9967 is not a full cache hit,
+ * yet whole-percent rounding turns it into "100%", claiming the whole prompt came from
+ * cache while 40 of its 12040 tokens did not. A ratio below 1 that rounds to 100
+ * therefore reads 99%; only an exact 1 reads "100%".
+ */
+export function formatCachePercent(ratio: number): string {
+  const percent = Math.round(ratio * 100);
+  return `${ratio < 1 && percent > 99 ? 99 : percent}%`;
+}
+
+/** Formats the latest step's cache hit rate as a whole-percent string, e.g. "91%". */
 export function formatCacheHit(reading: MeterReading): string | null {
   const ratio = cacheHitRatio(reading);
-  return ratio === null ? null : `${Math.round(ratio * 100)}%`;
+  return ratio === null ? null : formatCachePercent(ratio);
 }
 
 /**
@@ -69,7 +82,7 @@ export function formatSessionCacheHit(reading: MeterReading): string | null {
     cacheWriteTokens: reading.sessionCacheWriteTokens,
     inputTokens: reading.sessionInputTokens,
   });
-  return ratio === null ? null : `${Math.round(ratio * 100)}%`;
+  return ratio === null ? null : formatCachePercent(ratio);
 }
 
 /** Formats a token count with thousands separators. */
