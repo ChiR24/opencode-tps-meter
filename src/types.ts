@@ -40,6 +40,8 @@ export interface Config {
 
   /** Whether to show the prompt cache hit rate (default: true) */
   showCacheHit: boolean;
+  /** Whether to show time to first token in the footer (default: false) */
+  showTtft: boolean;
 
   /** Display format style (default: 'compact') */
   format: 'compact' | 'verbose' | 'minimal';

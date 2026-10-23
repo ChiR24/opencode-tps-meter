@@ -1492,6 +1492,67 @@ describe("v2 optional surfaces", () => {
     await (cleanup as () => void | Promise<void>)();
   });
 
+  it("shows ttft in the compact footer when showTtft is on", async () => {
+    const { ensureSolidTransformPlugin } = await import("@opentui/solid/bun-plugin");
+    ensureSolidTransformPlugin();
+    const { setupTui } = await import("../v2/tui.js");
+    const { testRender } = await import("@opentui/solid");
+    const { RGBA } = await import("@opentui/core");
+    const color = RGBA.fromInts(255, 255, 255, 255);
+
+    const handlers = new Map<string, (event: unknown) => void>();
+    const claims: Array<{ render: (input: unknown) => unknown; after?: string }> = [];
+    const cleanup = setupTui({
+      options: { showTtft: true },
+      theme: {
+        text: {
+          default: color,
+          subdued: color,
+          feedback: {
+            error: { default: color },
+            warning: { default: color },
+            success: { default: color },
+            info: { default: color },
+          },
+        },
+      },
+      data: {
+        on: (type: string, handler: (event: never) => void) => {
+          handlers.set(type, handler as (event: unknown) => void);
+          return () => handlers.delete(type);
+        },
+      },
+      ui: {
+        slot: (claim: Record<string, unknown>) => {
+          claims.push(claim as { render: (input: unknown) => unknown; after?: string });
+          return () => {};
+        },
+      },
+    } as never);
+
+    const base = Date.now();
+    const text = handlers.get("session.text.delta")!;
+    handlers.get("session.execution.started")!({
+      type: "session.execution.started",
+      created: base,
+      data: { sessionID: "ses-ttft" },
+    });
+    text({ ...textDelta("ses-ttft", "first chunk of output"), created: base + 250 });
+    text({ ...textDelta("ses-ttft", " and the rest of it"), created: base + 300 });
+    await delay(120);
+
+    const footer = claims.find((claim) => claim.after === "prompt.footer.status");
+    expect(footer).toBeDefined();
+    const setup = await testRender(() => footer!.render({ sessionID: "ses-ttft" }), {
+      width: 100,
+      height: 5,
+    });
+    await setup.flush();
+    expect(setup.captureCharFrame()).toContain("ttft 250ms");
+
+    await (cleanup as unknown as () => void | Promise<void>)?.();
+  });
+
   it("degrades to the footer meter alone when the host offers nothing optional", async () => {
     const { ensureSolidTransformPlugin } = await import("@opentui/solid/bun-plugin");
     ensureSolidTransformPlugin();
