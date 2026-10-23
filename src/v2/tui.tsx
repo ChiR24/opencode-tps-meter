@@ -39,7 +39,6 @@ import type {
   V2PluginDefinition,
   V2ResolvedTheme,
   V2Rgba,
-  V2Route,
   V2SessionData,
   V2SlotInput,
   V2TuiContext,
@@ -74,18 +73,8 @@ const MODE_ORDER: readonly DisplayMode[] = ["compact", "detailed", "hidden"];
 /** Route name for the dashboard page. */
 const DASHBOARD_ROUTE = "tps";
 
-/** Where to go when the dashboard is dismissed, based on the route it was opened from. */
-function returnRouteFrom(route: V2Route): Record<string, unknown> {
-  if (route.type === "session" && route.sessionID) {
-    return { type: "session", sessionID: route.sessionID };
-  }
-  if (route.type === "plugin" && route.name) {
-    return route.data
-      ? { type: "plugin", name: route.name, data: route.data }
-      : { type: "plugin", name: route.name };
-  }
-  return { type: "home" };
-}
+/** Plugin id the host stamps on plugin routes created through our router. */
+const PLUGIN_ID = "opencode-tps-meter";
 
 function loadTuiConfig(options?: Readonly<Record<string, unknown>>): Config {
   try {
@@ -460,10 +449,33 @@ function SidebarPanel(props: {
  * possible because of `ctx.storage.store`.
  */
 function DashboardPage(props: {
+  ctx: V2TuiContext;
   ledger: V2Ledger;
   theme: V2ResolvedTheme;
   snapshots: () => ReadonlyMap<string, V2Snapshot>;
+  onClose: () => void;
 }) {
+  // Registered from the page, not the global command layer: a routed page has its own
+  // reactive owner, and a binding without `mode` is inactive while a dialog is open — so
+  // typing `q` into a dialog does not close the dashboard behind it. It also exists only
+  // while the page is mounted, which removes any need for a route check.
+  try {
+    props.ctx.keymap?.layer(() => ({
+      commands: [
+        {
+          id: "tps.back",
+          bind: "escape,q",
+          title: "Back",
+          description: "Leave the throughput dashboard",
+          group: "TPS Meter",
+          run: props.onClose,
+        },
+      ],
+    }));
+  } catch {
+    // Escape is a nicety; the dashboard still renders without it.
+  }
+
   const models = createMemo(() => {
     const data = props.ledger.read();
     return Object.entries(data.models ?? {})
@@ -535,6 +547,7 @@ function CommandLayer(props: {
   setMode: (next: DisplayMode) => void;
   snapshots: () => ReadonlyMap<string, V2Snapshot>;
   ledger: V2Ledger;
+  openDashboard: () => void;
 }) {
   const describe = (): string => {
     const entries = [...props.snapshots().values()];
@@ -564,22 +577,6 @@ function CommandLayer(props: {
     mode: "global",
     commands: [
       {
-        id: "tps.back",
-        bind: "escape,q",
-        title: "Back",
-        description: "Leave the throughput dashboard",
-        group: "TPS Meter",
-        enabled: () => props.ctx.ui.router?.current()?.name === DASHBOARD_ROUTE,
-        run: () => {
-          const router = props.ctx.ui.router;
-          if (!router) {
-            return;
-          }
-          const back = router.current().data?.returnRoute as Record<string, unknown> | undefined;
-          router.navigate(back ?? { type: "home" });
-        },
-      },
-      {
         id: "tps.toggle",
         title: "Throughput meter",
         description: "Open the dashboard, cycle the meter, or show current stats",
@@ -590,16 +587,7 @@ function CommandLayer(props: {
           const arg = (input ?? "").trim().toLowerCase();
 
           if (arg === "" && props.ctx.ui.router) {
-            const router = props.ctx.ui.router;
-            const current = router.current();
-            if (current.name === DASHBOARD_ROUTE) {
-              return;
-            }
-            router.navigate({
-              type: "plugin",
-              name: DASHBOARD_ROUTE,
-              data: { returnRoute: returnRouteFrom(current) },
-            });
+            props.openDashboard();
             return;
           }
           if (arg === "detail" || arg === "details") {
@@ -676,6 +664,41 @@ export function setupTui(ctx: V2TuiContext): V2Cleanup | void {
   const [snapshots, setSnapshots] = createSignal<ReadonlyMap<string, V2Snapshot>>(new Map());
   const [mode, setMode] = createSignal<DisplayMode>("compact");
   const disposers: Array<() => void> = [];
+
+  /**
+   * Route the dashboard was opened from. A copy, not a reference: `router.current()` is the
+   * host's live store object, and its `reconcile` rewrites that object in place when the
+   * dashboard route is applied. Passing it through route data lost a plugin page's `data`
+   * (the storybook's `story`, the diff viewer's `sessionID`) and a home route's `location`.
+   */
+  let returnTo: Record<string, unknown> | undefined;
+
+  const openDashboard = (): void => {
+    const router = ctx.ui.router;
+    if (!router) {
+      return;
+    }
+    const current = router.current();
+    if (
+      current.type === "plugin" &&
+      current.id === PLUGIN_ID &&
+      current.name === DASHBOARD_ROUTE
+    ) {
+      return;
+    }
+    // Top-level copy is enough: reconcile replaces the store's `data`/`location` reference,
+    // it does not mutate the objects they point at.
+    returnTo = { ...current };
+    router.navigate({ type: "plugin", name: DASHBOARD_ROUTE });
+  };
+
+  const closeDashboard = (): void => {
+    const destination = returnTo ?? { type: "home" };
+    // Drop the copy once it has been used: a stale route must not be restored by a later
+    // dashboard open that did not go through `openDashboard`.
+    returnTo = undefined;
+    ctx.ui.router?.navigate(destination);
+  };
 
   const cleanup = (): void => {
     for (const dispose of disposers) {
@@ -766,7 +789,15 @@ export function setupTui(ctx: V2TuiContext): V2Cleanup | void {
     optional("dashboard", () =>
       ctx.ui.router?.register({
         name: DASHBOARD_ROUTE,
-        render: () => <DashboardPage ledger={ledger} theme={theme} snapshots={snapshots} />,
+        render: () => (
+          <DashboardPage
+            ctx={ctx}
+            ledger={ledger}
+            theme={theme}
+            snapshots={snapshots}
+            onClose={closeDashboard}
+          />
+        ),
       })
     );
   }
@@ -783,6 +814,7 @@ export function setupTui(ctx: V2TuiContext): V2Cleanup | void {
             setMode={setMode}
             snapshots={snapshots}
             ledger={ledger}
+            openDashboard={openDashboard}
           />
         ),
       })
@@ -794,7 +826,7 @@ export function setupTui(ctx: V2TuiContext): V2Cleanup | void {
 
 /** v2 TUI plugin definition. Structurally what `Plugin.define` from `@opencode-ai/plugin/tui` returns. */
 export const v2TuiPlugin: V2PluginDefinition<V2TuiContext> = {
-  id: "opencode-tps-meter",
+  id: PLUGIN_ID,
   setup: setupTui,
 };
 
