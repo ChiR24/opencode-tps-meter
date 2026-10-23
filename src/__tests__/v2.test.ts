@@ -1553,6 +1553,163 @@ describe("v2 optional surfaces", () => {
     await (cleanup as unknown as () => void | Promise<void>)?.();
   });
 
+  it("leaves the dashboard on escape and returns to the route it was opened from", async () => {
+    const { ensureSolidTransformPlugin } = await import("@opentui/solid/bun-plugin");
+    ensureSolidTransformPlugin();
+    const { setupTui } = await import("../v2/tui.js");
+    const { testRender } = await import("@opentui/solid");
+    const { createStore, reconcile } = await import("solid-js/store");
+    const { RGBA } = await import("@opentui/core");
+    const color = RGBA.fromInts(255, 255, 255, 255);
+
+    type TestCommand = {
+      id?: string;
+      bind?: string;
+      enabled?: (() => boolean) | boolean;
+      run: (input?: string) => void;
+    };
+    type TestLayer = { mode?: string; commands?: TestCommand[] };
+    type TestPage = { name: string; render: (input: unknown) => unknown };
+
+    const pluginID = "opencode-tps-meter";
+
+    /**
+     * Mirrors the host router: `current()` is a live store, `navigate` reconciles it in place,
+     * and a plugin route without an id is stamped with the navigating plugin's id.
+     */
+    function mount(initial: Record<string, unknown>) {
+      const [route, setRoute] = createStore<Record<string, unknown>>({ ...initial });
+      const navigated: Array<Record<string, unknown>> = [];
+      const claims: Array<Record<string, unknown>> = [];
+      const pages: TestPage[] = [];
+      const layers: Array<() => TestLayer> = [];
+
+      const cleanup = setupTui({
+        options: undefined,
+        theme: {
+          text: {
+            default: color,
+            subdued: color,
+            feedback: {
+              error: { default: color },
+              warning: { default: color },
+              success: { default: color },
+              info: { default: color },
+            },
+          },
+        },
+        data: { on: () => () => {} },
+        ui: {
+          slot: (claim: Record<string, unknown>) => {
+            claims.push(claim);
+            return () => {};
+          },
+          toast: { show: () => {} },
+          router: {
+            register: (page: TestPage) => {
+              pages.push(page);
+              return () => {};
+            },
+            navigate: (destination: Record<string, unknown>) => {
+              const next =
+                destination.type === "plugin"
+                  ? {
+                      ...destination,
+                      id: "id" in destination ? destination.id : pluginID,
+                    }
+                  : destination;
+              navigated.push(next);
+              setRoute(reconcile(next) as never);
+            },
+            current: () => route,
+          },
+        },
+        keymap: {
+          layer: (input: () => TestLayer) => {
+            layers.push(input);
+          },
+        },
+        storage: {
+          store: () => [{ version: 1, models: {} }, () => Promise.resolve()] as never,
+          memory: () => [{}, () => {}] as never,
+        },
+      } as never);
+
+      const app = claims.find((claim) => claim.append === "app");
+      const dashboard = pages.find((page) => page.name === "tps");
+      expect(app).toBeDefined();
+      expect(dashboard).toBeDefined();
+
+      return {
+        cleanup,
+        navigated,
+        layers,
+        route: () => route as Record<string, unknown>,
+        app: app!,
+        dashboard: dashboard!,
+      };
+    }
+
+    function commandsOf(layers: Array<() => TestLayer>, id: string): TestCommand | undefined {
+      for (const layer of layers) {
+        const command = layer().commands?.find((entry) => entry.id === id);
+        if (command) return command;
+      }
+      return undefined;
+    }
+
+    const cases: Array<{ label: string; route: Record<string, unknown> }> = [
+      { label: "a session", route: { type: "session", sessionID: "ses-1" } },
+      {
+        label: "another plugin page",
+        route: { type: "plugin", id: "other", name: "stats", data: { story: "x" } },
+      },
+      { label: "home with a location", route: { type: "home", location: { directory: "/p" } } },
+    ];
+
+    for (const { label, route: initial } of cases) {
+      const harness = mount(initial);
+
+      // The command layer is mounted in the `app` slot; the page is mounted only by the router.
+      harness.app.render({});
+
+      const toggle = commandsOf(harness.layers, "tps.toggle");
+      expect(toggle, label).toBeDefined();
+      toggle!.run("");
+
+      // Opening the dashboard stamps our plugin id and carries no route data.
+      expect(harness.route(), label).toEqual({ type: "plugin", id: pluginID, name: "tps" });
+
+      // No escape binding in the global layer: a dialog's input keeps its `q`.
+      const global = harness.layers
+        .map((layer) => layer())
+        .find((layer) => layer.mode === "global");
+      expect(global?.commands?.some((command) => command.bind === "escape,q"), label).toBe(false);
+
+      const page = await testRender(() => harness.dashboard.render({}), { width: 80, height: 20 });
+      await page.flush();
+
+      const backLayer = harness.layers
+        .map((layer) => layer())
+        .find((layer) => layer.commands?.some((command) => command.id === "tps.back"));
+      expect(backLayer, label).toBeDefined();
+      // Page-local and modeless: inactive while a dialog is open, gone once the page unmounts.
+      expect(backLayer!.mode, label).toBeUndefined();
+      const back = commandsOf(harness.layers, "tps.back");
+      expect(back?.bind, label).toBe("escape,q");
+      expect(back!.enabled, label).toBeUndefined();
+
+      back!.run();
+
+      // The full route comes back: plugin id and data, or the home location.
+      expect(harness.navigated.at(-1), label).toEqual(initial);
+      expect(harness.route(), label).toEqual(initial);
+
+      page.renderer.destroy();
+      await (harness.cleanup as () => void | Promise<void>)();
+    }
+  });
+
   it("degrades to the footer meter alone when the host offers nothing optional", async () => {
     const { ensureSolidTransformPlugin } = await import("@opentui/solid/bun-plugin");
     ensureSolidTransformPlugin();

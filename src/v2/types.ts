@@ -446,8 +446,21 @@ export interface V2Page {
   readonly render: (input: { readonly data?: Record<string, unknown> }) => unknown;
 }
 
+/**
+ * Where the TUI currently is. Mirrors the host's route store: sessions carry a `sessionID`,
+ * plugin pages carry the owning plugin `id`, their page `name`, and optional `data`, and a
+ * home route may carry the `location` to reopen.
+ */
+export interface V2Route {
+  readonly type: string;
+  readonly id?: string;
+  readonly name?: string;
+  readonly sessionID?: string;
+  readonly location?: unknown;
+}
+
 export interface V2Router {
   readonly register: (page: V2Page) => () => void;
   readonly navigate: (destination: Record<string, unknown>) => void;
-  readonly current: () => { readonly type: string; readonly sessionID?: string };
+  readonly current: () => V2Route;
 }
