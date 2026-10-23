@@ -5,6 +5,7 @@
 
 import type { Config, OpenCodeClient, DisplayState, AgentDisplayState, TokenCacheInfo, UIManager as IUIManager } from "./types.js";
 import { MIN_TOAST_INTERVAL_MS, DEFAULT_TOAST_DURATION_MS, FINAL_STATS_DURATION_MS } from "./constants.js";
+import { formatCachePercent } from "./format.js";
 
 /** Prompt cache hit rate as a whole-percent string, or null when unknown. */
 function formatCacheHit(cache?: TokenCacheInfo): string | null {
@@ -15,7 +16,7 @@ function formatCacheHit(cache?: TokenCacheInfo): string | null {
   if (promptTokens <= 0) {
     return null;
   }
-  return `${Math.round((cache.read / promptTokens) * 100)}%`;
+  return formatCachePercent(cache.read / promptTokens);
 }
 
 /**
