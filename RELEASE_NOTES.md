@@ -1,7 +1,7 @@
 ## v0.4.2 — TTFT in the footer, dashboard escape, cache rounding
 
 Two community fixes, one community feature, and documentation brought back in line with the
-code. Tested on OpenCode v1 and v2. Install with `opencode-tps-meter@latest`.
+code.
 
 ### Added
 
@@ -33,8 +33,7 @@ code. Tested on OpenCode v1 and v2. Install with `opencode-tps-meter@latest`.
 ## v0.4.1 — Accurate TPS, subagent throughput, cache hit rate, theme colors
 
 The throughput figures are now measured correctly, and three community features
-land alongside. Tested on OpenCode v1 and v2. Install with
-`opencode-tps-meter@latest`.
+land alongside.
 
 ### Accurate throughput
 
