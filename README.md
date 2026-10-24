@@ -15,9 +15,9 @@
 </div>
 
 ```
-╔══════════════════════════════════════════════════╗
-║  TPS: 92.4 (avg 78.1) | tokens: 1,842            ║
-╚══════════════════════════════════════════════════╝
+╔═══════════════════════════════════════════════════╗
+║  92.4 TPS · avg 78.1 · 1,842 tok · cache 91%      ║
+╚═══════════════════════════════════════════════════╝
 ```
 
 A live tokens-per-second meter plugin for OpenCode. Track AI token throughput in real-time with a configurable rolling window display. Only tracks **assistant role** messages — user and system messages are automatically excluded from metrics. File parts are also excluded from token counting.
@@ -29,14 +29,17 @@ A live tokens-per-second meter plugin for OpenCode. Track AI token throughput in
 ## Features
 
 - **Runs on both OpenCode generations** — one package, v1 (`opencode`) and v2 (`opencode2`)
+- **Accurate live rate** — every chunk is rated over the interval it was generated in, so the reading is exact from the second chunk, never spikes at the start, and falls when a stream stalls
 - **Exact final totals on v2** — provider-reported token counts replace the heuristic estimate when the turn ends
-- **Real-time Monitoring** — Live TPS calculation with configurable rolling window
-- **Smart Filtering** — Tracks only assistant text/reasoning, excludes user prompts, tools, patches, snapshots, and files
-- **Noise Suppression** — TPS display starts after a configurable 10ms startup delay for fast live feedback
+- **Calibrated estimate on v2** — the live token estimate is corrected against provider counts, learned and saved per model
+- **Subagent throughput** — while subagents run, the footer shows `TPS Σ … | main … | explore …` on both hosts
+- **Prompt cache hit rate** — `cache 91% · session cache 64%` once a step settles
+- **Time to first token on v2** — in the detailed footer and the dashboard, and in the compact footer with `showTtft`
+- **Smart Filtering** — Counts only model output (text, reasoning and, on v2, tool-call arguments); excludes user prompts, tool results, patches, snapshots, and files
 - **Multi-Session Support** — Isolated tracking per session with automatic cleanup
 - **Throttled UI Updates** — Configurable update intervals to prevent UI flooding
 - **Optional Time Display** — Elapsed time display (disabled by default, enable with `showElapsed: true`)
-- **TPS-Based Color Coding** — Visual feedback with color-coded persistent TUI text based on throughput speed
+- **TPS-Based Color Coding** — Visual feedback in your theme's colors based on throughput speed; on v2 a theme switch recolors the meter live
 - **Persistent TUI Meter** — OpenCode TUI slot display beside the session prompt on supported versions
 - **Opt-in Toast Fallback** — Legacy toast UI is disabled by default; enable it only for older OpenCode surfaces
 - **Zero Console Logging** — Safe for TUI environments (no console.* calls)
@@ -120,16 +123,18 @@ On v1, the meter renders in the session prompt area via `opencode-tps-meter/tui`
 
 On v2, TUI plugins are registered in the global `~/.config/opencode/cli.json` under `plugins` (auto-migrated from v1's `tui.json`). Per OpenCode's loader spec, a package with an `exports` map is resolved via `./tui` or `./server` and **never** falls back to `exports["."]`, so this package publishes both.
 
-**Registering a local checkout on v2:** a path spec must point at the built TUI **file**, not the
-package directory. v2's TUI loader resolves a directory spec by appending `/tui` and opening that path
-literally — it does not consult `package.json` `exports` and does not try extensions, so a directory
-entry fails with `ENOENT ... open '<dir>/tui'`:
+**Registering a local checkout on v2:** point the entry at the built `dist` directory, not the
+repository root, and use the same path in `opencode.json` and `cli.json`:
 
 ```json
-{ "plugins": ["file:///abs/path/to/opencode-tps-meter/dist/tui.mjs"] }
+{ "plugins": ["file:///abs/path/to/opencode-tps-meter/dist"] }
 ```
 
-`exports["./tui"]` is only used for npm-package specs (`"opencode-tps-meter"`).
+For a local directory the loader resolves files by path (`<dir>/server` or `<dir>/index` for the
+server, `<dir>/tui` for the TUI, trying the usual extensions) and never reads `package.json`
+`exports`. The repository root has no `index.*` of its own, so it is skipped without an error;
+`dist/` contains both `index.mjs` and `tui.mjs`. `exports` is only used for npm-package specs
+(`"opencode-tps-meter"`).
 
 **Note on the v2 TUI module shape:** v2 requires `{ id, setup }`. Plugins exporting only v1's
 `{ id, tui }` are rejected by the loader. This package's TUI module exports both keys, so it satisfies
@@ -161,10 +166,10 @@ These need APIs that do not exist on v1, so they are inert on `opencode`.
 | Calibrated live rate | The streaming estimate is corrected against provider token counts, learned per model | `session.step.started` (model/agent) + `session.step.ended` (tokens) |
 | Tool-call output counted | Arguments the model writes for a tool call (a file write, an edit) count as output, so a step that only calls a tool still has a real reading | `session.tool.input.delta` / `.ended` |
 | Tool time | Time the turn spent running tools, shown separately in the detailed footer; it is never inside a step's rate window | `session.tool.called` / `.success` / `.failed` |
-| Time to first token | Measured from turn start on the host clock | `session.execution.started` + event `created` |
+| Time to first token | Measured from turn start on the host clock; shown in the detailed footer and the dashboard, and in the compact footer with `showTtft` | `session.execution.started` + event `created` |
 | Hidden overhead | Tokens spent on auto-title and compaction that no step reports | `session.usage.updated` residual |
 | Per-subagent breakdown | Live footer aggregate — `TPS Σ 318 \| main 63 \| explore 91 \| …` — while subagents generate, on **both** hosts (v1 via `session.created`/`.updated` parentID + `api.state.session`; v2 via `ctx.data.session.root` / `.family`). Σ sums every session streaming tokens right now — a root waiting on its subagents drops out on its own, and counts again once it resumes. Children keep their spawn position (no column swapping), stay visible through long tool calls while the host reports them running, and drop off ~4s after they finish. The v2-only sidebar adds the full family breakdown panel | `api.state.session` (v1) / `ctx.data.session` (v2) |
-| Durable ledger + dashboard | Per-model mean/best throughput and TTFT, persisted and shared across windows | `ctx.storage.store`, `ctx.ui.router` |
+| Durable ledger + dashboard | Per-model mean/best throughput and TTFT, plus the token calibration, persisted and shared across windows; the dashboard closes with `escape` or `q` | `ctx.storage.store`, `ctx.ui.router` |
 | Wire-level TTFB | Provider dispatch to response headers, below the streaming pipeline | `ctx.session.hook("http.request"/"http.response")` |
 
 Every one of these is feature-detected. A host that exposes none of the optional APIs still gets
@@ -208,8 +213,9 @@ Configuration starts with built-in defaults, then merges these sources in order 
 2. **Project Config** (`.opencode/tps-meter.json`)
 3. **Global Config** (`~/.config/opencode/tps-meter.json`)
 4. **Environment Variables** (`TPS_METER_*`)
+5. **v2 inline plugin options** (`options` on the plugin entry, see [Installation](#opencode-v2-opencode2))
 
-> **Note:** Environment variables have the highest priority and override all config files. Global config overrides project config in the current implementation.
+> **Note:** Environment variables override both config files, and v2 inline options override everything. Global config overrides project config in the current implementation.
 
 ### Environment Variables
 
@@ -218,9 +224,9 @@ Configuration starts with built-in defaults, then merges these sources in order 
 TPS_METER_ENABLED=true                   # Enable/disable plugin
 TPS_METER_TOAST_FALLBACK=false           # Opt into old toast UI when needed
 TPS_METER_UPDATE_INTERVAL_MS=50          # UI update throttle (ms)
-TPS_METER_INITIAL_DISPLAY_DELAY_MS=10    # First live display delay; set 0 for absolute fastest
+TPS_METER_INITIAL_DISPLAY_DELAY_MS=10    # Extra delay before the first live reading (ms)
 TPS_METER_ROLLING_WINDOW_MS=1000          # TPS calculation window (ms)
-TPS_METER_FORMAT=compact                  # compact | verbose | minimal
+TPS_METER_FORMAT=compact                  # compact | verbose | minimal (reserved, no effect yet)
 TPS_METER_MIN_VISIBLE_TPS=0               # Minimum TPS to display
 
 # Display toggles
@@ -277,7 +283,7 @@ To show elapsed time in the meter:
 }
 ```
 
-Output: `TPS: 92.4 (avg 78.1) | tokens: 1,842 | 00:23`
+Footer: `92.4 TPS · avg 78.1 · 1,842 tok · 00:23`
 
 ### Default Configuration
 
@@ -286,7 +292,7 @@ Output: `TPS: 92.4 (avg 78.1) | tokens: 1,842 | 00:23`
 | `enabled` | `boolean` | `true` | Enable/disable the plugin |
 | `toastFallback` | `boolean` | `false` | Emit legacy toast notifications from the server plugin |
 | `updateIntervalMs` | `number` | `50` | UI update interval in milliseconds |
-| `initialDisplayDelayMs` | `number` | `10` | Startup delay before the first live TPS display; set `0` for absolute fastest updates |
+| `initialDisplayDelayMs` | `number` | `10` | Extra delay before the first live reading. A reading also waits until a rate is measurable (about 50ms of output) |
 | `rollingWindowMs` | `number` | `1000` | Rolling window for TPS calculation |
 | `showAverage` | `boolean` | `true` | Show average TPS in display |
 | `showInstant` | `boolean` | `true` | Show instantaneous TPS in display |
@@ -294,7 +300,7 @@ Output: `TPS: 92.4 (avg 78.1) | tokens: 1,842 | 00:23`
 | `showElapsed` | `boolean` | `false` | Show elapsed time |
 | `showCacheHit` | `boolean` | `true` | Show the prompt cache hit rate (provider-reported) |
 | `showTtft` | `boolean` | `false` | Show time to first token in the footer |
-| `format` | `string` | `"compact"` | Display format: `compact`, `verbose`, `minimal` |
+| `format` | `string` | `"compact"` | Reserved: `compact`, `verbose` or `minimal` is accepted but does not change the display yet |
 | `minVisibleTPS` | `number` | `0` | Minimum TPS value to trigger display |
 | `fallbackTokenHeuristic` | `string` | `"chars_div_4"` | Token counting method |
 | `enableColorCoding` | `boolean` | `false` | Enable TPS-based color coding |
@@ -359,32 +365,42 @@ unknown, such as before the first token or on v1, which does not report a turn s
 footer shows the subagent aggregate, the segment is left out because a family has no single
 first token.
 
-## Display Formats
+## What the Meter Shows
 
-### Compact (Default)
-```
-TPS: 92.4 (avg 78.1) | tokens: 1,842
-```
+### Footer (TUI, both hosts)
 
-### Compact with Time (showElapsed: true)
+While output streams, the leading figure is the live rate:
+
 ```
-TPS: 92.4 (avg 78.1) | tokens: 1,842 | 00:23
+92.4 TPS · avg 78.1 · 1,842 tok
 ```
 
-### Verbose
+Once the step settles it becomes the step's average, and the cache figures appear:
+
 ```
-TPS Meter — Instant: 92.4 tokens/sec | Average: 78.1 tokens/sec | Total: 1,842 tokens
+78.1 TPS · avg 78.1 · 1,842 tok · cache 91% · session cache 64%
 ```
 
-### Verbose with Time (showElapsed: true)
+`showElapsed: true` adds ` · 00:23`, and `showTtft: true` (v2) adds ` · ttft 1.2s`. On v2,
+`/tps detailed` appends tool time, time to first token and hidden overhead, e.g.
+` · tools 4.2s · ttft 1.2s · +120 ovh`.
+
+While subagents generate, the footer switches to the family line. Same-named subagents carry a
+short session-id suffix:
+
 ```
-TPS Meter — Instant: 92.4 tokens/sec | Average: 78.1 tokens/sec | Total: 1,842 tokens | Duration: 23s
+TPS Σ 318 | main 63 | explore(9B5c) 91 | explore(A1dF) 86 | general 78 | +2
 ```
 
-### Minimal
+### Toast (v1, opt-in with `toastFallback`)
+
 ```
-92.4 TPS (1,842 tokens)
+TPS: 92.4 (avg 78.1) | tokens: 1,842 | 00:23 | cache: 91%
 ```
+
+Each active subagent gets its own line below it.
+
+The `format` option (`compact`, `verbose`, `minimal`) is accepted but changes neither surface yet.
 
 ---
 
@@ -399,7 +415,7 @@ import TpsMeterV2 from 'opencode-tps-meter/v2';
 import TpsMeterV2Tui from 'opencode-tps-meter/v2/tui';
 ```
 
-- `opencode-tps-meter` is the v1 server/toast fallback entrypoint. It does not emit toasts unless `toastFallback` is enabled. The exported function also carries `id` and `setup` properties so a v2 host can load the same module.
+- `opencode-tps-meter` is the v1 server/toast fallback entrypoint. It does not emit toasts unless `toastFallback` is enabled. The default export is `{ id, server, setup }`, so v1 reads `server` and a v2 host reads `setup` from the same module.
 - `opencode-tps-meter/tui` is the persistent v1 TUI entrypoint. The exported object carries both `tui` (v1) and `setup` (v2).
 - `opencode-tps-meter/v2` and `opencode-tps-meter/v2/tui` are plain `{ id, setup }` v2 definitions with no callable v1 shape, for hosts that reject the dual-shaped modules.
 
@@ -434,7 +450,7 @@ The plugin subscribes to four OpenCode event types:
    - **User prompts excluded**: Prevents TPS spikes from user input (which would appear as thousands of TPS since prompts arrive instantly)
    - **Counted parts**: Only `text` and `reasoning` are counted toward TPS
    - **Ignored parts**: `tool`, `patch`, `snapshot`, `file`, `subtask`, `agent`, `retry`, `compaction`
-   - **Startup delay**: TPS display begins after `initialDisplayDelayMs` (10ms by default) for fast live feedback
+   - **First reading**: the live display begins once a rate is measurable (see [How the Rate Is Measured](#how-the-rate-is-measured))
    - Calculates delta tokens between consecutive updates
    - Updates tracker and throttled UI display
 
@@ -445,14 +461,14 @@ The plugin subscribes to four OpenCode event types:
    - Displays final stats when message completes
 
 4. **`session.idle`** — Persistence and cleanup trigger
-   - Keeps the latest streamed TPS stats visible as an inactive status once the startup delay has elapsed
+   - Keeps the latest streamed TPS stats visible as an inactive status once they had a measurable rate
    - Removes tracker for the specific session
    - Clears all session-specific caches (role cache, token cache, part text cache)
    - Preserves completed session stats
 
 ### Event Handling (OpenCode v2)
 
-v2 removed the entire `message.*` event family and replaced it with granular session events. The v2 entries subscribe to five:
+v2 removed the entire `message.*` event family and replaced it with granular session events. The core mapping:
 
 | v1 event | v2 replacement |
 |---|---|
@@ -462,7 +478,11 @@ v2 removed the entire `message.*` event family and replaced it with granular ses
 | `message.updated` (`info.tokens`) | `session.usage.updated` |
 | `session.idle` | `session.idle` (unchanged) |
 
-Two consequences worth knowing:
+On top of these, the v2 entries listen to `session.step.started` / `.failed`, `session.tool.*`
+(calls and their arguments) and `session.execution.*`, for model attribution, tool time, time to
+first token and calibration.
+
+Consequences worth knowing:
 
 - **No role filtering is needed.** `session.text.delta` and `session.reasoning.delta` are assistant output by construction, so v1's message-role cache, part-type filtering, and part-text extraction have no v2 equivalent — user prompts can no longer leak into the count.
 - **Final totals are exact, not heuristic.** `session.step.ended` carries provider-reported `tokens.output` and `tokens.reasoning`, which the meter prefers over its own character-based estimate. The heuristic still drives the live rolling rate, since deltas arrive before any usage report.
@@ -549,7 +569,7 @@ bun run build
 - ✅ Verify `TPS_METER_ENABLED` is not set to `false`
 - ✅ **v1:** for persistent TUI display, install with `opencode plug install opencode-tps-meter@latest` or add the package to OpenCode's TUI config (`~/.config/opencode/tui.json` or `tui.jsonc`)
 - ✅ **v2:** use the `"plugins"` key, not `"plugin"` — and note `tui.json`/`tui.jsonc` are no longer read at all, having been replaced by a single global `cli.json`
-- ✅ **v2:** if the bare package name does not load, register the explicit entries `opencode-tps-meter/v2` and `opencode-tps-meter/v2/tui`
+- ✅ **v2:** open the plugin manager (`ctrl+p` → **Open plugin manager dialog**) and check the meter is enabled; a failed load is logged to `~/.local/share/opencode/log/opencode.log` as `failed to load plugin`
 - ✅ **v2:** confirm the host supplies `@opentui/solid` and `solid-js`; a nested copy inside the plugin gives the meter its own reactive graph, so it renders once and then freezes
 - ✅ Verify your installed package exposes `opencode-tps-meter/tui` for TUI plugin loading
 - ✅ If you still see a `TPS Meter` popup, you are seeing the old server plugin toast path; remove the package from normal OpenCode plugin config or set `toastFallback: false` / `TPS_METER_TOAST_FALLBACK=false`
@@ -557,15 +577,13 @@ bun run build
 - ✅ Ensure you're viewing **assistant role** messages (user/system are filtered)
 - ✅ Check that `minVisibleTPS` threshold is not set too high
 
-### High TPS on First Message (Fixed)
+### Very High TPS Readings (Fixed)
 
-If you see extremely high TPS values (e.g., `TPS: 13590.0`) on the first message of a session, this is now fixed. The plugin now:
-- Filters out **user prompts** (which would count as instant tokens)
-- Only tracks **assistant responses** (actual AI output)
-- Excludes **file parts** from token counting
-- Applies a configurable **10ms startup delay** before showing TPS; set `initialDisplayDelayMs` to `0` for the lowest latency if you accept a jumpier first reading
-
-If you still see issues, ensure you're on the latest version with role filtering enabled.
+Readings like `TPS: 13590.0`, or a five-digit average on a subagent, came from dividing a host's
+first batch of output by the few milliseconds before the first update. Since v0.4.1 every chunk
+is rated over the interval it was generated in, the opening chunk never counts toward a rate,
+and nothing is shown until a rate is measurable. Only assistant output is counted; user prompts
+and file parts are excluded. If you still see implausible figures, update to the latest version.
 
 ### Incorrect Token Counts
 
@@ -574,6 +592,7 @@ If you still see issues, ensure you're on the latest version with role filtering
 - For code: Use `fallbackTokenHeuristic: 'chars_div_3'`
 - Remember: Tool outputs, patches, snapshots, and file parts are always excluded from counting
 - This plugin uses fast heuristics, not exact tokenizers like gpt-tokenizer
+- On v2 the live estimate is calibrated against provider counts per model, and final totals are provider-reported
 
 ### High CPU Usage
 
@@ -581,7 +600,6 @@ If you still see issues, ensure you're on the latest version with role filtering
 - Increase `initialDisplayDelayMs` if the first live reading is too jumpy
 - Increase `rollingWindowMs` if using short windows
 - Disable `showElapsed` if not needed
-- Check buffer size with `tracker.getBufferSize()`
 
 ### Import Errors
 
@@ -605,7 +623,7 @@ Helper modules are internal and are not exported as package subpaths. If you nee
 
 ```typescript
 export type {
-  BufferEntry,         // Ring buffer entry structure
+  BufferEntry,         // Rate tracker chunk entry
   TPSTrackerOptions,   // Tracker configuration
   TPSTracker,          // Tracker interface
   UIManager,           // UI manager interface

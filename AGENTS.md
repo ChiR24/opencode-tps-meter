@@ -103,18 +103,18 @@ Never import `src/ui.ts` or `src/types.ts` event types from v2 code — those ar
 
 | Task | Location | Notes |
 |------|----------|-------|
-| v1 plugin initialization | `src/index.ts:150` | `.server` member of the default export |
-| v1 event handling | `src/index.ts:971` | message.part.updated, message.updated, session.idle |
+| v1 plugin initialization | `src/index.ts` | `.server` member of the default export |
+| v1 event handling | `src/index.ts` | message.part.updated, message.updated, session.idle |
 | v1 TUI meter | `src/tui.tsx` | `session_prompt_right` slot, `api.event.on` |
-| v2 tracking core | `src/v2/meter.ts:82` | Drives both v2 entries; v2 event vocabulary |
-| v2 TUI meter | `src/v2/tui.tsx:103` | `prompt.footer.status` slot, `ctx.data.on` |
-| v2 server entry | `src/v2/server.ts:44` | `ctx.event.subscribe()` async iterable; no UI surface |
+| v2 tracking core | `src/v2/meter.ts` | Drives both v2 entries; v2 event vocabulary |
+| v2 TUI meter | `src/v2/tui.tsx` | `prompt.footer.status` slot, `ctx.data.on` |
+| v2 server entry | `src/v2/server.ts` | `ctx.event.subscribe()` async iterable; no UI surface |
 | v2 API types | `src/v2/types.ts` | Hand-written structural types for the beta v2 API |
 | TPS calculation | `src/tracker.ts` | Chunks rated over their generation interval (shared v1/v2) |
-| Meter text formatting | `src/format.ts:41` | Shared so v1 and v2 render identically |
-| UI display (v1 only) | `src/ui.ts:19` | Throttled toast updates; no v2 equivalent |
-| Token counting | `src/tokenCounter.ts:129` | Heuristic: chars/4, words/0.75, or chars/3 |
-| Configuration | `src/config.ts:319` | Priority: project → global → env → v2 options |
+| Meter text formatting | `src/format.ts` | Shared so v1 and v2 render identically |
+| UI display (v1 only) | `src/ui.ts` | Throttled toast updates; no v2 equivalent |
+| Token counting | `src/tokenCounter.ts` | Heuristic: chars/4, words/0.75, or chars/3 |
+| Configuration | `src/config.ts` | Priority: project → global → env → v2 options |
 | Type definitions | `src/types.ts` | v1 interfaces; v2 types live in `src/v2/types.ts` |
 | Build output | `dist/` | ESM (.mjs) + CJS (.js) + types (.d.ts) + `dist/v2/` |
 
@@ -124,22 +124,22 @@ Never import `src/ui.ts` or `src/types.ts` event types from v2 code — those ar
 
 | Symbol | Type | Location | Role |
 |--------|------|----------|------|
-| `TpsMeterPlugin` | Function | `index.ts:150` | v1 handler factory, exported as the module's `.server` |
-| `createMeter` | Factory | `v2/meter.ts:82` | v2 session tracking core |
+| `TpsMeterPlugin` | Function | `index.ts` | v1 handler factory, exported as the module's `.server` |
+| `createMeter` | Factory | `v2/meter.ts` | v2 session tracking core |
 | `collectMeterEntries` | Function | `v2/family.ts` | Selects/orders family sessions for the footer Σ line |
 | `formatAggregateLine` | Function | `v2/family.ts` | Renders `TPS Σ… \| main … \| agent … \| +N` |
 | `isGenerating` | Function | `v2/family.ts` | `active` + token within the rolling window; decides Σ membership |
 | `agentNameFromMessage` | Function | `agentName.ts` | v1 payload agent name; shared by server plugin and TUI |
-| `setupTui` | Function | `v2/tui.tsx:103` | v2 TUI setup; returns cleanup |
-| `setupServer` | Function | `v2/server.ts:44` | v2 server setup; returns cleanup |
+| `setupTui` | Function | `v2/tui.tsx` | v2 TUI setup; returns cleanup |
+| `setupServer` | Function | `v2/server.ts` | v2 server setup; returns cleanup |
 | `createTracker` | Factory | `tracker.ts` | Interval-based rate tracker (shared) |
-| `createUIManager` | Factory | `ui.ts:19` | v1 toast display manager with throttling |
-| `createTokenizer` | Factory | `tokenCounter.ts:129` | Heuristic token counter (shared) |
-| `formatMeterText` | Function | `format.ts:41` | Shared meter line rendering |
-| `loadConfigSync` | Function | `config.ts:319` | Config loader (sync), optional overrides |
-| `Config` | Interface | `types.ts:13` | Plugin configuration shape |
-| `TPSTracker` | Interface | `types.ts:363` | Tracker public API |
-| `MessageEvent` | Interface | `types.ts:242` | v1 OpenCode event structure |
+| `createUIManager` | Factory | `ui.ts` | v1 toast display manager with throttling |
+| `createTokenizer` | Factory | `tokenCounter.ts` | Heuristic token counter (shared) |
+| `formatMeterText` | Function | `format.ts` | Shared meter line rendering |
+| `loadConfigSync` | Function | `config.ts` | Config loader (sync), optional overrides |
+| `Config` | Interface | `types.ts` | Plugin configuration shape |
+| `TPSTracker` | Interface | `types.ts` | Tracker public API |
+| `MessageEvent` | Interface | `types.ts` | v1 OpenCode event structure |
 | `V2MeterEvent` | Type | `v2/types.ts` | v2 event union the meter consumes |
 
 ---
@@ -159,9 +159,9 @@ Never import `src/ui.ts` or `src/types.ts` event types from v2 code — those ar
 
 | Pattern | Why Forbidden | Location |
 |---------|---------------|----------|
-| **`console.*` calls** | TUI log leak during resize. SDK spawns TUI with `stdio: "inherit"` causing console output to bypass TUI redraw | `index.ts:125-134`, `config.ts:128-137` |
-| **Throwing config errors** | Silently ignore invalid configs to prevent TUI corruption | `config.ts:128-137` |
-| **Direct module.exports** | CJS requires special handling for OpenCode compatibility | `build.ts:46-60` |
+| **`console.*` calls** | TUI log leak during resize. SDK spawns TUI with `stdio: "inherit"` causing console output to bypass TUI redraw | `index.ts`, `config.ts` |
+| **Throwing config errors** | Silently ignore invalid configs to prevent TUI corruption | `config.ts` |
+| **Direct module.exports** | CJS requires special handling for OpenCode compatibility | `build.ts` |
 
 ---
 
@@ -186,7 +186,7 @@ Never import `src/ui.ts` or `src/types.ts` event types from v2 code — those ar
 ### Event Flow (v1)
 1. `message.part.updated` → Count delta tokens → Update tracker → Throttled UI update
 2. `message.updated` (completed) → Show final stats
-3. `session.idle` → Keep latest visible stats after startup delay → cleanup tracker
+3. `session.idle` → Keep latest visible stats (once they had a measurable rate) → cleanup tracker
 
 ### Event Flow (v2)
 v2 deleted the whole `message.*` family. Mapping:
@@ -201,11 +201,21 @@ v2 deleted the whole `message.*` family. Mapping:
 
 Also changed: event envelope `properties` → `data`; slot `session_prompt_right` →
 `prompt.footer.status`; slot prop `session_id` (required) → `sessionID` (optional);
-theme `current.textMuted` → `text.subdued` and `current.error` → `text.feedback.error.default`;
+theme `current.textMuted` → `text.muted` and `current.error` → `text.feedback.error.base` on
+current hosts (early v2 builds used `text.subdued` / `.default`); `normalizeTheme` in
+`v2/tui.tsx` maps both onto one shape and reads `ctx.theme` lazily, because the host's theme is a
+live getter and a copy taken at setup never follows a theme switch;
 `api.event.on` → `ctx.data.on` (TUI) or `ctx.event.subscribe()` async-iterable (server);
 `api.lifecycle.onDispose` → return a cleanup fn from `setup`.
 
 No role filtering is needed on v2 — text/reasoning deltas are assistant output by construction.
+
+**Dashboard routing.** `/tps` opens the dashboard through `openDashboard`, which stores a COPY of
+`router.current()` to return to: the host reconciles its route store in place, so a reference
+loses a plugin page's `data` or a home route's `location`. The host stamps plugin routes with the
+plugin `id` (`PLUGIN_ID`), which is how a repeat `/tps` on the dashboard is detected. `escape` /
+`q` come from a keymap layer registered inside `DashboardPage`, so they exist only while the page
+is mounted and never shadow the host's own Esc (interrupt) elsewhere.
 
 **Clock discipline.** The TUI flushes events in ~10ms batches, so `Date.now()` inside a handler
 is FLUSH time and every event in a batch shares it. Use each event's host-stamped `created`
@@ -232,15 +242,18 @@ from event `created` or v1's `info.time.completed`, which a remote service can s
    (`sawReasoning`); hidden reasoning otherwise inflates the rate. If reasoning streamed but the
    provider reports `reasoning: 0`, the count is ambiguous (folded into output, or omitted):
    skip both correction and calibration for that step (live: rates scaled down 40%).
+5. Tool execution runs between steps, never inside a step's window, so it is never subtracted
+   from a rate (`generationTps` equals the step average; `toolMs` is reported on its own).
+6. The ledger (`ledger.v2` store key) gets `generationMs` implied by the displayed rate, so its
+   per-model means agree with the footer. `ledger` (v1 key) held spike-polluted figures.
 7. A step too short to time falls back to tokens over the whole step, from `step.started`'s
    `started` field (the event itself is published late, with the first output).
 8. Calibration is a size-weighted ratio of sums (`CALIBRATION_MEMORY_TOKENS`), persisted per
    model in the ledger: tiny tool steps read ~2x (provider counts call framing) and must not
    swing it.
-5. Tool execution runs between steps, never inside a step's window, so it is never subtracted
-   from a rate (`generationTps` equals the step average; `toolMs` is reported on its own).
-6. The ledger (`ledger.v2` store key) gets `generationMs` implied by the displayed rate, so its
-   per-model means agree with the footer. `ledger` (v1 key) held spike-polluted figures.
+9. A live stream that goes quiet for `STALL_REPUBLISH_MS` is republished with the rate as of
+   now, until output resumes or it reaches zero; otherwise a stalled stream holds its last
+   speed.
 
 **Cumulative vs per-step.** `session.step.ended.tokens` is a PER-STEP DELTA;
 `session.usage.updated.tokens` is a CUMULATIVE SESSION TOTAL that also includes auto-title and
@@ -335,11 +348,19 @@ unaffected.
 
 ### Environment Variables
 - `TPS_METER_ENABLED` (boolean)
+- `TPS_METER_TOAST_FALLBACK` (boolean, default: false; v1 only)
 - `TPS_METER_UPDATE_INTERVAL_MS` (number, default: 50)
 - `TPS_METER_INITIAL_DISPLAY_DELAY_MS` (number, default: 10)
 - `TPS_METER_ROLLING_WINDOW_MS` (number, default: 1000)
-- `TPS_METER_FORMAT` (compact|verbose|minimal)
+- `TPS_METER_MIN_VISIBLE_TPS` (number, default: 0)
+- `TPS_METER_SHOW_AVERAGE` / `_SHOW_INSTANT` / `_SHOW_TOTAL_TOKENS` (boolean, default: true)
+- `TPS_METER_SHOW_ELAPSED` (boolean, default: false)
+- `TPS_METER_SHOW_CACHE_HIT` (boolean, default: true)
+- `TPS_METER_SHOW_TTFT` (boolean, default: false; v2 compact footer)
+- `TPS_METER_FORMAT` (compact|verbose|minimal; accepted, but no renderer reads it yet)
 - `TPS_METER_FALLBACK_HEURISTIC` (chars_div_4|chars_div_3|words_div_0_75)
+- `TPS_METER_ENABLE_COLOR_CODING` (boolean, default: false)
+- `TPS_METER_SLOW_TPS_THRESHOLD` / `_FAST_TPS_THRESHOLD` (number, default: 10 / 50)
 
 ### Testing
 - Uses `bun:test` (not Jest/Vitest)
@@ -356,5 +377,5 @@ unaffected.
 - v2 API types are hand-written in `src/v2/types.ts` rather than imported from
   `@opencode-ai/plugin@next`: v1 and v2 types ship under the same package name so both cannot be
   installed at once, and the v2 API is beta and still changing.
-- `gpt-tokenizer`: Optional (listed but not actively used - heuristic fallback)
-- `zod`: Listed but not actively used in current implementation
+- No runtime dependencies: token counting is heuristic (`src/tokenCounter.ts`), calibrated on
+  v2 against provider counts.
