@@ -1,3 +1,35 @@
+## v0.4.2 — TTFT in the footer, dashboard escape, cache rounding
+
+Two community fixes, one community feature, and documentation brought back in line with the
+code. Tested on OpenCode v1 and v2. Install with `opencode-tps-meter@latest`.
+
+### Added
+
+- **Time to first token in the compact footer** (#14, @cardin). Set `showTtft: true` (or
+  `TPS_METER_SHOW_TTFT=true`) to keep `ttft 1.2s` in the compact footer on v2. It was only in
+  `/tps detailed` and the dashboard before. Off by default, and left out of the subagent line,
+  since a family has no single first token.
+
+### Fixed
+
+- **The dashboard closes with `escape` or `q`** (#13, @cardin) and returns to the screen you
+  opened it from, including a plugin page's data and a home route's location.
+- **The cache hit rate no longer rounds up to 100%** (#15, @Karl-Dai). A ratio below 1 that
+  rounds to 100 reads 99%, so `12000` cached of `12040` prompt tokens no longer claims a full
+  hit. Applies to the footer and the v1 toast.
+
+### Docs
+
+- The README matches the code again: the footer and toast formats as they actually render,
+  registering a local `dist` directory on v2, config priority including v2 inline options, and
+  current troubleshooting. The `format` option is documented as reserved: it is accepted, but
+  no display reads it yet.
+
+### Notes
+
+- New config option: `showTtft` (default `false`), env `TPS_METER_SHOW_TTFT`.
+- Thanks to @cardin and @Karl-Dai for the contributions.
+
 ## v0.4.1 — Accurate TPS, subagent throughput, cache hit rate, theme colors
 
 The throughput figures are now measured correctly, and three community features
