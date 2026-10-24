@@ -1,107 +1,74 @@
 ## v0.4.2 — TTFT in the footer, dashboard escape, cache rounding
 
-Two community fixes, one community feature, and documentation brought back in line with the
-code.
+Time to first token can now sit in the compact footer, the dashboard closes with Escape, and
+the cache hit rate no longer reads 100% before the whole prompt is cached.
 
 ### Added
 
-- **Time to first token in the compact footer** (#14, @cardin). Set `showTtft: true` (or
-  `TPS_METER_SHOW_TTFT=true`) to keep `ttft 1.2s` in the compact footer on v2. It was only in
-  `/tps detailed` and the dashboard before. Off by default, and left out of the subagent line,
-  since a family has no single first token.
+- **Time to first token in the compact footer** (#14, @cardin). Turn it on with
+  `showTtft: true` or `TPS_METER_SHOW_TTFT=true` to see `ttft 1.2s` next to the rate on v2.
+  Off by default.
 
 ### Fixed
 
-- **The dashboard closes with `escape` or `q`** (#13, @cardin) and returns to the screen you
-  opened it from, including a plugin page's data and a home route's location.
-- **The cache hit rate no longer rounds up to 100%** (#15, @Karl-Dai). A ratio below 1 that
-  rounds to 100 reads 99%, so `12000` cached of `12040` prompt tokens no longer claims a full
-  hit. Applies to the footer and the v1 toast.
+- **The dashboard closes with `escape` or `q`** (#13, @cardin) and returns you to where you
+  opened it.
+- **The cache hit rate no longer rounds up to 100%** (#15, @Karl-Dai). A prompt that isn't
+  fully cached reads at most 99%.
 
 ### Docs
 
-- The README matches the code again: the footer and toast formats as they actually render,
-  registering a local `dist` directory on v2, config priority including v2 inline options, and
-  current troubleshooting. The `format` option is documented as reserved: it is accepted, but
-  no display reads it yet.
+- README updated with the footer and toast as they appear, the configuration priority, and
+  troubleshooting.
 
 ### Notes
 
 - New config option: `showTtft` (default `false`), env `TPS_METER_SHOW_TTFT`.
+- The `format` option is accepted but does not change the display yet.
 - Thanks to @cardin and @Karl-Dai for the contributions.
 
 ## v0.4.1 — Accurate TPS, subagent throughput, cache hit rate, theme colors
 
-The throughput figures are now measured correctly, and three community features
-land alongside.
+Throughput readings are now accurate, and the footer gains subagent throughput, the prompt
+cache hit rate and live theme colors.
 
 ### Accurate throughput
 
-- **No more five-digit spikes.** Hosts batch output before publishing it (v2
-  flushes every ~100ms), and the first batch of a stream was divided by the few
-  milliseconds before the meter's first update, so readings like `10364` appeared,
-  most visibly as a subagent's frozen average. Each chunk is now rated over the
-  interval it was actually generated in, and the opening chunk counts toward the
-  total but never toward a rate.
-- **The live rate is right from the start.** It used to begin at a fixed 100 TPS
-  and climb toward the real figure over several seconds on fast models. It is now
-  exact from the second chunk (about 100ms in) at any speed, with no smoothing lag.
-- **Settled averages describe what streamed.** A step's average is its streamed
-  tokens over the time they streamed, corrected by the provider's count only when
-  the two agree within 2x. Provider totals that include output the host never
-  streamed, such as hidden reasoning, no longer inflate the rate.
-- **Tool-call arguments count as output** (v2). The text a model writes for a tool
-  call (a file write, an edit) is now counted, so a step that only calls a tool has
-  a real reading instead of none.
-- **Calibration persists and is weighted by size** (v2). The live estimate's
-  per-model correction is saved, so new sessions start calibrated, and small steps
-  no longer swing it. Steps whose reasoning count the provider leaves ambiguous are
-  left out.
+- **No more spikes.** Readings no longer jump to thousands of TPS at the start of a reply, or
+  stay that way on a finished subagent.
+- **The live rate is right from the start**, instead of beginning at 100 TPS and climbing for
+  several seconds on fast models.
+- **Averages reflect what actually streamed**, so reasoning the provider doesn't show can no
+  longer inflate them.
+- **Tool calls count as output** (v2). Text the model writes for a tool call, such as a file
+  write or an edit, is part of its rate.
+- **Calibration is remembered per model** (v2), so new sessions start with an accurate
+  estimate.
 - **A stalled stream shows its rate falling** instead of holding its last value.
-- **One clock per measurement.** v1 no longer divides by server completion time
-  minus a local first-token time.
-- **The v1 toast** keeps its main line on the primary session (a subagent's chunk
-  used to relabel the subagent's rate as the main one) and no longer drops an
-  update that lands inside its throttle window.
-- **Dashboard.** `gen` is replaced by `tools`, the time a turn spent running tools,
-  since tool time is never inside a step's rate window. The per-model ledger starts
-  fresh, as its old best/mean figures were recorded with the spiking formula.
-- Same-named subagents in the footer get a short id suffix, e.g. `explore(9B5c)`,
-  and a step that ends on an error now settles the reading and still counts its
-  usage.
+- **The v1 toast** always shows the main session on its main line and no longer skips
+  updates.
+- **Dashboard.** `gen` is replaced by `tools`, the time a turn spent running tools.
+  Per-model stats start fresh.
+- Subagents with the same name get a short id, e.g. `explore(9B5c)`.
 
 ### Added
 
-- **Multi-session footer** (#8, @ondrejch). While subagents run, the footer
-  switches to an aggregate line, e.g. `TPS Σ 318 | main 63 | explore 91 | +2`.
-  Σ sums every session generating right now, and each agent is labeled by name.
-  Columns keep their spawn order, so they don't swap places. A subagent stays
-  visible through long tool calls and drops off about 4s after it finishes.
-  Works on both hosts: v1 resolves the session tree from `session.created` /
-  `session.updated` and `api.state.session`, v2 from `ctx.data.session`.
-- **Prompt cache hit rate** (#9, @Anigx). The footer shows
-  `cache N% · session cache N%`: the cached share of the prompt for the last
-  step and for the whole session, computed as
-  `cache.read / (input + cache.read + cache.write)`. It also appears in the v2
-  dashboard and the v1 final-stats toast. The figures appear once a session's
-  first step has finished. Toggle with `showCacheHit` (default `true`) or
-  `TPS_METER_SHOW_CACHE_HIT`.
+- **Multi-session footer** (#8, @ondrejch). While subagents run, the footer shows each one's
+  rate and the total, e.g. `TPS Σ 318 | main 63 | explore 91 | +2`, on v1 and v2.
+- **Prompt cache hit rate** (#9, @Anigx). The footer shows `cache N% · session cache N%`: the
+  share of the prompt served from cache for the last step and for the session. It also appears
+  in the v2 dashboard and the v1 toast.
 
 ### Fixed
 
-- **Theme colors on current v2 hosts** (#10, @dragonish). v2 renamed its theme
-  tokens to `text.base` / `text.muted` / `feedback.<kind>.base`. The meter now
-  resolves those names, falling back to the older ones, instead of rendering in
-  the host's default color. The theme is also read live, so a theme switch
-  recolors the meter without restarting the TUI.
-- **Cache figures after a tool-call-only step.** A step that ends in a tool call
-  without streaming any text now updates the footer's cache figures on both
-  hosts, instead of leaving the previous step's numbers on screen.
+- **Theme colors on v2** (#10, @dragonish). The meter uses your theme's colors and follows a
+  theme switch without a restart.
+- **Cache figures after a tool-call-only step** update instead of showing the previous step's
+  numbers.
 
 ### Notes
 
-- New config option: `showCacheHit` (default `true`), env
-  `TPS_METER_SHOW_CACHE_HIT`. No other config changes.
+- New config option: `showCacheHit` (default `true`), env `TPS_METER_SHOW_CACHE_HIT`.
 - Thanks to @ondrejch, @Anigx and @dragonish for the contributions.
 
 ## v0.4.0 — OpenCode v2 support (stable)
