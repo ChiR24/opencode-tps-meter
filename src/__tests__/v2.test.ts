@@ -1497,14 +1497,19 @@ describe("v2 optional surfaces", () => {
     ensureSolidTransformPlugin();
     const { setupTui } = await import("../v2/tui.js");
     const { testRender } = await import("@opentui/solid");
+    const { createSignal } = await import("solid-js");
     const { RGBA } = await import("@opentui/core");
     const color = RGBA.fromInts(255, 255, 255, 255);
 
     const handlers = new Map<string, (event: unknown) => void>();
     const claims: Array<{ render: (input: unknown) => unknown; append?: string }> = [];
-    const statuses = new Map<string, string>([
-      ["root", "running"],
-      ["child", "running"],
+    const [rootStatus, setRootStatus] = createSignal("running");
+    const [childStatus, setChildStatus] = createSignal("running");
+    const [quietStatus, setQuietStatus] = createSignal("idle");
+    const statuses = new Map<string, () => string>([
+      ["root", rootStatus],
+      ["child", childStatus],
+      ["quiet", quietStatus],
     ]);
 
     const cleanup = setupTui({
@@ -1529,9 +1534,9 @@ describe("v2 optional surfaces", () => {
         session: {
           get: (id: string) => ({ agent: id === "root" ? "build" : "general" }),
           root: () => "root",
-          family: () => ["root", "child"],
+          family: () => ["root", "child", "quiet"],
           cost: () => 0,
-          status: (id: string) => statuses.get(id) ?? "idle",
+          status: (id: string) => statuses.get(id)?.() ?? "idle",
         },
       },
       ui: {
@@ -1561,31 +1566,37 @@ describe("v2 optional surfaces", () => {
       await setup.flush();
       const frame = setup.captureCharFrame();
       expect(frame).toContain("Throughput");
-      expect(frame).toContain("general");
+      expect(frame.match(/general/g)?.length).toBe(1);
 
-      // Both sessions are idle now. No publish follows, so only the sidebar's own
-      // heartbeat can age the child out of the linger window.
-      statuses.set("root", "idle");
-      statuses.set("child", "idle");
+      // Both metered sessions are idle now. No publish follows, so only the sidebar's
+      // own heartbeat can age the child out of the linger window.
+      setRootStatus("idle");
+      setChildStatus("idle");
       setSystemTime(new Date(base + 5_000));
       await delay(800);
       await setup.flush();
 
       expect(setup.captureCharFrame()).not.toContain("Throughput");
 
-      // A child inside a long tool call is still reported running; it must stay.
-      statuses.set("child", "running");
-      text({ ...textDelta("child", "tool output"), created: Date.now() });
-      await delay(120);
+      // Status-only revival: the child's snapshot is now stale and `quiet` never had
+      // one, so this exercises the running check without a token publish.
+      setChildStatus("running");
+      setQuietStatus("running");
+      await delay(50);
       await setup.flush();
-      expect(setup.captureCharFrame()).toContain("Throughput");
 
+      const revived = setup.captureCharFrame();
+      expect(revived).toContain("Throughput");
+      expect(revived.match(/general/g)?.length).toBe(2);
+
+      // A child inside a long tool call keeps its row past the linger window.
       setSystemTime(new Date(base + 10_000));
       await delay(800);
       await setup.flush();
-      expect(setup.captureCharFrame()).toContain("Throughput");
+      expect(setup.captureCharFrame().match(/general/g)?.length).toBe(2);
     } finally {
       setSystemTime();
+      setup.renderer.destroy();
       await (cleanup as unknown as () => void | Promise<void>)?.();
     }
   });
