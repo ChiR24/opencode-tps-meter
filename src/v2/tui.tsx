@@ -29,6 +29,7 @@ import {
   formatAggregateLine,
   hasSubagentEntries,
   sameIDs,
+  SUBAGENT_LINGER_MS,
 } from "./family.js";
 import { createMeter, type V2Snapshot } from "./meter.js";
 import { createLedger, type V2Ledger } from "./ledger.js";
@@ -406,6 +407,12 @@ function SidebarPanel(props: {
     }));
   });
 
+  /**
+   * Heartbeat for the recency filter. Finished subagents must disappear after ~4s, but
+   * nothing republishes once every stream is quiet. Mirrors the footer's heartbeat.
+   */
+  const [tick, setTick] = createSignal(0);
+
   const rows = createMemo<FamilyRow[]>(() => {
     const members = family();
     if (members.length === 0) {
@@ -413,7 +420,26 @@ function SidebarPanel(props: {
     }
     const data = props.ctx.data.session;
     const snaps = props.snapshots();
-    return members.map((member) => {
+    tick();
+    const now = Date.now();
+    const visible = members.filter((member) => {
+      if (member.isRoot) {
+        return true;
+      }
+      // Same rule as the footer: keep a child while it is running (including a long
+      // tool call) or within the linger window after its last token.
+      const snapshot = snaps.get(member.id);
+      return (
+        data?.status(member.id) === "running" ||
+        (snapshot !== undefined && now - snapshot.lastActivityAt <= SUBAGENT_LINGER_MS)
+      );
+    });
+    // A solo root is already covered by the footer meter. Hide the panel once no
+    // subagent qualifies, rather than leaving a one-row "Throughput" block behind.
+    if (!visible.some((member) => !member.isRoot)) {
+      return [];
+    }
+    return visible.map((member) => {
       const snapshot = snaps.get(member.id);
       return {
         ...member,
@@ -422,6 +448,15 @@ function SidebarPanel(props: {
         tokens: snapshot?.totalTokens ?? 0,
       };
     });
+  });
+
+  const showingSubagents = createMemo(() => rows().some((row) => !row.isRoot));
+  createEffect(() => {
+    if (!showingSubagents()) {
+      return;
+    }
+    const heartbeat = setInterval(() => setTick((value) => value + 1), AGGREGATE_TICK_INTERVAL_MS);
+    onCleanup(() => clearInterval(heartbeat));
   });
 
   return (

@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, setSystemTime } from "bun:test";
 
 import { createMeter, type V2Snapshot } from "../v2/meter.js";
 import { loadConfigSync } from "../config.js";
@@ -1490,6 +1490,104 @@ describe("v2 optional surfaces", () => {
 
     expect(typeof cleanup).toBe("function");
     await (cleanup as () => void | Promise<void>)();
+  });
+
+  it("drops finished subagents from the sidebar after the linger window", async () => {
+    const { ensureSolidTransformPlugin } = await import("@opentui/solid/bun-plugin");
+    ensureSolidTransformPlugin();
+    const { setupTui } = await import("../v2/tui.js");
+    const { testRender } = await import("@opentui/solid");
+    const { RGBA } = await import("@opentui/core");
+    const color = RGBA.fromInts(255, 255, 255, 255);
+
+    const handlers = new Map<string, (event: unknown) => void>();
+    const claims: Array<{ render: (input: unknown) => unknown; append?: string }> = [];
+    const statuses = new Map<string, string>([
+      ["root", "running"],
+      ["child", "running"],
+    ]);
+
+    const cleanup = setupTui({
+      options: undefined,
+      theme: {
+        text: {
+          default: color,
+          subdued: color,
+          feedback: {
+            error: { default: color },
+            warning: { default: color },
+            success: { default: color },
+            info: { default: color },
+          },
+        },
+      },
+      data: {
+        on: (type: string, handler: (event: never) => void) => {
+          handlers.set(type, handler as (event: unknown) => void);
+          return () => handlers.delete(type);
+        },
+        session: {
+          get: (id: string) => ({ agent: id === "root" ? "build" : "general" }),
+          root: () => "root",
+          family: () => ["root", "child"],
+          cost: () => 0,
+          status: (id: string) => statuses.get(id) ?? "idle",
+        },
+      },
+      ui: {
+        slot: (claim: Record<string, unknown>) => {
+          claims.push(claim as { render: (input: unknown) => unknown; append?: string });
+          return () => {};
+        },
+      },
+    } as never);
+
+    const base = Date.now();
+    const text = handlers.get("session.text.delta")!;
+    for (const id of ["root", "child"]) {
+      text({ ...textDelta(id, "hello there, "), created: base - 100 });
+      text({ ...textDelta(id, "streaming tokens"), created: base });
+    }
+    await delay(120);
+
+    const sidebar = claims.find((claim) => claim.append === "sidebar.content");
+    expect(sidebar).toBeDefined();
+    const setup = await testRender(() => sidebar!.render({ sessionID: "root" }), {
+      width: 40,
+      height: 10,
+    });
+
+    try {
+      await setup.flush();
+      const frame = setup.captureCharFrame();
+      expect(frame).toContain("Throughput");
+      expect(frame).toContain("general");
+
+      // Both sessions are idle now. No publish follows, so only the sidebar's own
+      // heartbeat can age the child out of the linger window.
+      statuses.set("root", "idle");
+      statuses.set("child", "idle");
+      setSystemTime(new Date(base + 5_000));
+      await delay(800);
+      await setup.flush();
+
+      expect(setup.captureCharFrame()).not.toContain("Throughput");
+
+      // A child inside a long tool call is still reported running; it must stay.
+      statuses.set("child", "running");
+      text({ ...textDelta("child", "tool output"), created: Date.now() });
+      await delay(120);
+      await setup.flush();
+      expect(setup.captureCharFrame()).toContain("Throughput");
+
+      setSystemTime(new Date(base + 10_000));
+      await delay(800);
+      await setup.flush();
+      expect(setup.captureCharFrame()).toContain("Throughput");
+    } finally {
+      setSystemTime();
+      await (cleanup as unknown as () => void | Promise<void>)?.();
+    }
   });
 
   it("shows ttft in the compact footer when showTtft is on", async () => {
