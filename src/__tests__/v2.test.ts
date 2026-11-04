@@ -1505,12 +1505,13 @@ describe("v2 optional surfaces", () => {
     const claims: Array<{ render: (input: unknown) => unknown; append?: string }> = [];
     const [rootStatus, setRootStatus] = createSignal("running");
     const [childStatus, setChildStatus] = createSignal("running");
-    const [quietStatus, setQuietStatus] = createSignal("idle");
+    // Deliberately non-reactive: the hidden sidebar must still notice a plain status
+    // change through its heartbeat.
+    const quietStatus = { value: "idle" };
     const [selectedSession, setSelectedSession] = createSignal("root");
     const statuses = new Map<string, () => string>([
       ["root", rootStatus],
       ["child", childStatus],
-      ["quiet", quietStatus],
     ]);
 
     const cleanup = setupTui({
@@ -1537,7 +1538,8 @@ describe("v2 optional surfaces", () => {
           root: () => "root",
           family: () => ["root", "child", "quiet"],
           cost: () => 0,
-          status: (id: string) => statuses.get(id)?.() ?? "idle",
+          status: (id: string) =>
+            id === "quiet" ? quietStatus.value : (statuses.get(id)?.() ?? "idle"),
         },
       },
       ui: {
@@ -1596,10 +1598,20 @@ describe("v2 optional surfaces", () => {
 
       expect(setup.captureCharFrame()).not.toContain("Throughput");
 
-      // Status-only revival: the child's snapshot is now stale and `quiet` never had
-      // one, so this exercises the running check without a token publish.
+      // Status-only revival without a reactive status accessor: `quiet` has no snapshot
+      // and its plain status change notifies nothing, so only the heartbeat can bring
+      // the hidden panel back.
+      quietStatus.value = "running";
+      await delay(800);
+      await setup.flush();
+
+      const quietRevived = setup.captureCharFrame();
+      expect(quietRevived).toContain("Throughput");
+      expect(quietRevived.match(/general/g)?.length).toBe(1);
+
+      // Status-only revival through the reactive host accessor: the child's snapshot is
+      // now stale, so this exercises the running check without a token publish.
       setChildStatus("running");
-      setQuietStatus("running");
       await delay(50);
       await setup.flush();
 
@@ -1616,7 +1628,7 @@ describe("v2 optional surfaces", () => {
       // Opening a finished child must keep the panel visible: the footer now renders
       // that child, so the sidebar is where main's rate remains visible.
       setChildStatus("idle");
-      setQuietStatus("idle");
+      quietStatus.value = "idle";
       setRootStatus("running");
       setSelectedSession("child");
       await delay(50);
@@ -1625,6 +1637,7 @@ describe("v2 optional surfaces", () => {
       const selected = setup.captureCharFrame();
       expect(selected).toContain("Throughput");
       expect(selected).toContain("build");
+      expect(selected).toMatch(/> build (?!0\.0 )\d+\.\d t\/s/);
       expect(selected.match(/general/g)?.length).toBe(1);
     } finally {
       setSystemTime();

@@ -409,7 +409,9 @@ function SidebarPanel(props: {
 
   /**
    * Heartbeat for the recency filter. Finished subagents must disappear after ~4s, but
-   * nothing republishes once every stream is quiet. Mirrors the footer's heartbeat.
+   * nothing republishes once every stream is quiet. It must keep running while the panel
+   * is hidden too: a child can become running again without a snapshot publish, and the
+   * host's status accessor is not guaranteed to notify us reactively.
    */
   const [tick, setTick] = createSignal(0);
 
@@ -454,9 +456,9 @@ function SidebarPanel(props: {
     });
   });
 
-  const showingSubagents = createMemo(() => rows().some((row) => !row.isRoot));
+  const familyHasChildren = createMemo(() => family().some((member) => !member.isRoot));
   createEffect(() => {
-    if (!showingSubagents()) {
+    if (!familyHasChildren()) {
       return;
     }
     const heartbeat = setInterval(() => setTick((value) => value + 1), AGGREGATE_TICK_INTERVAL_MS);
