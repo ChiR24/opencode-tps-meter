@@ -1598,11 +1598,22 @@ describe("v2 optional surfaces", () => {
 
       expect(setup.captureCharFrame()).not.toContain("Throughput");
 
-      // Status-only revival without a reactive status accessor: `quiet` has no snapshot
-      // and its plain status change notifies nothing, so only the heartbeat can bring
-      // the hidden panel back.
+      // Status-only revival without a reactive status accessor: `quiet` has no snapshot,
+      // and its plain status change notifies nothing. With the panel hidden there is no
+      // heartbeat to notice it, so the change must not appear on its own. The host's
+      // execution event is the trigger: the hidden panel re-checks status then, without
+      // a token publish.
       quietStatus.value = "running";
       await delay(800);
+      await setup.flush();
+      expect(setup.captureCharFrame()).not.toContain("Throughput");
+
+      handlers.get("session.execution.started")!({
+        type: "session.execution.started",
+        created: Date.now(),
+        data: { sessionID: "quiet" },
+      });
+      await delay(50);
       await setup.flush();
 
       const quietRevived = setup.captureCharFrame();
