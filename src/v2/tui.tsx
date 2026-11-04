@@ -423,11 +423,15 @@ function SidebarPanel(props: {
     tick();
     const now = Date.now();
     const visible = members.filter((member) => {
-      if (member.isRoot) {
+      // The root and the session the user opened always stay. If that session is a
+      // finished child, the footer is showing it, so the panel is the only place the
+      // root's rate appears.
+      if (member.isRoot || member.id === props.input.sessionID) {
         return true;
       }
-      // Same rule as the footer: keep a child while it is running (including a long
-      // tool call) or within the linger window after its last token.
+      // The footer's recency rule, plus a running child that has no reading yet: keep a
+      // child while the host reports it working (including a long tool call) or within
+      // the linger window after its last token.
       const snapshot = snaps.get(member.id);
       return (
         data?.status(member.id) === "running" ||

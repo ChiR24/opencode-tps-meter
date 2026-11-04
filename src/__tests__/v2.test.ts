@@ -1506,6 +1506,7 @@ describe("v2 optional surfaces", () => {
     const [rootStatus, setRootStatus] = createSignal("running");
     const [childStatus, setChildStatus] = createSignal("running");
     const [quietStatus, setQuietStatus] = createSignal("idle");
+    const [selectedSession, setSelectedSession] = createSignal("root");
     const statuses = new Map<string, () => string>([
       ["root", rootStatus],
       ["child", childStatus],
@@ -1557,10 +1558,15 @@ describe("v2 optional surfaces", () => {
 
     const sidebar = claims.find((claim) => claim.append === "sidebar.content");
     expect(sidebar).toBeDefined();
-    const setup = await testRender(() => sidebar!.render({ sessionID: "root" }), {
-      width: 40,
-      height: 10,
-    });
+    const setup = await testRender(
+      () =>
+        sidebar!.render({
+          get sessionID() {
+            return selectedSession();
+          },
+        }),
+      { width: 40, height: 10 }
+    );
 
     try {
       await setup.flush();
@@ -1568,10 +1574,22 @@ describe("v2 optional surfaces", () => {
       expect(frame).toContain("Throughput");
       expect(frame.match(/general/g)?.length).toBe(1);
 
-      // Both metered sessions are idle now. No publish follows, so only the sidebar's
-      // own heartbeat can age the child out of the linger window.
+      // End both streams before advancing the clock. With no meter timers left, only
+      // the sidebar's own heartbeat can age the child out after the jump. It must stay
+      // visible right after going idle, because the linger window starts at its last token.
       setRootStatus("idle");
       setChildStatus("idle");
+      const step = handlers.get("session.step.ended")!;
+      const idle = handlers.get("session.idle")!;
+      for (const id of ["root", "child"]) {
+        step(stepEnded(id, "stop"));
+        idle(sessionIdle(id));
+      }
+      await delay(50);
+      await setup.flush();
+      expect(setup.captureCharFrame()).toContain("Throughput");
+      expect(setup.captureCharFrame().match(/general/g)?.length).toBe(1);
+
       setSystemTime(new Date(base + 5_000));
       await delay(800);
       await setup.flush();
@@ -1594,6 +1612,20 @@ describe("v2 optional surfaces", () => {
       await delay(800);
       await setup.flush();
       expect(setup.captureCharFrame().match(/general/g)?.length).toBe(2);
+
+      // Opening a finished child must keep the panel visible: the footer now renders
+      // that child, so the sidebar is where main's rate remains visible.
+      setChildStatus("idle");
+      setQuietStatus("idle");
+      setRootStatus("running");
+      setSelectedSession("child");
+      await delay(50);
+      await setup.flush();
+
+      const selected = setup.captureCharFrame();
+      expect(selected).toContain("Throughput");
+      expect(selected).toContain("build");
+      expect(selected.match(/general/g)?.length).toBe(1);
     } finally {
       setSystemTime();
       setup.renderer.destroy();
