@@ -29,6 +29,7 @@ import {
   formatAggregateLine,
   hasSubagentEntries,
   sameIDs,
+  SUBAGENT_LINGER_MS,
 } from "./family.js";
 import { createMeter, type V2Snapshot } from "./meter.js";
 import { createLedger, type V2Ledger } from "./ledger.js";
@@ -44,6 +45,18 @@ import type {
   V2TuiContext,
   V2UnknownEvent,
 } from "./types.js";
+
+/**
+ * Events that change a session's run status. The sidebar reads the host's status accessor,
+ * which is not guaranteed to notify reactively; bumping a revision on these events makes a
+ * hidden sidebar re-evaluate immediately, without polling for it while nothing runs.
+ */
+const STATUS_EVENTS: ReadonlySet<string> = new Set([
+  "session.execution.started",
+  "session.execution.succeeded",
+  "session.execution.failed",
+  "session.execution.interrupted",
+]);
 
 /** Events the TUI plugin subscribes to. */
 const SUBSCRIBED_EVENTS: ReadonlyArray<V2AnyMeterEvent["type"]> = [
@@ -376,6 +389,8 @@ function SidebarPanel(props: {
   ctx: V2TuiContext;
   theme: V2ResolvedTheme;
   snapshots: () => ReadonlyMap<string, V2Snapshot>;
+  /** Bumped on host run-status events, so a hidden panel re-checks status without polling. */
+  statusRevision: () => number;
 }) {
   // Split deliberately: the session tree and each agent's name change rarely, while
   // snapshots change on every token publish (up to ~125/s). Resolving the family inside the
@@ -406,6 +421,16 @@ function SidebarPanel(props: {
     }));
   });
 
+  /**
+   * Heartbeat for the recency filter. Finished subagents must disappear after ~4s, but
+   * nothing republishes once every stream is quiet. The interval exists only while a
+   * child can age out on its own: root and the selected session are retained indefinitely,
+   * so they need no timer. A child that starts running again is picked up by
+   * `statusRevision` (bumped on execution events), and token publishes update the rows
+   * directly.
+   */
+  const [tick, setTick] = createSignal(0);
+
   const rows = createMemo<FamilyRow[]>(() => {
     const members = family();
     if (members.length === 0) {
@@ -413,7 +438,31 @@ function SidebarPanel(props: {
     }
     const data = props.ctx.data.session;
     const snaps = props.snapshots();
-    return members.map((member) => {
+    tick();
+    props.statusRevision();
+    const now = Date.now();
+    const visible = members.filter((member) => {
+      // The root and the session the user opened always stay. If that session is a
+      // finished child, the footer is showing it, so the panel is the only place the
+      // root's rate appears.
+      if (member.isRoot || member.id === props.input.sessionID) {
+        return true;
+      }
+      // The footer's recency rule, plus a running child that has no reading yet: keep a
+      // child while the host reports it working (including a long tool call) or within
+      // the linger window after its last token.
+      const snapshot = snaps.get(member.id);
+      return (
+        data?.status(member.id) === "running" ||
+        (snapshot !== undefined && now - snapshot.lastActivityAt <= SUBAGENT_LINGER_MS)
+      );
+    });
+    // A solo root is already covered by the footer meter. Hide the panel once no
+    // subagent qualifies, rather than leaving a one-row "Throughput" block behind.
+    if (!visible.some((member) => !member.isRoot)) {
+      return [];
+    }
+    return visible.map((member) => {
       const snapshot = snaps.get(member.id);
       return {
         ...member,
@@ -422,6 +471,17 @@ function SidebarPanel(props: {
         tokens: snapshot?.totalTokens ?? 0,
       };
     });
+  });
+
+  const hasExpiringSubagents = createMemo(() =>
+    rows().some((row) => !row.isRoot && row.id !== props.input.sessionID)
+  );
+  createEffect(() => {
+    if (!hasExpiringSubagents()) {
+      return;
+    }
+    const heartbeat = setInterval(() => setTick((value) => value + 1), AGGREGATE_TICK_INTERVAL_MS);
+    onCleanup(() => clearInterval(heartbeat));
   });
 
   return (
@@ -662,6 +722,7 @@ export function setupTui(ctx: V2TuiContext): V2Cleanup | void {
     },
   });
   const [snapshots, setSnapshots] = createSignal<ReadonlyMap<string, V2Snapshot>>(new Map());
+  const [statusRevision, setStatusRevision] = createSignal(0);
   const [mode, setMode] = createSignal<DisplayMode>("compact");
   const disposers: Array<() => void> = [];
 
@@ -720,6 +781,9 @@ export function setupTui(ctx: V2TuiContext): V2Cleanup | void {
       disposers.push(
         ctx.data.on(type, (event) => {
           meter.handleEvent(event as unknown as V2UnknownEvent);
+          if (STATUS_EVENTS.has(type)) {
+            setStatusRevision((value) => value + 1);
+          }
         })
       );
     }
@@ -779,7 +843,13 @@ export function setupTui(ctx: V2TuiContext): V2Cleanup | void {
       ctx.ui.slot({
         append: "sidebar.content",
         render: (input) => (
-          <SidebarPanel input={input} ctx={ctx} theme={theme} snapshots={snapshots} />
+          <SidebarPanel
+            input={input}
+            ctx={ctx}
+            theme={theme}
+            snapshots={snapshots}
+            statusRevision={statusRevision}
+          />
         ),
       })
     );

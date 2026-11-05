@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, setSystemTime } from "bun:test";
 
 import { createMeter, type V2Snapshot } from "../v2/meter.js";
 import { loadConfigSync } from "../config.js";
@@ -1490,6 +1490,171 @@ describe("v2 optional surfaces", () => {
 
     expect(typeof cleanup).toBe("function");
     await (cleanup as () => void | Promise<void>)();
+  });
+
+  it("drops finished subagents from the sidebar after the linger window", async () => {
+    const { ensureSolidTransformPlugin } = await import("@opentui/solid/bun-plugin");
+    ensureSolidTransformPlugin();
+    const { setupTui } = await import("../v2/tui.js");
+    const { testRender } = await import("@opentui/solid");
+    const { createSignal } = await import("solid-js");
+    const { RGBA } = await import("@opentui/core");
+    const color = RGBA.fromInts(255, 255, 255, 255);
+
+    const handlers = new Map<string, (event: unknown) => void>();
+    const claims: Array<{ render: (input: unknown) => unknown; append?: string }> = [];
+    const [rootStatus, setRootStatus] = createSignal("running");
+    const [childStatus, setChildStatus] = createSignal("running");
+    // Deliberately non-reactive: the hidden sidebar must still notice a plain status
+    // change through its heartbeat.
+    const quietStatus = { value: "idle" };
+    const [selectedSession, setSelectedSession] = createSignal("root");
+    const statuses = new Map<string, () => string>([
+      ["root", rootStatus],
+      ["child", childStatus],
+    ]);
+
+    const cleanup = setupTui({
+      options: undefined,
+      theme: {
+        text: {
+          default: color,
+          subdued: color,
+          feedback: {
+            error: { default: color },
+            warning: { default: color },
+            success: { default: color },
+            info: { default: color },
+          },
+        },
+      },
+      data: {
+        on: (type: string, handler: (event: never) => void) => {
+          handlers.set(type, handler as (event: unknown) => void);
+          return () => handlers.delete(type);
+        },
+        session: {
+          get: (id: string) => ({ agent: id === "root" ? "build" : "general" }),
+          root: () => "root",
+          family: () => ["root", "child", "quiet"],
+          cost: () => 0,
+          status: (id: string) =>
+            id === "quiet" ? quietStatus.value : (statuses.get(id)?.() ?? "idle"),
+        },
+      },
+      ui: {
+        slot: (claim: Record<string, unknown>) => {
+          claims.push(claim as { render: (input: unknown) => unknown; append?: string });
+          return () => {};
+        },
+      },
+    } as never);
+
+    const base = Date.now();
+    const text = handlers.get("session.text.delta")!;
+    for (const id of ["root", "child"]) {
+      text({ ...textDelta(id, "hello there, "), created: base - 100 });
+      text({ ...textDelta(id, "streaming tokens"), created: base });
+    }
+    await delay(120);
+
+    const sidebar = claims.find((claim) => claim.append === "sidebar.content");
+    expect(sidebar).toBeDefined();
+    const setup = await testRender(
+      () =>
+        sidebar!.render({
+          get sessionID() {
+            return selectedSession();
+          },
+        }),
+      { width: 40, height: 10 }
+    );
+
+    try {
+      await setup.flush();
+      const frame = setup.captureCharFrame();
+      expect(frame).toContain("Throughput");
+      expect(frame.match(/general/g)?.length).toBe(1);
+
+      // End both streams before advancing the clock. With no meter timers left, only
+      // the sidebar's own heartbeat can age the child out after the jump. It must stay
+      // visible right after going idle, because the linger window starts at its last token.
+      setRootStatus("idle");
+      setChildStatus("idle");
+      const step = handlers.get("session.step.ended")!;
+      const idle = handlers.get("session.idle")!;
+      for (const id of ["root", "child"]) {
+        step(stepEnded(id, "stop"));
+        idle(sessionIdle(id));
+      }
+      await delay(50);
+      await setup.flush();
+      expect(setup.captureCharFrame()).toContain("Throughput");
+      expect(setup.captureCharFrame().match(/general/g)?.length).toBe(1);
+
+      setSystemTime(new Date(base + 5_000));
+      await delay(800);
+      await setup.flush();
+
+      expect(setup.captureCharFrame()).not.toContain("Throughput");
+
+      // Status-only revival without a reactive status accessor: `quiet` has no snapshot,
+      // and its plain status change notifies nothing. With the panel hidden there is no
+      // heartbeat to notice it, so the change must not appear on its own. The host's
+      // execution event is the trigger: the hidden panel re-checks status then, without
+      // a token publish.
+      quietStatus.value = "running";
+      await delay(800);
+      await setup.flush();
+      expect(setup.captureCharFrame()).not.toContain("Throughput");
+
+      handlers.get("session.execution.started")!({
+        type: "session.execution.started",
+        created: Date.now(),
+        data: { sessionID: "quiet" },
+      });
+      await delay(50);
+      await setup.flush();
+
+      const quietRevived = setup.captureCharFrame();
+      expect(quietRevived).toContain("Throughput");
+      expect(quietRevived.match(/general/g)?.length).toBe(1);
+
+      // Status-only revival through the reactive host accessor: the child's snapshot is
+      // now stale, so this exercises the running check without a token publish.
+      setChildStatus("running");
+      await delay(50);
+      await setup.flush();
+
+      const revived = setup.captureCharFrame();
+      expect(revived).toContain("Throughput");
+      expect(revived.match(/general/g)?.length).toBe(2);
+
+      // A child inside a long tool call keeps its row past the linger window.
+      setSystemTime(new Date(base + 10_000));
+      await delay(800);
+      await setup.flush();
+      expect(setup.captureCharFrame().match(/general/g)?.length).toBe(2);
+
+      // Opening a finished child must keep the panel visible: the footer now renders
+      // that child, so the sidebar is where main's rate remains visible.
+      setChildStatus("idle");
+      quietStatus.value = "idle";
+      setRootStatus("running");
+      setSelectedSession("child");
+      await delay(50);
+      await setup.flush();
+
+      const selected = setup.captureCharFrame();
+      expect(selected).toContain("Throughput");
+      expect(selected).toContain("build");
+      expect(selected).toMatch(/> build (?!0\.0 )\d+\.\d t\/s/);
+      expect(selected.match(/general/g)?.length).toBe(1);
+    } finally {
+      setSystemTime();
+      setup.renderer.destroy();
+      await (cleanup as unknown as () => void | Promise<void>)?.();
+    }
   });
 
   it("shows ttft in the compact footer when showTtft is on", async () => {
